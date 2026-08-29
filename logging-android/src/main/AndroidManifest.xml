@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Empty on purpose. This module contributes no permissions, no components and
+  no resources to a consumer's merged manifest: it is code the app calls, not
+  behavior the app inherits. A FileProvider for sharing a report belongs to the
+  consuming app, whose authority it is.
+-->
+<manifest />

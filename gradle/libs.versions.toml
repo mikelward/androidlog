@@ -1,0 +1,16 @@
+# Held in step with the consumer fleet (simmo, snoozemo, typelauncher,
+# clothescast) rather than moved independently: a composite build puts this
+# build's AGP and Kotlin alongside theirs in one Gradle invocation, so a major
+# divergence here breaks four apps at once with no pin to hide behind. See
+# AGENTS.md, "What this repository must not grow".
+[versions]
+agp = "9.3.1"
+junit = "4.13.2"
+kotlin = "2.4.10"
+
+[libraries]
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+
+[plugins]
+android-library = { id = "com.android.library", version.ref = "agp" }
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
