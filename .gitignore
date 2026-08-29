@@ -1,0 +1,22 @@
+# Ignore all dotfiles and dot-directories by default; allowlist below.
+.*
+!/.github
+!/.github/**
+!/.gitignore
+!.gitkeep
+# Claude Code shared config (SessionStart hook + settings) must be tracked so
+# remote web sessions pick it up; keep machine-local overrides ignored.
+!/.claude
+!/.claude/**
+/.claude/settings.local.json
+/.claude/worktrees/
+/.claude/scheduled_tasks.lock
+/.claude/scheduled_tasks.json
+
+*.iml
+/local.properties
+build/
+
+# JVM fatal-error / replay crash dumps from forked test workers
+hs_err_pid*.log
+replay_pid*.log
