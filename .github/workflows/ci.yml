@@ -10,14 +10,56 @@ on:
   push:
     branches: [main]
   pull_request:
+    # No paths filter, deliberately: the ruleset requires the `lanes` check,
+    # and a required check that never reports blocks the pull request forever
+    # -- which is exactly what a path-filtered-out workflow produces.
+    # Housekeeping-only pull requests skip the heavy job via `classify`
+    # instead, and `lanes` verifies the skip was justified.
+    #
+    # `edited` is load-bearing, not tidiness: a retarget changes what the
+    # pull request's diff is measured against while the head -- and any
+    # `lanes` check run already minted on it -- stays put, so a base change
+    # must start a fresh run. Title and body edits re-run the lane too,
+    # deliberately: a skipped job would be worse, because GitHub counts a
+    # skipped required check as satisfied, so skipping the gate on a
+    # "harmless" edit would let a newer skipped run replace a red verdict on
+    # the same head.
+    types: [opened, synchronize, reopened, edited]
 
+# Nothing here writes to the repository. The docs lane's classify and lanes
+# jobs read the pull request's files and commits through the workflow token;
+# read-only, and still nothing here can write.
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
+  # Decides whether the check job may skip: true only when every changed file
+  # in the pull request is housekeeping (markdown outside the module trees --
+  # see .github/lanes.conf for the rules; the engine is mikelward/lanes).
+  # Pushes to main are always classified as code.
+  classify:
+    name: Classify the diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.lane.outputs.docs_only }}
+      base_sha: ${{ steps.lane.outputs.base_sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: mikelward/lanes@main
+        id: lane
+        with:
+          mode: classify
+          pr: ${{ github.event.pull_request.number }}
+
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     steps:
       - uses: actions/checkout@v5
         with:
@@ -73,3 +115,32 @@ jobs:
             echo "::error::verifyNoAndroid failed, but without naming the injected dependency."
             exit 1
           fi
+
+  # The one check the ruleset requires from this workflow (alongside `codex`
+  # and `zizmor`). Always runs, always reports -- green only when the check
+  # job succeeded, or when it was skipped and the skip is INDEPENDENTLY
+  # verified as justified: the gate re-derives the classification itself
+  # rather than trusting classify's output. Any other combination is an
+  # explicit red, never a silent pass. Named `lanes` from the start -- this
+  # repository adopts the engine after mikelward/lanes#9's check rename, so it
+  # never carries the `gate` name its siblings are still migrating away from.
+  lanes:
+    name: lanes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [classify, check]
+    if: always()
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: mikelward/lanes@main
+        with:
+          mode: gate
+          pr: ${{ github.event.pull_request.number }}
+          # Only read on a dispatched run, and harmless on a pull_request one,
+          # which takes the same commit from its own event payload.
+          base-sha: ${{ needs.classify.outputs.base_sha }}
+          classify-result: ${{ needs.classify.result }}
+          results: >-
+            check=${{ needs.check.result }}
