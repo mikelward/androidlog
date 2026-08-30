@@ -1,6 +1,6 @@
-package app.mikelward.androidlog.android
+package com.mikelward.androidlog.android
 
-import app.mikelward.androidlog.DebugLog
+import com.mikelward.androidlog.DebugLog
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse

@@ -1,8 +1,8 @@
-package app.mikelward.androidlog.android
+package com.mikelward.androidlog.android
 
 import android.content.Context
-import app.mikelward.androidlog.DebugLog
-import app.mikelward.androidlog.boundedLogTail
+import com.mikelward.androidlog.DebugLog
+import com.mikelward.androidlog.boundedLogTail
 import java.io.File
 import java.lang.ref.WeakReference
 import java.nio.file.Files

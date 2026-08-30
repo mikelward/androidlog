@@ -1,10 +1,10 @@
-package app.mikelward.androidlog.android
+package com.mikelward.androidlog.android
 
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import app.mikelward.androidlog.DebugLog
+import com.mikelward.androidlog.DebugLog
 
 /**
  * What a share attempt actually achieved.

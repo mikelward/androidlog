@@ -1,4 +1,4 @@
-package app.mikelward.androidlog
+package com.mikelward.androidlog
 
 /**
  * Decides, per argument, what a line of the debug log may carry off the device.

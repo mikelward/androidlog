@@ -11,7 +11,7 @@ plugins {
 // Android-free entry point where that block does not run. The substitution a
 // consumer's composite build performs matches on these, so a missing group is
 // the difference between the offramp working and resolving `:0.0` remotely.
-group = "app.mikelward.androidlog"
+group = "com.mikelward.androidlog"
 version = "0.0"
 
 // Deliberately a plain Kotlin JVM module, not an Android library. The privacy
