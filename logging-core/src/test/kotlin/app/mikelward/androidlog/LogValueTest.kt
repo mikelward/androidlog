@@ -15,6 +15,31 @@ class LogValueTest {
 
     private enum class Mode { ARMED, IDLE }
 
+    /** Counts how many entries a rendering actually reads. */
+    private class CountingMap(private val delegate: Map<String, Int>) : Map<String, Int> by delegate {
+        var read = 0
+
+        override val entries: Set<Map.Entry<String, Int>>
+            get() = object : Set<Map.Entry<String, Int>> by delegate.entries {
+                override fun iterator(): Iterator<Map.Entry<String, Int>> {
+                    val inner = delegate.entries.iterator()
+                    return object : Iterator<Map.Entry<String, Int>> {
+                        override fun hasNext(): Boolean = inner.hasNext()
+
+                        override fun next(): Map.Entry<String, Int> {
+                            read++
+                            return inner.next()
+                        }
+                    }
+                }
+            }
+    }
+
+    /** A domain type whose `toString()` this library did not write. */
+    private class Holder {
+        override fun toString(): String = "ssid ExampleWifi"
+    }
+
     /**
      * An enum whose `toString()` reads live state, which is the shape that used
      * to walk through the floor: the type rule lets an enum past on the
@@ -123,9 +148,120 @@ class LogValueTest {
     }
 
     @Test
-    fun `safe honors toString, because the call site asked for that value`() {
-        assertEquals("mode=ExampleWifi", full("mode=%s", safe(Leaky.CURRENT)))
-        assertEquals("mode=ExampleWifi", mirrored("mode=%s", safe(Leaky.CURRENT)))
+    fun `a tag decides what may leave the device, not how a value is written`() {
+        // `safe` used to mean both, and the second meaning was a way around the
+        // no-messages rule. It now answers only the floor's question, so the
+        // enum still renders its constant name rather than an override that
+        // reads live state.
+        assertTrue(logArgumentMayLeaveDevice(safe(Leaky.CURRENT)))
+        assertEquals("mode=CURRENT", full("mode=%s", safe(Leaky.CURRENT)))
+        assertEquals("mode=CURRENT", mirrored("mode=%s", safe(Leaky.CURRENT)))
+    }
+
+    @Test
+    fun `a throwable inside a composite renders its type, not its message`() {
+        // The fourth route by which an unknown `toString()` reached a message:
+        // the collection's own, which calls the exception's.
+        val boom = IllegalStateException("dialed +15550100")
+        assertEquals("failure [java.lang.IllegalStateException]", full("failure %s", listOf(boom)))
+        assertEquals(
+            "failure {a=java.lang.IllegalStateException}",
+            full("failure %s", mapOf("a" to boom)),
+        )
+        assertEquals("failure [java.lang.IllegalStateException]", full("failure %s", arrayOf(boom)))
+        assertFalse(full("failure %s", listOf(listOf(boom))).contains("+15550100"))
+    }
+
+    @Test
+    fun `an unknown type renders as its class name rather than its toString`() {
+        val rendered = full("at %s", Holder())
+        assertFalse(rendered, rendered.contains("ExampleWifi"))
+        assertTrue(rendered, rendered.contains("Holder"))
+    }
+
+    @Test
+    fun `a tagged value inside a composite renders its value, not the wrapper`() {
+        // The tags are value classes, so boxed inside a collection they reached
+        // the unknown-type branch and rendered as their own class name — losing
+        // exactly the value the call site had gone out of its way to mark
+        // (Codex, PR #3).
+        assertEquals("at [51.5]", full("at %s", listOf(sensitive(51.5))))
+        assertEquals("at [ARMED]", full("at %s", listOf(safe(Mode.ARMED))))
+        assertEquals("at {a=51.5}", full("at %s", mapOf("a" to sensitive(51.5))))
+        assertEquals("at [51.5]", full("at %s", arrayOf<Any?>(sensitive(51.5))))
+    }
+
+    @Test
+    fun `a summary inside a composite still picks its own rendering`() {
+        val summary = LogSummary(full = "place=Home", mirrored = "place=•••")
+        assertEquals("state [place=Home]", full("state %s", listOf(summary)))
+        // Off device an untagged composite is withheld whole, so reaching the
+        // summary's mirrored form at all takes a `safe` composite.
+        assertEquals("state [place=•••]", mirrored("state %s", safe(listOf(summary))))
+    }
+
+    @Test
+    fun `a sensitive element is withheld off device even inside a safe composite`() {
+        // `safe` on the composite is the call site vouching for the composite;
+        // `sensitive` inside it still dominates, as it does anywhere else.
+        val tagged = safe(listOf("cell", sensitive(51.5)))
+        assertTrue(logArgumentMayLeaveDevice(tagged))
+        assertEquals("at [cell, 51.5]", full("at %s", tagged))
+        assertEquals("at [cell, •••]", mirrored("at %s", tagged))
+    }
+
+    @Test
+    fun `a safe composite still keeps its ordinary elements off device`() {
+        // The other direction. Re-applying the whole floor per element would
+        // withhold every `String` in a composite the call site had already
+        // vouched for, which costs the diagnostic and protects nothing.
+        assertEquals("sources [wifi, motion]", mirrored("sources %s", safe(listOf("wifi", "motion"))))
+    }
+
+    @Test
+    fun `a tagged throwable inside a composite still renders its type`() {
+        // The tag decides the floor, never the rendering — so wrapping one does
+        // not reopen the route to the message from inside a composite either.
+        val boom = IllegalStateException("dialed +15550100")
+        assertEquals("failure [java.lang.IllegalStateException]", full("failure %s", listOf(safe(boom))))
+        assertFalse(full("failure %s", listOf(safe(boom))).contains("+15550100"))
+    }
+
+    @Test
+    fun `a composite of ordinary values still reads as its contents`() {
+        // The other direction, and the reason elements are recursed into rather
+        // than the whole composite refused: this is what a call site passing a
+        // list actually wants to see.
+        assertEquals("skipped [a, b]", full("skipped %s", listOf("a", "b")))
+        assertEquals("counts {a=1, b=2}", full("counts %s", mapOf("a" to 1, "b" to 2)))
+    }
+
+    @Test
+    fun `a self-referential composite renders rather than overflowing the stack`() {
+        // Recording must not throw, and unbounded recursion here would throw
+        // from inside the renderer.
+        val loop = mutableListOf<Any>()
+        loop.add(loop)
+        val rendered = full("loop %s", loop)
+        assertTrue(rendered, rendered.startsWith("loop ["))
+    }
+
+    @Test
+    fun `a long composite is bounded rather than built whole`() {
+        val rendered = full("ids %s", (1..100).toList())
+        assertTrue(rendered, rendered.contains("…80 more"))
+        assertFalse(rendered, rendered.contains(" 99,"))
+    }
+
+    @Test
+    fun `a long map is bounded before its entries are rendered, not after`() {
+        // Mapping the entry set eagerly rendered every entry and then threw all
+        // but twenty away — the bound was there, and the cost it exists to
+        // avoid was paid in full on the recording path.
+        val counting = CountingMap((1..100).associate { "k$it" to it })
+        val rendered = full("m %s", counting)
+        assertTrue(rendered, rendered.contains("…80 more"))
+        assertTrue("read ${counting.read} entries", counting.read <= 21)
     }
 
     @Test

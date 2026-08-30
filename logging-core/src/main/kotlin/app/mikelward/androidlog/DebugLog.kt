@@ -127,11 +127,6 @@ open class DebugLog(
     private val buffer = ArrayDeque<Line>(maxEntries)
 
     /**
-     * Where each entry is mirrored once it is safely in the buffer — the
-     * persisted file, logcat, anything the app adds. Each call is isolated, so
-     * one sink's failure can't reach another or the caller.
-     */
-    /**
      * Every registered sink, mapped to the offset it has actually been anchored
      * to — null until its first anchor lands.
      *
@@ -169,6 +164,28 @@ open class DebugLog(
         var offset: ZoneOffset? = null
     }
 
+    /**
+     * Where each entry is mirrored once it is safely in the buffer — the
+     * persisted file, logcat, anything the app adds. Each call is isolated, so
+     * one sink's failure can't reach another or the caller.
+     *
+     * **A sink enqueues; it does not write inline.** Delivery happens under the
+     * buffer's monitor, so a sink that blocks here blocks every other recorder,
+     * and on the paths this library exists for that is not affordable.
+     *
+     * Two things follow from that, and both are prohibitions rather than
+     * behavior this class can make work:
+     *
+     * - **Never call [setRecording] from inside [log].** That is a
+     *   read-to-write upgrade on a lock that does not allow one, and it
+     *   deadlocks.
+     * - **Never record — [event], [warning], [failure] — from inside [log].**
+     *   The entry is dropped, and counted, and the count is reported on the
+     *   next ordinary entry (maintainer, 2026-08-30). A sink honoring the
+     *   enqueue contract loses nothing by this: its own work, and any failure
+     *   of it, happens later on its own thread, where recording is not
+     *   reentrant and works normally.
+     */
     fun interface Sink {
         fun log(line: String)
     }
@@ -196,6 +213,41 @@ open class DebugLog(
 
     @Volatile
     private var session = Session(recording = true)
+
+    /**
+     * The thread currently inside [deliver], if any — how a record made from
+     * inside a sink's own callback is recognized.
+     *
+     * A sink calling [event] from [Sink.log] re-enters both the gate's read
+     * lock and the buffer's monitor, since both are reentrant, so the nested
+     * entry used to append and fan out **completely** before the outer fan-out
+     * reached its next sink: a later sink saw the two in the opposite order to
+     * [snapshot], and a sink that logged on every entry recursed until the
+     * stack gave out (Codex, PR #1).
+     *
+     * Recording from inside [Sink.log] is not supported (maintainer,
+     * 2026-08-30), and the reason it costs a correct sink nothing is the
+     * contract [Sink] already states: sinks *enqueue*. A sink that honors that
+     * also fails later, on its own thread, where recording is not reentrant and
+     * works normally. A queue that made the nested call work would only serve a
+     * sink that was already writing inline, and would need a cap of its own,
+     * which is this same drop one step further along.
+     *
+     * Compared by identity against the calling thread, so another thread merely
+     * *blocked* on the monitor is unaffected — it is not delivering, it is
+     * waiting to record.
+     */
+    @Volatile
+    private var deliveringThread: Thread? = null
+
+    /**
+     * Nested records dropped since the last one that was reported.
+     *
+     * *Never fail silently*: the entries are gone, but that they existed is
+     * not. Guarded by the buffer's monitor, which the dropping thread already
+     * holds — it is inside [deliver].
+     */
+    private var droppedFromSink = 0
 
     /**
      * Excludes a disable from the whole of a record — the append *and* the
@@ -234,6 +286,12 @@ open class DebugLog(
             session = Session(enabled)
             if (!enabled) synchronized(buffer) {
                 buffer.clear()
+                // The pending drop report belongs to the session being
+                // discarded. Left standing, the first entry of the next one
+                // would open with a warning about entries lost before the user
+                // turned recording off — a stale diagnostic pointed at the
+                // wrong session is worse than none (Codex, PR #3).
+                droppedFromSink = 0
                 // The marker went with the clear, so the next entry has to
                 // announce the offset again rather than assume it still stands.
                 // Every sink re-announces after a re-enable rather than
@@ -357,6 +415,16 @@ open class DebugLog(
     }
 
     private fun record(level: Char, format: String, args: Array<out Any?>, throwable: Throwable?) {
+        // Before anything else, including the enabled read: a sink recording
+        // from inside its own `log()` is not supported, and the entry is
+        // dropped rather than allowed to overtake the one being delivered. The
+        // count is reported on the next ordinary entry -- see
+        // [deliveringThread].
+        if (deliveringThread === Thread.currentThread()) {
+            // Reentrant: this thread is inside `deliver`, which holds it.
+            synchronized(buffer) { droppedFromSink++ }
+            return
+        }
         // One read, so the enabled flag and the period it belongs to cannot
         // disagree. A disabled log costs exactly this volatile read on a
         // latency-critical path.
@@ -394,13 +462,59 @@ open class DebugLog(
             // other recorders, and on this library's paths that is not
             // affordable.
             synchronized(buffer) {
-                if (buffer.size >= maxEntries) buffer.removeFirst()
-                buffer.addLast(Line(entry, now?.offset))
-                // Before anything else reaches a sink, so a retried anchor
-                // still precedes the first entry that sink sees.
-                deliver(entry, now)
+                // Ahead of the entry, so the loss is visible at the point in
+                // the log where it happened rather than at the end.
+                reportDroppedFromSink(now)
+                append(entry, now)
             }
         }
+    }
+
+    /**
+     * Appends one rendered entry and hands it to every sink, under the caller's
+     * hold on the buffer's monitor.
+     *
+     * The fan-out is inside the monitor rather than after it so a sink sees
+     * lines in the order the buffer took them, and so a retried anchor still
+     * precedes the first entry that sink sees.
+     */
+    private fun append(entry: String, at: ZonedDateTime?) {
+        if (buffer.size >= maxEntries) buffer.removeFirst()
+        buffer.addLast(Line(entry, at?.offset))
+        deliver(entry, at)
+    }
+
+    /**
+     * Writes one line for the entries dropped since the last report, if any.
+     *
+     * The count is cleared **before** the line is delivered, so a sink that
+     * records from inside this very delivery is counted toward the next report
+     * rather than lost. A line that could not be rendered leaves the count
+     * standing to be reported next time, since a lost report is the silence
+     * this exists to prevent.
+     */
+    private fun reportDroppedFromSink(at: ZonedDateTime?) {
+        val dropped = droppedFromSink
+        if (dropped == 0) return
+        val notice = runCatching {
+            val entries = if (dropped == 1) "entry" else "entries"
+            render(
+                at,
+                'W',
+                "$dropped $entries dropped: a sink recorded from inside log(), " +
+                    "which is not supported",
+                throwable = null,
+            )
+        }.getOrNull() ?: return
+        droppedFromSink = 0
+        // At `maxEntries == 1` this notice is evicted by the entry behind it,
+        // and that is what a one-slot ring means rather than a fault in the
+        // report: the ring holds the newest line, and nothing else was ever
+        // going to survive there. The report still reaches every sink, which is
+        // append-only, so that is where it keeps (Codex, PR #3). Holding the
+        // count back instead would mean it never surfaced at that bound at all,
+        // since every entry evicts the last.
+        append(notice, at)
     }
 
     /**
@@ -425,31 +539,39 @@ open class DebugLog(
      */
     private fun deliver(entry: String, at: ZonedDateTime?) {
         val offset = at?.offset
-        // Iterated over a snapshot of the keys, not the live map. A sink is
-        // free to call `addSink`, `removeSink` or `clearSinks` from inside
-        // `log()`, and a structural change during iteration throws
-        // `ConcurrentModificationException` out of the iterator's `next()` --
-        // which is outside the `runCatching` that contains the callback, and so
-        // escapes `event()` entirely, against the never-throw guarantee (Codex,
-        // PR #1). Snapshotting also means the set of destinations for one entry
-        // is decided once, rather than shifting underneath it.
-        for (sink in sinkAnchors.keys.toList()) {
-            // The registration this entry is going out under. Absent means the
-            // sink unregistered earlier in this same fan-out, so it gets
-            // nothing more.
-            val registration = sinkAnchors[sink] ?: continue
-            if (offset != null && registration.offset != offset) {
-                val marker = "${TIMESTAMP.format(at)} $MARKER_LEVEL timezone offset $offset"
-                val anchored = runCatching { sink.log(marker) }.isSuccess
-                // Compared by identity, not membership: the callback may have
-                // unregistered this sink, or removed and re-added it, and a
-                // fresh registration is waiting for an anchor of its own.
-                // Writing this one's result into it would mark it anchored by a
-                // marker its destination never saw.
-                if (sinkAnchors[sink] !== registration) continue
-                if (anchored) registration.offset = offset
+        // Cleared in a `finally`: a sink is isolated by `runCatching` below, so
+        // nothing here should escape, but leaving this set would silently drop
+        // every later entry on this thread.
+        deliveringThread = Thread.currentThread()
+        try {
+            // Iterated over a snapshot of the keys, not the live map. A sink is
+            // free to call `addSink`, `removeSink` or `clearSinks` from inside
+            // `log()`, and a structural change during iteration throws
+            // `ConcurrentModificationException` out of the iterator's `next()` --
+            // which is outside the `runCatching` that contains the callback, and so
+            // escapes `event()` entirely, against the never-throw guarantee (Codex,
+            // PR #1). Snapshotting also means the set of destinations for one entry
+            // is decided once, rather than shifting underneath it.
+            for (sink in sinkAnchors.keys.toList()) {
+                // The registration this entry is going out under. Absent means the
+                // sink unregistered earlier in this same fan-out, so it gets
+                // nothing more.
+                val registration = sinkAnchors[sink] ?: continue
+                if (offset != null && registration.offset != offset) {
+                    val marker = "${TIMESTAMP.format(at)} $MARKER_LEVEL timezone offset $offset"
+                    val anchored = runCatching { sink.log(marker) }.isSuccess
+                    // Compared by identity, not membership: the callback may have
+                    // unregistered this sink, or removed and re-added it, and a
+                    // fresh registration is waiting for an anchor of its own.
+                    // Writing this one's result into it would mark it anchored by a
+                    // marker its destination never saw.
+                    if (sinkAnchors[sink] !== registration) continue
+                    if (anchored) registration.offset = offset
+                }
+                runCatching { sink.log(entry) }
             }
-            runCatching { sink.log(entry) }
+        } finally {
+            deliveringThread = null
         }
     }
 
