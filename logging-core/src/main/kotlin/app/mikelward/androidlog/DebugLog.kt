@@ -188,6 +188,23 @@ open class DebugLog(
      */
     fun interface Sink {
         fun log(line: String)
+
+        /**
+         * The buffer was emptied because recording was turned off.
+         *
+         * A sink that keeps a durable copy has to act on this, or "off" means
+         * off only in memory: [setRecording] discards what was collected, but a
+         * sink's own copy survives, and on the next launch it is still there to
+         * be read and shared — diagnostics from before the opt-out, kept by the
+         * one component that outlives the buffer (Codex, PR #4). A sink that
+         * keeps nothing durable (logcat) has nothing to do and takes the
+         * default.
+         *
+         * The enqueue contract and both prohibitions above apply here exactly as
+         * they do to [log]: this is called under the same monitor, and recording
+         * from inside it is dropped the same way.
+         */
+        fun onCleared() {}
     }
 
     /**
@@ -275,7 +292,9 @@ open class DebugLog(
     /**
      * Applies the setting. Disabling also **empties the buffer**: entries
      * already collected are exactly what a re-enable in the same process would
-     * otherwise write to disk.
+     * otherwise write to disk. Every sink is told ([Sink.onCleared]), so one
+     * holding a durable copy can discard it too — otherwise "off" would mean
+     * off only in memory.
      */
     fun setRecording(enabled: Boolean) {
         gate.write {
@@ -297,6 +316,9 @@ open class DebugLog(
                 // Every sink re-announces after a re-enable rather than
                 // assuming the offset it last saw still stands.
                 sinkAnchors.values.forEach { it.offset = null }
+                // Last, so a sink acting on this sees the emptied buffer rather
+                // than the one being discarded.
+                notifyCleared()
             }
         }
     }
@@ -463,7 +485,10 @@ open class DebugLog(
             // affordable.
             synchronized(buffer) {
                 // Ahead of the entry, so the loss is visible at the point in
-                // the log where it happened rather than at the end.
+                // the log where it happened rather than at the end. The opt-out
+                // failure goes first: it is about something that happened
+                // before this session opened.
+                reportClearFailures(now)
                 reportDroppedFromSink(now)
                 append(entry, now)
             }
@@ -537,6 +562,71 @@ open class DebugLog(
      * evicted from it, so an inline marker carrying the time it happened is
      * right there and wrong in the ring.
      */
+    /**
+     * Tells every sink the buffer was emptied. Under the same delivering-thread
+     * marker as [deliver], so a sink that records from inside [Sink.onCleared]
+     * is dropped and counted rather than appending to the buffer the disable
+     * just cleared. Each call is isolated, as delivery's are.
+     */
+    private fun notifyCleared() {
+        deliveringThread = Thread.currentThread()
+        try {
+            for (sink in sinkAnchors.keys.toList()) {
+                runCatching { sink.onCleared() }
+                    .onFailure { failure ->
+                        // Held, not said here: recording is off by definition at
+                        // this point, so a line recorded now is dropped by the
+                        // gate. And it has to be said somewhere — a sink that
+                        // could not clear may still be holding exactly what the
+                        // opt-out was meant to remove, and nothing else in the
+                        // system knows (Codex, PR #4).
+                        clearFailures++
+                        if (clearFailure == null) clearFailure = failure
+                    }
+            }
+        } finally {
+            deliveringThread = null
+        }
+    }
+
+    /**
+     * Sinks whose [Sink.onCleared] threw, and the first throwable among them,
+     * awaiting the next entry that can carry the notice.
+     *
+     * Unlike [droppedFromSink] this deliberately **survives the disable that
+     * produced it**. That report was about entries lost from a session being
+     * discarded, so it is stale in the next one; this one is about a durable
+     * copy that outlives every session, and is still true whenever recording
+     * comes back.
+     */
+    private var clearFailures = 0
+    private var clearFailure: Throwable? = null
+
+    /**
+     * Writes one line for the sinks that could not clear, if any.
+     *
+     * Cleared before the line is delivered and left standing when it could not
+     * be rendered, for [reportDroppedFromSink]'s reasons.
+     */
+    private fun reportClearFailures(at: ZonedDateTime?) {
+        val failures = clearFailures
+        if (failures == 0) return
+        val cause = clearFailure
+        val notice = runCatching {
+            val sinks = if (failures == 1) "sink" else "sinks"
+            render(
+                at,
+                'W',
+                "$failures $sinks failed to clear a saved copy when recording " +
+                    "was turned off",
+                cause,
+            )
+        }.getOrNull() ?: return
+        clearFailures = 0
+        clearFailure = null
+        append(notice, at)
+    }
+
     private fun deliver(entry: String, at: ZonedDateTime?) {
         val offset = at?.offset
         // Cleared in a `finally`: a sink is isolated by `runCatching` below, so

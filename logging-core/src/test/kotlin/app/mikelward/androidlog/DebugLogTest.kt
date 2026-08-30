@@ -909,4 +909,112 @@ class DebugLogTest {
         log.event("after")
         assertTrue(seen.toString(), seen.any { it.endsWith(" D after") })
     }
+
+    @Test
+    fun `disabling recording tells the sinks the buffer was cleared`() {
+        // A sink holding a durable copy has to hear about this, or "off" means
+        // off only in memory and its copy outlives the opt-out.
+        val log = log()
+        var cleared = 0
+        log.addSink(object : DebugLog.Sink {
+            override fun log(line: String) = Unit
+            override fun onCleared() {
+                cleared++
+            }
+        })
+
+        log.event("before")
+        assertEquals(0, cleared)
+        log.setRecording(false)
+        assertEquals(1, cleared)
+    }
+
+    @Test
+    fun `enabling recording does not, and a redundant disable does not repeat`() {
+        // The other direction: this is not a general "something changed" signal,
+        // so a sink cannot use it to mean anything but "the buffer is empty now".
+        val log = log()
+        var cleared = 0
+        log.addSink(object : DebugLog.Sink {
+            override fun log(line: String) = Unit
+            override fun onCleared() {
+                cleared++
+            }
+        })
+
+        log.setRecording(false)
+        log.setRecording(true)
+        assertEquals("a re-enable clears nothing", 1, cleared)
+        log.setRecording(false)
+        log.setRecording(false)
+        assertEquals("a redundant disable is a no-op", 2, cleared)
+    }
+
+    @Test
+    fun `a sink recording from inside onCleared has that entry dropped`() {
+        // The same prohibition as `log()`, for the same reason: this runs under
+        // the buffer's monitor, on a thread already inside the log.
+        val log = log()
+        log.addSink(object : DebugLog.Sink {
+            override fun log(line: String) = Unit
+            override fun onCleared() {
+                log.event("from inside onCleared")
+            }
+        })
+
+        log.event("before")
+        log.setRecording(false)
+        log.setRecording(true)
+        log.event("after")
+
+        assertFalse(log.events().toString(), log.events().any { it.contains("from inside onCleared") })
+        assertTrue(log.events().toString(), log.events().any { it.contains("dropped") })
+    }
+
+    @Test
+    fun `a sink that throws from onCleared does not stop the others`() {
+        val log = log()
+        var reached = false
+        log.addSink(object : DebugLog.Sink {
+            override fun log(line: String) = Unit
+            override fun onCleared(): Unit = throw IllegalStateException("boom")
+        })
+        log.addSink(object : DebugLog.Sink {
+            override fun log(line: String) = Unit
+            override fun onCleared() {
+                reached = true
+            }
+        })
+
+        log.setRecording(false)
+        assertTrue(reached)
+    }
+
+    @Test
+    fun `a sink that fails to clear is named once recording resumes`() {
+        // The sink may still be holding exactly what the opt-out was meant to
+        // remove, and nothing else in the system knows. Nothing can be said at
+        // the time — recording is off by then — so it is held.
+        val log = log()
+        log.addSink(object : DebugLog.Sink {
+            override fun log(line: String) = Unit
+            override fun onCleared(): Unit = throw IllegalStateException("boom")
+        })
+
+        log.setRecording(false)
+        assertEquals("nothing is recorded while it is off", emptyList<String>(), log.events())
+
+        log.setRecording(true)
+        log.event("after")
+        val notice = log.events().single { "failed to clear" in it }
+        assertTrue(notice, notice.contains("1 sink failed to clear a saved copy"))
+        assertTrue("and names what failed", notice.contains("IllegalStateException"))
+        assertTrue(
+            log.events().toString(),
+            log.events().indexOf(notice) < log.events().indexOfFirst { it.endsWith(" D after") },
+        )
+
+        log.event("later")
+        assertEquals("said once", 1, log.events().count { "failed to clear" in it })
+    }
 }
