@@ -156,6 +156,27 @@ class PreviousRun internal constructor(
      * has to follow it or miss.
      */
     internal val files: MutableList<File>,
+    /**
+     * Whether [text] is the **whole** of every prior run this handle consumes.
+     *
+     * False three ways, each leaving [text] a partial account:
+     * a run could not be read and was skipped; the directory could not be
+     * listed at all; or the persisted budget trimmed lines away. The first two
+     * leave those files in place for a later read. The third does not — the
+     * trim drops whole lines off the front, so an older run can lose every one
+     * of its lines to a verbose newer one while its file stays in [files] and
+     * [DebugFileSink.clearPreviousRun] deletes it (Codex, PR #20).
+     *
+     * Exposed because a caller cannot work it out. The skipped run is not in
+     * [files] and contributes nothing to [text], so a handle missing an
+     * unreadable crash is indistinguishable from one that is simply the
+     * ordinary run beside it — and a report built from the second, treated as
+     * if it were the first, can consume a crash it never carried (Codex,
+     * snoozemo#153). The text does carry a human-readable notice for whoever
+     * reads the report; this is the same fact in a form a caller can branch on
+     * without matching on a sentence.
+     */
+    val complete: Boolean,
 )
 
 class DebugFileSink internal constructor(
@@ -1194,30 +1215,87 @@ class DebugFileSink internal constructor(
         // find, which is the retry this preserves.
         val files = previousFilesOrNull() ?: run {
             log.warning("Earlier runs could not be listed")
-            return handleFor("[earlier runs could not be listed]", mutableListOf())
+            // Incomplete in the strongest sense: not one run was accounted for,
+            // and every one of them is still on disk.
+            return handleFor("[earlier runs could not be listed]", mutableListOf(), complete = false)
         }
-        val read = mutableListOf<File>()
+        // Kept per file rather than flattened, so the bound below can be
+        // attributed back to the file whose lines it dropped.
+        val perFile = mutableListOf<Pair<File, List<String>>>()
         var unreadable = 0
-        val lines = files.flatMap { file ->
+        for (file in files) {
             val text = runCatching { file.readText() }.getOrNull()
-            if (text != null) {
-                read += file
-                text.split("\n")
-            } else {
+            if (text == null) {
                 unreadable++
-                emptyList()
+                continue
             }
-        }.filter { it.isNotEmpty() }
+            perFile += file to text.split("\n").filter { it.isNotEmpty() }
+        }
+        val readable = perFile.map { it.first }.toMutableList()
+        val lines = perFile.flatMap { it.second }
         if (unreadable > 0) log.warning("%s earlier run(s) could not be read", unreadable)
-        if (lines.isEmpty()) return handleFor(unreadableNotice(unreadable), read)
+        if (lines.isEmpty()) return handleFor(unreadableNotice(unreadable), readable, unreadable == 0)
         // After the bound, not before: a notice prepended first would be the
         // oldest line and so the first one trimmed.
-        val tail = boundedLogTail(lines, PERSIST_BUDGET_CHARS).joinToString("\n")
-        if (tail.isBlank()) return handleFor(unreadableNotice(unreadable), read)
+        val kept = boundedLogTail(lines, PERSIST_BUDGET_CHARS)
+        // The trim is the second way this handle can cover less than it
+        // consumes, and the only one that would *destroy* what it left out: a
+        // skipped run stays on disk because it never entered the handle, but a
+        // run the bound dropped whole was read, listed, and would be deleted by
+        // the share that carried none of it (Codex, PR #20). So it is dropped
+        // from the handle too — a handle consumes exactly the files its text
+        // speaks for, and the next share, with the newer runs gone, carries it.
+        val consumable = filesInside(perFile, droppedLines = lines.size - kept.size)
+        // Still not the whole account, though, and the caller needs to know:
+        // the crash it is about to retire a banner for may be one of the runs
+        // left behind. Compared by content, not by count, since a lone
+        // surviving line can be truncated in place instead of dropped.
+        val complete = unreadable == 0 && kept == lines
+        val tail = kept.joinToString("\n")
+        if (tail.isBlank()) return handleFor(unreadableNotice(unreadable), consumable, complete)
         return handleFor(
             listOfNotNull(unreadableNotice(unreadable), tail).joinToString("\n"),
-            read,
+            consumable,
+            complete,
         )
+    }
+
+    /**
+     * The files whose lines survived a trim of [droppedLines] from the front.
+     *
+     * The bound drops oldest-first, and [perFile] is in that same order, so
+     * walking it and spending the count says which files lost *everything*. A
+     * file whose last lines were cut but whose first survived is kept: a tail
+     * is what this log offers, and excluding a partially-trimmed run would mean
+     * a single over-budget run could never be consumed at all.
+     */
+    private fun filesInside(
+        perFile: List<Pair<File, List<String>>>,
+        droppedLines: Int,
+    ): MutableList<File> {
+        var remaining = droppedLines
+        val kept = mutableListOf<File>()
+        for ((file, lines) in perFile) {
+            // An empty file contributed nothing to drop and nothing to keep. It
+            // is still this run's file and still consumable — but it must not
+            // spend or clear the outstanding count, which belongs entirely to
+            // the files that had lines. Falling through to the reset below let
+            // an empty run sorted ahead of a wholly-dropped one clear the debt
+            // and hand that run back to be deleted unsent (Codex, PR #20).
+            if (lines.isEmpty()) {
+                kept += file
+                continue
+            }
+            if (remaining >= lines.size) {
+                remaining -= lines.size
+                continue
+            }
+            // The first file with a surviving line. Everything after it survives
+            // too, so the count is spent.
+            remaining = 0
+            kept += file
+        }
+        return kept
     }
 
     /**
@@ -1227,9 +1305,9 @@ class DebugFileSink internal constructor(
      * nothing*, not *the read failed*, which is what [readPreviousRun] answers
      * null for when its own wait does not complete.
      */
-    private fun handleFor(text: String?, files: MutableList<File>): PreviousRun? =
+    private fun handleFor(text: String?, files: MutableList<File>, complete: Boolean): PreviousRun? =
         text?.let {
-            PreviousRun(it, files).also { handle ->
+            PreviousRun(it, files, complete).also { handle ->
                 liveHandles()
                 outstanding += WeakReference(handle)
             }

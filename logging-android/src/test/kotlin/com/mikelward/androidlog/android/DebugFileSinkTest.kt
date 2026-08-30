@@ -824,6 +824,102 @@ class DebugFileSinkTest {
     }
 
     @Test
+    fun `a handle says whether it covers every run still on disk`() {
+        // Both directions, because the flag only earns its place if a caller can
+        // tell the two apart: the text reads the same either way once the notice
+        // is one line among many, and the skipped file is in neither `files` nor
+        // the text, so nothing else distinguishes a partial handle from a whole
+        // one.
+        File(dir, "androidlog-prev-1.log").writeText("readable\n")
+        assertTrue("nothing was skipped", sink().readPreviousRun()!!.complete)
+
+        File(dir, "androidlog-prev-2.log").mkdirs()
+        val partial = sink().readPreviousRun()!!
+        assertTrue(partial.text, partial.text.contains("readable"))
+        assertFalse("a run was skipped and is still there", partial.complete)
+    }
+
+    @Test
+    fun `a handle trimmed by the persisted budget does not call itself complete`() {
+        // The trim drops whole lines off the front, so an older run can lose
+        // every line of its own to a verbose newer one -- and its file is
+        // still in the handle, so a share deletes it. A handle calling itself
+        // complete there hands a consumer a report missing that run entirely
+        // and then destroys it (Codex, PR #20).
+        File(dir, "androidlog-prev-1.log").writeText("the oldest run, first to go\n")
+        File(dir, "androidlog-prev-2.log").writeText(
+            (1..12_000).joinToString("\n") { "line $it of a very talkative run" } + "\n",
+        )
+        val handle = sink().readPreviousRun()!!
+
+        assertFalse("the budget cut something", handle.text.contains("the oldest run"))
+        assertFalse(handle.complete)
+    }
+
+    @Test
+    fun `a run the budget dropped whole is not consumed by the share that left it out`() {
+        // The skip cases leave their files alone because those files never
+        // entered the handle. The trim is the one that would destroy what it
+        // left out: the run was read, listed, and would be deleted by a share
+        // carrying none of it (Codex, PR #20). So it leaves the handle too, and
+        // the next share -- with the talkative run gone -- carries it.
+        val older = File(dir, "androidlog-prev-1.log").apply { writeText("the oldest run, first to go\n") }
+        val newer = File(dir, "androidlog-prev-2.log").apply {
+            writeText((1..12_000).joinToString("\n") { "line $it of a very talkative run" } + "\n")
+        }
+        val sink = sink()
+
+        val first = sink.readPreviousRun()!!
+        assertFalse("the premise: the budget cut the older run out", first.text.contains("the oldest run"))
+        sink.clearPreviousRun(first)
+        sink.awaitIdle()
+
+        assertTrue("the run nobody was sent survives", older.exists())
+        assertFalse("the run that was sent does not", newer.exists())
+
+        // And it is offered on the next share, rather than waiting to be pruned.
+        val second = sink.readPreviousRun()!!
+        assertTrue(second.text, second.text.contains("the oldest run"))
+        assertTrue("with nothing left behind this time", second.complete)
+    }
+
+    @Test
+    fun `an empty run ahead of an omitted one does not hand it back to be deleted`() {
+        // The empty file contributed nothing to the trim, so it must not spend
+        // or clear the outstanding drop count. Letting it fall through to the
+        // reset marked the wholly-omitted run beside it as consumable, and the
+        // share that carried none of it deleted it (Codex, PR #20).
+        //
+        // Ordered by modification time, oldest first, which is the order the
+        // trim drops in -- so the times are set rather than left to chance.
+        val empty = File(dir, "androidlog-prev-1.log").apply { writeText("") }
+        val omitted = File(dir, "androidlog-prev-2.log").apply { writeText("the run that gets cut\n") }
+        val verbose = File(dir, "androidlog-prev-3.log").apply {
+            writeText((1..12_000).joinToString("\n") { "line $it of a very talkative run" } + "\n")
+        }
+        assertTrue(empty.setLastModified(1_000L))
+        assertTrue(omitted.setLastModified(2_000L))
+        assertTrue(verbose.setLastModified(3_000L))
+        val sink = sink()
+
+        val handle = sink.readPreviousRun()!!
+        assertFalse("the premise: the budget cut the middle run out", handle.text.contains("the run that gets cut"))
+        sink.clearPreviousRun(handle)
+        sink.awaitIdle()
+
+        assertTrue("the run nobody was sent survives", omitted.exists())
+        assertFalse("the run that was sent does not", verbose.exists())
+    }
+
+    @Test
+    fun `a handle from a listing that failed says it covers nothing`() {
+        // The strongest incomplete case: not one run was accounted for, and
+        // every one of them is still on disk.
+        val handle = sink(at = unlistable()).readPreviousRun()!!
+        assertFalse(handle.complete)
+    }
+
+    @Test
     fun `a shared run that cannot be discarded stays tracked and is reported`() {
         // Dropping it from the tracked set while its contents survive re-sends a
         // report the user has already sent, with nothing to say so.
