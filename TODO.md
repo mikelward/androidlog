@@ -587,6 +587,51 @@ own `runCatching`, before the snapshot and after the crash marker.
   Whatever lands, the test is that an AGP release cannot leave the fleet
   half-moved without something red saying so.
 
+- **Decide what `MAX_PREVIOUS_RUNS` should be, and protect a crash from the
+  prune first.** Standardized at **5 for every consumer** (maintainer,
+  2026-08-30) — no per-app parameter, deliberately, so there is one number to
+  reason about rather than four.
+
+  **Why it is 5 today: no reason is recorded anywhere.** The constant's whole
+  comment is *"How many unshared prior runs to keep — older ones are dropped at
+  startup."* It appeared in simmo, was copy-pasted into typelauncher, and came
+  here with the extraction. No commit body, spec line or review thread
+  justifies it. It is arbitrary and it propagated, which is the drift this
+  repository exists to end.
+
+  **The prune protects the wrong thing, and that is the part to fix first.**
+  `candidates = runs.filter { it.file != rotated }` excludes only the run this
+  launch rotated, so an **unacknowledged crash is deletable by age** once the
+  set is over the bound (Codex, PR #15, on a change since closed). The crash
+  record is what the prior-run set exists for, and a count is a poor way to
+  protect it: at 5 the loss is unlikely rather than impossible, and it gets
+  likelier the lower the bound goes. Exclude an unacknowledged crash from the
+  candidates the way the just-rotated run already is — counted toward the
+  bound, but not deletable, which is the principle the surrounding comment
+  already states.
+
+  **Protect the newest unacknowledged crash, not every one of them** (Codex,
+  PR #16). Acknowledgement is one flag for the whole banner, not one per run,
+  so in a crash loop every crash-suffixed file is unacknowledged at once. A
+  rule that merely counts those toward the bound while refusing to delete any
+  of them stops enforcing a bound at all: once they fill the allowance, each
+  further crash adds another file nothing can ever reclaim, in `cacheDir`, on
+  a device with a bug bad enough to be looping. Protecting the newest one
+  keeps exactly what the banner is about — the crash the user is being asked
+  to report — and leaves the older ones prunable by age like any other run,
+  which is bounded by construction.
+
+  **Then 3 is the recommendation.** Once a crash cannot be pruned, the count
+  governs only *ordinary* runs, whose diagnostic value decays fast — a run four
+  restarts ago that ended uneventfully explains nothing. 3 still covers "it
+  misbehaved a couple of restarts back" and retains 40% less history.
+
+  **Why not lower:** process churn differs sharply across the consumers.
+  simmo's call-redirection service is woken per call and dies constantly, so a
+  bound of 1–2 drops the interesting run within a few calls, before the user
+  ever opens the app. A launcher restarts far less often. One number has to
+  serve the noisiest consumer, which is what rules out the small end.
+
 - **Decide whether this repository carries a `LICENSE`** (maintainer,
   2026-08-30: "to-do for later"). It has none today. That is consistent while
   it is one owner's code shared between one owner's apps — clothescast's
