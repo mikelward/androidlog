@@ -66,30 +66,6 @@ value class SafeLogValue(val value: Any?)
 @JvmInline
 value class SensitiveLogValue(val value: Any?)
 
-/**
- * A composite that carries its own reduced rendering.
- *
- * This exists for the summary of app state whose *shape* is exactly what a
- * report is read for, while some of its fields name the user. As a plain
- * [String] the whole summary would be withheld, and a failure nobody can
- * diagnose is its own kind of loss.
- *
- * **[mirrored] is what renders.** Since the floor moved to ingestion there is
- * one rendering everywhere, so [full] reaches no log line — it is kept for now
- * because it documents at the call site what was reduced away, and because
- * collapsing this type into `safe(mirrored)`, which it is now equivalent to, is
- * a public-API decision rather than a doc fix (Codex, PR #4). Recorded in
- * `TODO.md`.
- */
-class LogSummary(
-    /** What the composite says unreduced. Not rendered; see the class KDoc. */
-    val full: String,
-    /** The rendering that reaches the log. */
-    val mirrored: String,
-) {
-    override fun toString(): String = mirrored
-}
-
 /** See [SafeLogValue]. */
 fun safe(value: Any?): SafeLogValue = SafeLogValue(value)
 
@@ -117,8 +93,6 @@ fun logArgumentMayLeaveDevice(argument: Any?): Boolean {
 }
 
 private fun mayLeaveDeviceUntagged(argument: Any?): Boolean = when (argument) {
-    // Carries both renderings and picks between them itself.
-    is LogSummary -> true
     null -> true
     is Boolean -> true
     is Char -> true
@@ -181,7 +155,8 @@ private const val MAX_RENDERED_ELEMENTS = 20
  *   reads `[51.5]` on device.
  * - Anything else renders as its class name. A domain object is exactly the
  *   case where this code cannot know what is inside, so it does not guess —
- *   [LogSummary] is how a call site renders one deliberately.
+ *   `safe(summarize(it))` is how a call site renders one deliberately, having
+ *   decided for itself what the summary may say.
  *
  * [depth] bounds the recursion, so a self-referential collection renders its
  * type instead of overflowing the stack — recording must not throw.
@@ -250,8 +225,8 @@ private fun renderElements(
  * rendered the outer wrapper through `toString()`, and put the exception
  * message it prints straight into the line the no-messages rule exists to keep
  * it out of. `safe(sensitive(x))` read as safe on the strength of the outer tag
- * alone, and `safe(summary)` rendered a [LogSummary] whole rather than through
- * its own mirrored form (Codex, PR #1).
+ * alone, and a `safe` wrapped around a summary rendered the wrapper rather than
+ * the summary (Codex, PR #1).
  *
  * So the tags are collapsed before anything is decided, and **`sensitive`
  * dominates**: a value the call site marked as the user's stays withheld
@@ -296,9 +271,9 @@ internal fun untaggedLogValue(argument: Any?): Any? = untag(argument).value
 /**
  * Renders one argument, or one element of a composite — they are the same
  * thing, and that is the point: **an element renders exactly as it would if it
- * were the argument itself.** Anything less was how a tag or a [LogSummary]
- * inside a list came out as the wrapper's class name, losing the value the
- * call site had gone out of its way to mark (Codex, PR #3).
+ * were the argument itself.** Anything less was how a tag inside a list came
+ * out as the wrapper's class name, losing the value the call site had gone out
+ * of its way to mark (Codex, PR #3).
  *
  * The floor is applied per *argument*, and a composite is one argument: an
  * untagged one is withheld off device whole, so its elements are never reached
@@ -317,10 +292,6 @@ private fun renderArgument(argument: Any?, redactSensitive: Boolean, depth: Int 
     if (redactSensitive && untagged.sensitive) return REDACTED_PLACEHOLDER
     val value = untagged.value
     return when {
-        // Ahead of the tag branch: a summary carries both renderings and picks
-        // between them itself, and a tag wrapped around one must not take that
-        // choice away from it.
-        value is LogSummary -> if (redactSensitive) value.mirrored else value.full
         // Tagged or not, one rendering path. A tag answers "may this leave the
         // device?", which is [logArgumentMayLeaveDevice]'s question, and
         // nothing about how the value is written down (maintainer,

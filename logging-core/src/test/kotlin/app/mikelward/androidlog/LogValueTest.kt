@@ -103,9 +103,14 @@ class LogValueTest {
     }
 
     @Test
-    fun `a summary renders full on device and reduced off it`() {
-        val summary = LogSummary(full = "snooze(at=Home, 3h)", mirrored = "snooze(3h)")
-        assertEquals("state=snooze(at=Home, 3h)", full("state=%s", summary))
+    fun `a summary the call site reduced itself is carried as it wrote it`() {
+        // An app summarizes its own domain type and vouches for the result. It
+        // reads the same everywhere, because there is one rendering: this used
+        // to be a two-field `LogSummary` picking between a full form and a
+        // reduced one, and the reduced one is the only one anything ever asked
+        // for once the floor moved to ingestion.
+        val summary = safe("snooze(3h)")
+        assertEquals("state=snooze(3h)", full("state=%s", summary))
         assertEquals("state=snooze(3h)", mirrored("state=%s", summary))
     }
 
@@ -192,12 +197,15 @@ class LogValueTest {
     }
 
     @Test
-    fun `a summary inside a composite still picks its own rendering`() {
-        val summary = LogSummary(full = "place=Home", mirrored = "place=•••")
-        assertEquals("state [place=Home]", full("state %s", listOf(summary)))
-        // Off device an untagged composite is withheld whole, so reaching the
-        // summary's mirrored form at all takes a `safe` composite.
-        assertEquals("state [place=•••]", mirrored("state %s", safe(listOf(summary))))
+    fun `a summary inside a composite renders as itself`() {
+        // An element renders exactly as it would as the argument, which is what
+        // keeps a call site's own summary from coming out as a wrapper's class
+        // name when it happens to be inside a list.
+        val summary = safe("place=a place")
+        assertEquals("state [place=a place]", full("state %s", listOf(summary)))
+        // An untagged composite is withheld whole, so reaching the element at
+        // all takes a `safe` composite.
+        assertEquals("state [place=a place]", mirrored("state %s", safe(listOf(summary))))
     }
 
     @Test
@@ -286,9 +294,12 @@ class LogValueTest {
     }
 
     @Test
-    fun `a summary keeps its own mirrored form through a tag`() {
-        val summary = LogSummary(full = "at Home, 12m", mirrored = "at a place, 12m")
-        assertEquals("snooze at Home, 12m", full("snooze %s", safe(summary)))
+    fun `a summary wrapped in a further tag still renders once`() {
+        // Tags collapse before anything is decided, so a `safe` around a `safe`
+        // renders the value rather than the wrapper -- which is what a
+        // generated `toString()` on the outer tag would otherwise print.
+        val summary = safe("at a place, 12m")
+        assertEquals("snooze at a place, 12m", full("snooze %s", safe(summary)))
         assertEquals("snooze at a place, 12m", mirrored("snooze %s", safe(summary)))
     }
 

@@ -26,8 +26,8 @@ Composites are recursed into rather than refused, which is what pays for the
 rule — `listOf("a", "b")` still reads `[a, b]` while `listOf(e)` reads
 `[java.lang.IllegalStateException]`. Only a domain type with its own
 `toString()` degrades, to its class name, and that is exactly the case where
-this code cannot know what is inside; `LogSummary` is how a call site renders
-one deliberately.
+this code cannot know what is inside; `safe(summarize(it))` is how a call site
+renders one deliberately.
 
 `safe(...)` and `sensitive(...)` were narrowed to the floor decision alone —
 may this leave the device — and no longer decide how a value is written.
@@ -36,6 +36,25 @@ sites were using, since `safe` carries fixed-vocabulary strings and state
 names and `String` rendering is identical on either path. One shipped behavior
 changed with it: `safe(enumWithOverriddenToString)` renders the constant name
 rather than the override.
+
+### 3. `LogSummary` — **deleted, in favor of `safe(...)`**
+
+The type carried two fields, `full` and `mirrored`, and the on-device log
+rendered `full` while anything leaving the device rendered `mirrored`. Moving the
+floor to ingestion left one rendering, so only `mirrored` was ever asked for and
+`full` reached nothing — making `LogSummary(full, mirrored)` exactly
+`safe(mirrored)`.
+
+Deleted rather than kept with a dead field (maintainer, 2026-08-30). A call site
+that fills in `full` reasonably expects it to appear somewhere, and it never
+will, so the type was a trap for the four migrations still to come. `safe(...)`
+says the same thing with nothing dead in it. Nothing outside this repository used
+it.
+
+The name went with it, which is a second small win: `mirrored` named a
+*destination* rather than a property of the value, and it was competing with the
+file sink's own — and exact — use of "mirror" for the on-disk copy of the
+in-memory buffer. One meaning now.
 
 ## Decisions needing review
 
@@ -142,7 +161,7 @@ Two things that made this cheap rather than the capability loss I argued it was:
   `record()` has always stored only redacted text — `redactNumber` keeps the
   country code and the last three digits — so its migration is marking those
   values `safe(...)`, not deciding afresh what is safe. clothescast already uses
-  `safe(...)` and `LogSummary` at its call sites. That is the arrangement *No
+  `safe(...)` at its call sites. That is the arrangement *No
   scrubber in the core* describes: the app owns what its own data reduces to,
   the core owns the default.
 
@@ -159,23 +178,6 @@ rendering rule staying put rather than on the type itself.
 **Still true and still tracked below**: the report is the moment the log leaves
 the device, so `:logging-report` should still show the user what they are about
 to send. There is simply less in it to be surprised by now.
-
-### `LogSummary` now has one rendering that is used, and two fields
-
-With the floor applied at ingestion, `renderArgument` only ever asks for the
-reduced form, so `LogSummary.mirrored` is what reaches a log line and
-`LogSummary.full` reaches nothing. That makes `LogSummary(full, mirrored)`
-exactly equivalent to `safe(mirrored)` (Codex, PR #4).
-
-- **Alternative:** collapse the type — delete `LogSummary` and let call sites say
-  `safe(...)` around the reduced string they were going to put in `mirrored`.
-- **Why not yet:** it is a public API removal, and `AGENTS.md` names the type as
-  the reason app-specific report content can stay at the call site. Keeping
-  `full` also documents *at the call site* what was reduced away, which a bare
-  `safe(...)` does not. Neither is a strong enough reason to keep a field
-  nothing renders, so this is the maintainer's call rather than a doc fix.
-- **Reversible:** entirely, in either direction — no consumer has migrated yet,
-  so nothing outside this repository uses it.
 
 ### The `onCrash` hook replaced typelauncher's inlined app state
 
