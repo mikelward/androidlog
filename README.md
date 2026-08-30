@@ -134,6 +134,20 @@ withheld on its own by its type, and every `String` is withheld unless the call
 site wraps it in `safe(...)`. Interpolating into the format string defeats that,
 and nothing can enforce it but review.
 
+**The rule is applied as the entry is recorded, and there is only one
+rendering.** The buffer holds the reduced text, and that is what `snapshot()`,
+every sink, the persisted file and any report all carry — a withheld value is
+never held in full anywhere in the process, so nothing downstream has to
+remember to ask for a safe version. Numbers, booleans, enums, durations and a
+throwable's *type* pass untouched; a `String` does not.
+
+So an app that reduces its own values keeps them by saying so. `simmo` masks a
+dialed number before logging it, and `safe(redactNumber(number))` carries
+`+61••••••678 (len=12)` into the log while a bare number would render as `•••`.
+An unmarked call site shows `•••` on the device's own log screen the first time
+anyone looks, which is the intended feedback: nothing degrades quietly in a file
+nobody reads until a crash.
+
 ### What a consuming app inherits
 
 `:logging-android` ships a `consumer-rules.pro`, which AGP merges into every

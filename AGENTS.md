@@ -36,6 +36,13 @@ has stopped biting.
   in it cannot weaken the type rule. What needs scrubbing differs per app (a
   phone number is simmo's problem, an SSID is snoozemo's, a package name is
   Type Launcher's), and a shared regex would be wrong for three of the four.
+- **The floor is applied at ingestion, and there is one rendering** (maintainer,
+  2026-08-30). `record` renders reduced; the buffer, `snapshot()`, every sink and
+  the persisted file carry that same text, so a withheld value exists in full
+  nowhere in the process and no future reader has to remember to ask for the safe
+  form. Rendering full and reducing at a boundary is what let the durable file
+  carry everything. A consumer that already reduces its own values keeps them by
+  saying `safe(...)`.
 - **No `getMessage()` from a throwable, ever.** A platform exception quotes
   what it was given, and on the paths this log exists for that is exactly what
   the floor bans. Types and stack frames only. There is no scrubber to catch a

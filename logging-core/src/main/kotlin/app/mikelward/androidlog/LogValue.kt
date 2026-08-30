@@ -26,22 +26,34 @@ package app.mikelward.androidlog
  * its own sink around this core, where a mistake in it cannot weaken the type
  * rule above.
  *
- * Nothing is derived off-device here today: every sink the consumers register
- * is on-device. This exists so that adding an off-device mirror later is a
- * change that cannot quietly widen what is sent. The on-device log is
- * unaffected and always renders every argument in full — it is what the user
- * reviews and consents to before sharing a report, and the values in it are
- * what make a bug reproducible.
+ * **The floor is applied at ingestion, and there is one rendering.** An earlier
+ * revision rendered every entry in full and reduced it only at whatever
+ * boundary was judged to be leaving the device. That is two renderings of
+ * everything — twice the buffer — and worse, a rule that holds only while every
+ * future reader remembers to ask for the reduced form; the durable file was
+ * already a reader that did not (maintainer, 2026-08-30). So the buffer,
+ * `snapshot()`, every sink, the persisted file and anything derived from them
+ * all carry the same text, and a value this rule withholds exists in full
+ * nowhere in the process.
+ *
+ * That puts the weight on the call sites, deliberately. A consumer that has
+ * already reduced a value — a masked number, an account token, a state name —
+ * says so with [safe] and keeps it, which is the arrangement the *no scrubber
+ * in the core* rule describes: the app owns what its own data reduces to, and
+ * this rule owns the default. An unmarked call site shows
+ * [REDACTED_PLACEHOLDER] on the device's own log screen the first time anyone
+ * looks, rather than quietly degrading a file nobody reads until a crash.
  */
 
 /** Rendered in place of an argument that may not leave the device. */
 const val REDACTED_PLACEHOLDER = "•••"
 
 /**
- * Marks a value that may be carried in full even though its type would withhold
+ * Marks a value that is carried as it is even though its type would withhold
  * it — fixed vocabulary that names the platform rather than anything of the
  * user's (a state name, an intent action, an end reason, a wake-up source, a
- * URI reduced to its scheme).
+ * URI reduced to its scheme), or a value the app has already reduced itself (a
+ * masked number, an account token).
  */
 @JvmInline
 value class SafeLogValue(val value: Any?)
@@ -55,21 +67,27 @@ value class SafeLogValue(val value: Any?)
 value class SensitiveLogValue(val value: Any?)
 
 /**
- * A value with two renderings: the full one for the on-device log, and a
- * reduced one for anywhere else.
+ * A composite that carries its own reduced rendering.
  *
- * This exists for the composite summary — a snapshot of app state whose *shape*
- * is exactly what a report is read for, while some of its fields name the user.
- * As a plain [String] the whole summary would be withheld, and a failure nobody
- * can diagnose is its own kind of loss.
+ * This exists for the summary of app state whose *shape* is exactly what a
+ * report is read for, while some of its fields name the user. As a plain
+ * [String] the whole summary would be withheld, and a failure nobody can
+ * diagnose is its own kind of loss.
+ *
+ * **[mirrored] is what renders.** Since the floor moved to ingestion there is
+ * one rendering everywhere, so [full] reaches no log line — it is kept for now
+ * because it documents at the call site what was reduced away, and because
+ * collapsing this type into `safe(mirrored)`, which it is now equivalent to, is
+ * a public-API decision rather than a doc fix (Codex, PR #4). Recorded in
+ * `TODO.md`.
  */
 class LogSummary(
-    /** Rendered in the on-device log. */
+    /** What the composite says unreduced. Not rendered; see the class KDoc. */
     val full: String,
-    /** Rendered off device, with the identifying fields removed. */
+    /** The rendering that reaches the log. */
     val mirrored: String,
 ) {
-    override fun toString(): String = full
+    override fun toString(): String = mirrored
 }
 
 /** See [SafeLogValue]. */
@@ -79,7 +97,8 @@ fun safe(value: Any?): SafeLogValue = SafeLogValue(value)
 fun sensitive(value: Any?): SensitiveLogValue = SensitiveLogValue(value)
 
 /**
- * Whether [argument] may appear in full off the device.
+ * Whether [argument] is carried as it is, rather than as
+ * [REDACTED_PLACEHOLDER]. Asked once, as the entry is recorded.
  *
  * Numbers pass by default: a count, a duration, a distance in meters, a fix
  * accuracy. Those say whether a mechanism worked, which is the diagnostic.
@@ -110,6 +129,16 @@ private fun mayLeaveDeviceUntagged(argument: Any?): Boolean = when (argument) {
     is Float -> true
     is Double -> true
     is Enum<*> -> true
+    // Its rendering here is fixed to the class name, and the no-messages floor
+    // is what makes that true: nothing this library renders reaches a
+    // throwable's message. So a throwable names a *type*, never the user --
+    // the same reason an enum passes. Withholding it cost the one thing a
+    // failure line is read for (maintainer, 2026-08-30).
+    is Throwable -> true
+    // Everything else is withheld, `String` above all. An unknown type renders
+    // as its class name too, so it could pass by the same argument -- it does
+    // not, because that would rest on a rendering rule staying put rather than
+    // on the type itself, and the default here fails closed.
     else -> false
 }
 

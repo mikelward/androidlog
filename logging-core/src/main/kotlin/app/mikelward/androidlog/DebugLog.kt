@@ -358,10 +358,16 @@ open class DebugLog(
      *
      * [format] is a hard-coded format string — a source literal, never a built
      * value — with one `%s` per argument. That split is what makes the log safe
-     * to mirror off the device later: the literal cannot name anything of the
+     * to leave the device at all: the literal cannot name anything of the
      * user's, and each argument is carried or withheld on its own by
-     * [logArgumentMayLeaveDevice]. The on-device line always renders every
-     * argument in full.
+     * [logArgumentMayLeaveDevice].
+     *
+     * **The floor is applied here, as the entry is recorded, and there is one
+     * rendering.** An argument it withholds renders as [REDACTED_PLACEHOLDER]
+     * in the buffer, on the device's own log screen, in every sink and in
+     * anything persisted or shared — there is no fuller form anywhere. A call
+     * site that has already reduced a value keeps it by saying `safe(...)`;
+     * one that has not sees the placeholder the first time anyone looks.
      *
      * Interpolating into [format] defeats it. The type system cannot enforce
      * that, so it is a rule: pass values as arguments.
@@ -479,8 +485,17 @@ open class DebugLog(
         // nothing it does may escape -- a lost log line is the accepted cost, a
         // dropped call or a stuck snooze is not. Built before the gate is
         // taken, so rendering never holds it.
+        //
+        // **Redacted here, once, and there is no other form.** The floor is
+        // applied at ingestion rather than at whichever boundary happens to be
+        // last, so the buffer, `snapshot()`, every sink and anything derived
+        // from them all carry the same text. Rendering full and reducing later
+        // would mean two renderings of every entry -- twice the buffer, and a
+        // rule that holds only as long as every future reader remembers to ask
+        // for the reduced one. An argument the type rule withholds never exists
+        // in full anywhere in this process (maintainer, 2026-08-30).
         val entry = runCatching {
-            render(now, level, formatLogMessage(format, args, redactSensitive = false), throwable)
+            render(now, level, formatLogMessage(format, args, redactSensitive = true), throwable)
         }.getOrElse { return false }
         gate.read {
             // Still the same session? Anything else — a disable, a re-enable,

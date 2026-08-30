@@ -55,11 +55,36 @@ class DebugLogTest {
     }
 
     @Test
-    fun `an event is recorded with its level and its arguments in full`() {
+    fun `an event is recorded with its level, and the floor applied at ingestion`() {
+        // One rendering, and it is the reduced one. The buffer never holds a
+        // form the floor would withhold, so nothing downstream -- a sink, a
+        // file, a report -- has to remember to ask for the safe version.
         val log = log()
         log.event("joined %s at %s", "ExampleWifi", 3)
         val line = log.events().single()
-        assertTrue(line, line.endsWith(" D joined ExampleWifi at 3"))
+        assertTrue(line, line.endsWith(" D joined $REDACTED_PLACEHOLDER at 3"))
+    }
+
+    @Test
+    fun `a value the call site vouches for survives ingestion`() {
+        // The floor is a type rule, so an app that has already reduced a value
+        // says so and keeps it -- which is how a consumer that redacts before
+        // logging (a masked number, an account token) stays diagnosable.
+        val log = log()
+        log.event("joined %s at %s", safe("+61\u2022\u2022\u2022\u2022\u2022\u2022678 (len=12)"), 3)
+        val line = log.events().single()
+        assertTrue(line, line.endsWith(" D joined +61\u2022\u2022\u2022\u2022\u2022\u2022678 (len=12) at 3"))
+    }
+
+    @Test
+    fun `a throwable argument still names its type`() {
+        // Withheld, it took the one thing a failure line is read for. Its
+        // rendering is the class name and nothing else, so it names no user.
+        val log = log()
+        log.event("gave up on %s", IllegalStateException("secret"))
+        val line = log.events().single()
+        assertTrue(line, line.endsWith(" D gave up on java.lang.IllegalStateException"))
+        assertFalse(line, line.contains("secret"))
     }
 
     @Test

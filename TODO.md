@@ -117,38 +117,65 @@ than the window it removes.
 - **Reversible:** whichever fix is chosen, it is local to `onCleared` and the
   startup rotation. Nothing else depends on the purge being asynchronous.
 
-### The persisted log keeps the on-device rendering, not the mirrored one
+### The floor is applied at ingestion, so there is one rendering
 
-Codex raised this as a P1 on PR #4: `writeSnapshot` persists `DebugLog.snapshot()`,
-which is the full on-device rendering, so a value the type floor would withhold —
-every `String`, which is most of a log — is written verbatim and read back into a
-shared report. Its proposal was to persist a separately rendered, redacted
-snapshot instead.
+Codex raised this twice on PR #4, as a P1 both times: the persisted file carried
+`DebugLog.snapshot()`, which was the full on-device rendering, so a value the
+type floor would withhold was written verbatim and read back into a shared
+report. I declined it twice, on the grounds that the file sink is an on-device
+sink and `LogValue.kt` said the on-device log renders in full.
 
-**Declined**, and this is the one finding on that PR I did not take, so it is
-recorded here rather than only on the thread.
+**Overruled by the maintainer (2026-08-30), and the resolution is stronger than
+the proposal.** The proposal was a second, reduced rendering written to disk. The
+maintainer's model was simpler and is the one taken: reduce at *ingestion*, keep
+one form. `record` renders with `redactSensitive = true`, and the buffer,
+`snapshot()`, every sink, the persisted file and any report all carry that same
+text. A withheld value now exists in full nowhere in the process, so the rule
+does not depend on each future reader remembering to ask for the safe form —
+which is exactly how the file came to be a reader that did not.
 
-- It cites *No scrubber in the core* (`AGENTS.md`), which says the opposite of
-  what the proposal needs: the floor is "a type rule over log arguments, not a
-  regex over rendered text", and an app wanting more "wraps its own sink around
-  the core".
-- `LogValue.kt` states the design directly: "The on-device log is unaffected and
-  always renders every argument in full — **it is what the user reviews and
-  consents to before sharing a report**, and the values in it are what make a bug
-  reproducible." The file sink is an on-device sink. The mirrored rendering
-  exists for a channel that leaves the device *without* a person reviewing it,
-  and there is none today.
-- Taking it would redact essentially the whole log, since `String` is the type
-  every identifier arrives as — which is `AGENTS.md`'s named failure: an
-  over-strict reading costing the consumers the ability to diagnose their own
-  bugs. It is also what both shipped copies do today.
+Two things that made this cheap rather than the capability loss I argued it was:
 
-**What is real in it, and is now tracked below**: the report is the moment the
-log leaves the device, so consent belongs at that boundary rather than in the
-sink. `:logging-report` has to show the user what they are about to send.
+- **Numbers, booleans, enums and durations already pass**, so the mechanism
+  detail most lines turn on is untouched.
+- **The consumers that handle PII already reduce it before logging.** simmo's
+  `record()` has always stored only redacted text — `redactNumber` keeps the
+  country code and the last three digits — so its migration is marking those
+  values `safe(...)`, not deciding afresh what is safe. clothescast already uses
+  `safe(...)` and `LogSummary` at its call sites. That is the arrangement *No
+  scrubber in the core* describes: the app owns what its own data reduces to,
+  the core owns the default.
 
-If the maintainer would rather the persisted file were mirrored, that inverts
-the design statement in `LogValue.kt` and should change there first.
+One widening came with it: a bare `Throwable` argument now passes the type rule.
+Its rendering here is fixed to the class name and the no-messages floor
+guarantees nothing reaches its message, so it names a type rather than a person —
+the same reason an enum passes. Withheld, it took the one thing a failure line is
+read for.
+
+Left deliberately narrow: an *unknown* type also renders as its class name and
+could pass by the same argument. It does not, because that would rest on a
+rendering rule staying put rather than on the type itself.
+
+**Still true and still tracked below**: the report is the moment the log leaves
+the device, so `:logging-report` should still show the user what they are about
+to send. There is simply less in it to be surprised by now.
+
+### `LogSummary` now has one rendering that is used, and two fields
+
+With the floor applied at ingestion, `renderArgument` only ever asks for the
+reduced form, so `LogSummary.mirrored` is what reaches a log line and
+`LogSummary.full` reaches nothing. That makes `LogSummary(full, mirrored)`
+exactly equivalent to `safe(mirrored)` (Codex, PR #4).
+
+- **Alternative:** collapse the type — delete `LogSummary` and let call sites say
+  `safe(...)` around the reduced string they were going to put in `mirrored`.
+- **Why not yet:** it is a public API removal, and `AGENTS.md` names the type as
+  the reason app-specific report content can stay at the call site. Keeping
+  `full` also documents *at the call site* what was reduced away, which a bare
+  `safe(...)` does not. Neither is a strong enough reason to keep a field
+  nothing renders, so this is the maintainer's call rather than a doc fix.
+- **Reversible:** entirely, in either direction — no consumer has migrated yet,
+  so nothing outside this repository uses it.
 
 ### The `onCrash` hook replaced typelauncher's inlined app state
 
