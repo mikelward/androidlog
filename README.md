@@ -20,11 +20,12 @@ and nothing propagated it.
 | `:logging-core` | Plain Kotlin JVM. No Android, enforced by `verifyNoAndroid`. | The bounded buffer, the recording gate, the sink interface, the format-plus-arguments contract, the type rule that is the privacy floor, throwable rendering. |
 | `:logging-android` | Android library, `minSdk` 31, **no resources**. | The platform sinks: logcat, and the persisted file with its rotation and crash record. |
 
-A third module, `:logging-report` — the share sheet, the clipboard fallback and
-the FileProvider glue — is deliberately not here yet. It is the one part that
-needs resources (a chooser title names the app), and a library with resources
-forces resource merging on every consumer, so it earns its own module when it
-arrives rather than being folded into `:logging-android`.
+The share sheet and clipboard fallback are in `:logging-android` too, as
+`DebugReport`. They were once meant to be a third module — a chooser title names
+the app, and that reads like a resource — but the caller passes the title and
+subject as strings, so nothing needed resources and no consumer pays for
+resource merging. A `:logging-report` module still awaits the one thing that
+genuinely needs them: the FileProvider glue for a report carrying a screenshot.
 
 **What is not here, and will not be: the report's *contents*.** A decision
 snapshot, a snooze summary, an `Intent` rendering — those are each app's own
@@ -148,6 +149,50 @@ since a tail keeps the newest and drops the oldest, which is the opposite of
 what they need. Reserve it for lines written a handful of times a run: the
 pinned buffer is bounded too, so a chatty caller evicts the start-up lines from
 the one place keeping them.
+
+## Sharing it
+
+The app decides what the report says; the library gets it to the user:
+
+```kotlin
+// Off the main thread — it reads the prior run's files.
+val report = DebugReport.collect(SnoozemoLog, files) {
+    buildString {
+        appendLine("Snoozemo debug log")
+        appendLine(describeCurrentSnooze())
+    }
+}
+
+// On the main thread — it touches the clipboard.
+when (DebugReport.deliver(context, SnoozemoLog, report, subject, title, label)) {
+    ShareOutcome.SHARED -> Unit                  // the sheet is its own confirmation
+    ShareOutcome.COPIED_ONLY -> toast("Copied")  // say so, or the user shares again
+    ShareOutcome.FAILED -> toast("Couldn't share")
+}
+```
+
+Two calls rather than one `suspend` function, because this library takes no
+third-party runtime dependency and so cannot hop threads for you — your own
+scope is a better place for that choice anyway.
+
+The prior run is consumed only when the **clipboard copy** landed. A chooser
+reports nothing back, so its launch is not evidence anything was sent, and
+treating it as delivery would spend a crash log on a sheet the user may have
+dismissed. `COPIED_ONLY` is the case worth telling them about: no sheet and no
+error reads as "the tap did nothing", and the retry carries no prior run and
+overwrites the clipboard copy that did.
+
+You write what your app has to say; **the prior run is appended for you**. That
+is deliberate rather than a convenience: passing it in and trusting the returned
+text to contain it means a builder that ignores it still gets it marked as
+delivered, and the first clipboard copy then deletes a crash log nobody saw. An
+app that wants no prior run passes a null sink, which reads nothing and consumes
+nothing.
+
+A payload builder that throws is contained — its section says which exception
+type, never its message — and the prior run is still appended and still
+consumed, because it was read and delivered regardless of what the app's own
+section managed to say.
 
 The rule that matters: **a log call is a hard-coded format string plus
 arguments.** The literal is safe by construction; each argument is carried or

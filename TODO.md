@@ -107,6 +107,37 @@ growing a second copy for the buffers.
 
 ## Decisions needing review
 
+### Should the privacy floor extend over report *bodies*?
+
+Codex raised it as a P1 on PR #8 and I declined it there, because
+`AGENTS.md`'s *App-specific report content does not belong here* places that
+judgment with the app in as many words — "deciding for itself what the summary
+may say". But the underlying question is real and is the maintainer's, not
+mine to settle from a review comment.
+
+The finding: `DebugReport.collect`'s `buildPayload` returns a plain `String`,
+so an app interpolating an SSID or a contact into its own report section has it
+shared verbatim. Nothing in the library judges it by type the way a log
+argument is judged.
+
+- **Why it is not a regression:** this is how all four apps already build their
+  reports, and the part the *library* contributes — the appended prior run — is
+  reduced at ingestion like every other entry. The PR ports an app-owned path
+  rather than opening one.
+- **What extending the floor would cost:** a report body is version strings,
+  permission grants, an SDK level and app-domain summaries. Requiring every
+  line to be a marked log value makes it unreadable to assemble and pushes
+  app vocabulary — sections, ordering, headings — into a module `AGENTS.md`
+  keeps it out of.
+- **What it would buy:** an app that interpolates a raw value into its report
+  could no longer do so silently. Today that is caught by review, not by types.
+
+Not urgent: nothing about it blocks a migration, and the apps reduce their own
+values already (simmo's `redactNumber` runs before anything reaches its
+payload).
+
+
+
 ### PR #7 is held for the maintainer, not merged under autopilot
 
 Seven Codex findings across four rounds, **five of them on one seam**: the clamp
@@ -318,7 +349,31 @@ own `runCatching`, before the snapshot and after the crash marker.
   time it is read. The fix is to re-emit the last anchor above the cut, which
   means recognizing an anchor line by its rendered form — worth doing, and
   worth doing deliberately rather than folded into another change.
-- `:logging-report` — share sheet, clipboard fallback, FileProvider. The one
+- **Migrate the API to `suspend` functions** (maintainer, 2026-08-30). Decided,
+  not merely available. `DebugReport.collect` blocks
+  and is documented "call it off the main thread", on my mistaken claim that a
+  `suspend` function would drag in `kotlinx-coroutines`. It would not: `suspend`,
+  `Continuation`, `suspendCoroutine` and `startCoroutine` are all in
+  `kotlin-stdlib` (verified by compiling them here with nothing declared). What
+  needs the dependency is *dispatching* — `Dispatchers`, `withContext`, `Flow`,
+  and `suspendCancellableCoroutine`. So the library could park the caller while
+  the worker reads and resume them on whatever dispatcher they came from,
+  removing the footgun entirely. Not done in the first cut because the blocking
+  pair is the shape the apps already wrap in `withContext(IO)`, so it was parity
+  and unblocked the migrations; the `suspend` form is the shape to land on. One
+  caveat when it is done: without `suspendCancellableCoroutine` a cancelled
+  scope will not abort an in-flight read, which is fine for a bounded file read
+  but should be stated rather than discovered.
+
+- `:logging-report` — **not built, and may never need to be.** The share sheet
+  and clipboard fallback landed in `:logging-android` as `DebugReport`, taking
+  the chooser title and subject as caller strings, so they need no resources and
+  forced no resource merging on four consumers. What is left for a module of its
+  own is the FileProvider attachment, which only Type Launcher's
+  screenshot-carrying report wants; until something needs it, the module would
+  be a module for one caller.
+
+  The old entry read: share sheet, clipboard fallback, FileProvider — the one
   module that needs resources, which is why it is its own module. **It has to
   show the user the report before it is sent** — but not for the reason this
   entry used to give (Codex, PR #4). The old rationale was that the on-device
@@ -337,6 +392,25 @@ own `runCatching`, before the snapshot and after the crash marker.
   app removes them. The names are per-app, so the library cannot: it is one
   delete in each migration, alongside marking that app's already-reduced values
   `safe(...)`.
-- The consumer migrations, one at a time, starting with snoozemo: its `:core`
-  split already matches this shape. Then simmo, typelauncher, clothescast.
-  Held until simmo's in-flight PRs land (maintainer, 2026-08-30).
+- **The consumer migrations, one at a time — clothescast, then snoozemo, then
+  typelauncher, and simmo LAST** (maintainer, 2026-08-30).
+
+  The order is not arbitrary and the reason is worth keeping: **simmo's CI is
+  expensive, so the cheaper repos go first to flush out this library's bugs
+  before that cost is paid.** Which makes the early migrations bug-discovery
+  rather than rollout — expect to find gaps here and fix them here, and treat a
+  migration that needs no library change as the surprise rather than the norm.
+  They are also the first exercise of two things no JVM test can reach: the
+  composite build resolving from a consumer, and the chooser and clipboard
+  actually working.
+
+  Availability at the time of writing: clothescast is clear (its open PRs are
+  two dependency batches and two CI changes, none touching logging), is at the
+  `minSdk` 31 floor, and already uses `safe(...)` at its call sites — so it is
+  first. snoozemo has work in flight. typelauncher has PR #675 live in the
+  bug-report/crash-log path a migration replaces, and is the heaviest anyway:
+  it is the only report carrying a screenshot, which wants the FileProvider
+  piece this library does not have.
+
+  Each migration also deletes that app's legacy log files and marks its
+  already-reduced values `safe(...)` — see the entry above.
