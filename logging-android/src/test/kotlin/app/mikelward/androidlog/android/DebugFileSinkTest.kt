@@ -116,7 +116,7 @@ class DebugFileSinkTest {
 
         assertFalse("the current file is renamed, not copied", current().exists())
         assertEquals(1, previous().size)
-        assertTrue(sink.readPreviousRun()!!.contains("the run before"))
+        assertTrue(sink.readPreviousRun()!!.text.contains("the run before"))
     }
 
     @Test
@@ -144,8 +144,9 @@ class DebugFileSinkTest {
         sink.start(installCrashHandler = false)
         sink.awaitIdle()
 
-        assertTrue(sink.readPreviousRun()!!.contains("the run before"))
-        sink.clearPreviousRun()
+        val shared = sink.readPreviousRun()!!
+        assertTrue(shared.text.contains("the run before"))
+        sink.clearPreviousRun(shared)
         sink.awaitIdle()
         assertEquals(0, previous().size)
         assertNull("a consumed run is not offered twice", sink.readPreviousRun())
@@ -159,8 +160,9 @@ class DebugFileSinkTest {
         File(dir, "androidlog-prev-2.log").writeText("readable\n")
         val sink = sink()
 
-        assertTrue(sink.readPreviousRun()!!.contains("readable"))
-        sink.clearPreviousRun()
+        val shared = sink.readPreviousRun()!!
+        assertTrue(shared.text.contains("readable"))
+        sink.clearPreviousRun(shared)
         sink.awaitIdle()
         assertTrue("the unread run survives its own share", File(dir, "androidlog-prev-1.log").exists())
         assertFalse(File(dir, "androidlog-prev-2.log").exists())
@@ -201,8 +203,7 @@ class DebugFileSinkTest {
         assertFalse("the marker is read once, then consumed", File(dir, "androidlog.log.crash").exists())
 
         // Share it away, so what the next start sees is only its own run.
-        crashed.readPreviousRun()
-        crashed.clearPreviousRun()
+        crashed.clearPreviousRun(crashed.readPreviousRun()!!)
         crashed.awaitIdle()
 
         // A second run that ended ordinarily leaves an ordinary file behind: the
@@ -232,7 +233,7 @@ class DebugFileSinkTest {
         // banner must not throw away the log it was offering.
         assertTrue(previous().single().name.endsWith(".log"))
         assertFalse(previous().single().name.endsWith(".crash.log"))
-        assertTrue(sink.readPreviousRun()!!.contains("crashed"))
+        assertTrue(sink.readPreviousRun()!!.text.contains("crashed"))
     }
 
     @Test
@@ -273,8 +274,7 @@ class DebugFileSinkTest {
         sink.start(installCrashHandler = false)
         sink.awaitIdle()
 
-        sink.readPreviousRun()
-        sink.clearPreviousRun()
+        sink.clearPreviousRun(sink.readPreviousRun()!!)
         sink.awaitIdle()
         assertFalse("the crash was consumed along with its log", sink.unacknowledgedCrash)
     }
@@ -290,10 +290,10 @@ class DebugFileSinkTest {
         sink.start(installCrashHandler = false)
         sink.awaitIdle()
 
-        sink.readPreviousRun()
+        val shared = sink.readPreviousRun()!!
         sink.acknowledgeCrashBanner()
         sink.awaitIdle()
-        sink.clearPreviousRun()
+        sink.clearPreviousRun(shared)
         sink.awaitIdle()
         assertEquals("the renamed file was still consumed", 0, previous().size)
     }
@@ -462,7 +462,7 @@ class DebugFileSinkTest {
         next.awaitIdle()
 
         assertTrue("still classified as a crash", next.unacknowledgedCrash)
-        assertTrue(next.readPreviousRun()!!.contains("the crash nobody has read yet"))
+        assertTrue(next.readPreviousRun()!!.text.contains("the crash nobody has read yet"))
     }
 
     // --------------------------------------------------------- the opt-out
@@ -522,7 +522,7 @@ class DebugFileSinkTest {
 
         log.setRecording(false)
         sink.awaitIdle()
-        assertTrue(sink.readPreviousRun()!!.contains("an earlier run"))
+        assertTrue(sink.readPreviousRun()!!.text.contains("an earlier run"))
     }
 
     // ----------------------- a retained run is a prior run in every sense
@@ -546,7 +546,7 @@ class DebugFileSinkTest {
         val sink = sinkWithFailedRotation()
 
         assertTrue("the preserved crash raises the banner", sink.unacknowledgedCrash)
-        assertTrue(sink.readPreviousRun()!!.contains("the crash nobody has read yet"))
+        assertTrue(sink.readPreviousRun()!!.text.contains("the crash nobody has read yet"))
     }
 
     @Test
@@ -555,8 +555,7 @@ class DebugFileSinkTest {
         val sink = sinkWithFailedRotation(log)
         log.addSink(sink)
 
-        sink.readPreviousRun()
-        sink.clearPreviousRun()
+        sink.clearPreviousRun(sink.readPreviousRun()!!)
         sink.awaitIdle()
         // The file may exist again immediately — resuming writes this run's
         // buffer straight away — so the claim is about its *contents*.
@@ -579,7 +578,7 @@ class DebugFileSinkTest {
         sink.acknowledgeCrashBanner()
         sink.awaitIdle()
         assertFalse(sink.unacknowledgedCrash)
-        assertTrue("the log stays shareable", sink.readPreviousRun()!!.contains("the crash nobody has read yet"))
+        assertTrue("the log stays shareable", sink.readPreviousRun()!!.text.contains("the crash nobody has read yet"))
     }
 
     @Test
@@ -594,7 +593,7 @@ class DebugFileSinkTest {
         log.setRecording(false)
         sink.awaitIdle()
         assertTrue(current().exists())
-        assertTrue(sink.readPreviousRun()!!.contains("the crash nobody has read yet"))
+        assertTrue(sink.readPreviousRun()!!.text.contains("the crash nobody has read yet"))
     }
 
     // ------------------------------------------------------- the crash marker
@@ -724,7 +723,7 @@ class DebugFileSinkTest {
         val log = log()
         val sink = sink(log)
 
-        val report = sink.readPreviousRun()!!
+        val report = sink.readPreviousRun()!!.text
         assertTrue(report, report.contains("could not be read"))
         assertTrue(report, report.contains("readable"))
         assertTrue(
@@ -738,7 +737,7 @@ class DebugFileSinkTest {
         // The other shape of the same harm: returning null here would say "no
         // earlier run" when the truth is "one, and it could not be read".
         File(dir, "androidlog-prev-1.log").mkdirs()
-        val report = sink().readPreviousRun()
+        val report = sink().readPreviousRun()?.text
         assertNotNull(report)
         assertTrue(report!!, report.contains("could not be read"))
     }
@@ -750,14 +749,14 @@ class DebugFileSinkTest {
         File(dir, "androidlog-prev-1.log").writeText("shared once\n")
         val log = log()
         val sink = sink(log)
-        sink.readPreviousRun()
+        val shared = sink.readPreviousRun()!!
 
         // A directory in place of the file: it cannot be deleted (not empty) and
         // cannot be truncated, so the discard fails for real.
         File(dir, "androidlog-prev-1.log").delete()
         File(dir, "androidlog-prev-1.log/wedged").mkdirs()
 
-        sink.clearPreviousRun()
+        sink.clearPreviousRun(shared)
         sink.awaitIdle()
         assertTrue(
             log.snapshot().toString(),
@@ -768,7 +767,7 @@ class DebugFileSinkTest {
         // leaving the contents to ride a later report.
         File(dir, "androidlog-prev-1.log").deleteRecursively()
         File(dir, "androidlog-prev-1.log").writeText("shared once\n")
-        sink.clearPreviousRun()
+        sink.clearPreviousRun(shared)
         sink.awaitIdle()
         assertFalse("the retry reached it", File(dir, "androidlog-prev-1.log").exists())
     }
@@ -1132,7 +1131,7 @@ class DebugFileSinkTest {
         val sink = sink()
         sink.start(installCrashHandler = false)
         sink.awaitIdle()
-        sink.readPreviousRun()
+        val shared = sink.readPreviousRun()!!
 
         val holding = CountDownLatch(1)
         val released = CountDownLatch(1)
@@ -1144,7 +1143,7 @@ class DebugFileSinkTest {
 
         // Deadlocks if this waits on the worker, which is exactly what it would
         // do on the main thread from a report's completion callback.
-        sink.clearPreviousRun()
+        sink.clearPreviousRun(shared)
         released.countDown()
         sink.awaitIdle()
 
@@ -1218,8 +1217,7 @@ class DebugFileSinkTest {
         log.event("logged while nothing could be written")
         sink.awaitIdle()
 
-        sink.readPreviousRun()
-        sink.clearPreviousRun()
+        sink.clearPreviousRun(sink.readPreviousRun()!!)
         sink.awaitIdle()
 
         // No further entry: the resume itself has to be what saves it.
@@ -1291,7 +1289,7 @@ class DebugFileSinkTest {
         val log = log()
         val sink = sink(log, at = unlistable())
 
-        val report = sink.readPreviousRun()
+        val report = sink.readPreviousRun()?.text
         assertNotNull(report)
         assertTrue(report!!, report.contains("could not be listed"))
         assertTrue(
@@ -1318,8 +1316,7 @@ class DebugFileSinkTest {
 
         log.event("this run, which must not be saved beside a stale marker")
         sink.awaitIdle()
-        sink.readPreviousRun()
-        sink.clearPreviousRun()
+        sink.clearPreviousRun(sink.readPreviousRun()!!)
         sink.awaitIdle()
 
         assertFalse(
@@ -1383,18 +1380,19 @@ class DebugFileSinkTest {
         val logs = File(dir, "logs").apply { mkdirs() }
         File(logs, "androidlog-prev-1.log").writeText("never sent\n")
         val sink = sink(at = logs)
-        assertTrue(sink.readPreviousRun()!!.contains("never sent"))
+        assertTrue(sink.readPreviousRun()!!.text.contains("never sent"))
 
         // Make the directory unlistable without destroying it, then read again.
         val stash = File(dir, "logs.stash")
         logs.renameTo(stash)
         File(dir, "logs").writeText("not a directory")
-        assertTrue(sink.readPreviousRun()!!.contains("could not be listed"))
+        val fromFailedRead = sink.readPreviousRun()!!
+        assertTrue(fromFailedRead.text.contains("could not be listed"))
 
         // Restore it and follow the documented flow.
         File(dir, "logs").delete()
         stash.renameTo(logs)
-        sink.clearPreviousRun()
+        sink.clearPreviousRun(fromFailedRead)
         sink.awaitIdle()
         assertTrue(
             "a log absent from the last report is not deleted by its clear",
@@ -1676,128 +1674,6 @@ class DebugFileSinkTest {
             }
             return delegate.submit(task)
         }
-    }
-
-    @Test
-    fun `a read the worker refused invalidates what an earlier one surfaced`() {
-        // The refusal happens before the task exists, so nothing stamps a
-        // ticket for it. An equality check therefore saw the *earlier* read's
-        // number, called the standing list current, and deleted a run the
-        // caller was never handed (Codex, PR #4).
-        File(dir, "androidlog-prev-1.log").writeText("shown once, never sent\n")
-        val worker = RefusesSubmitOnce(ScheduledThreadPoolExecutor(1))
-        val sink = DebugFileSink(log(), { dir }, 0L, {}, { "1" }, { worker })
-        sink.start(installCrashHandler = false)
-        sink.awaitIdle()
-
-        assertTrue(
-            "the premise: the first read surfaces it",
-            sink.readPreviousRun()!!.contains("shown once, never sent"),
-        )
-
-        worker.arm = true
-        assertNull("the second read is refused outright", sink.readPreviousRun())
-
-        sink.clearPreviousRun()
-        sink.awaitIdle()
-
-        assertTrue(
-            "so the clear that follows it deletes nothing",
-            File(dir, "androidlog-prev-1.log").isFile,
-        )
-    }
-
-    @Test
-    fun `an abandoned read invalidates what an earlier one surfaced`() {
-        // The list is "what the last read surfaced", so a successful read leaves
-        // one standing. If the next read is abandoned, the clear that follows is
-        // still following *that* read — and the earlier list is not what it was
-        // shown (Codex, PR #4).
-        File(dir, "androidlog-prev-1.log").writeText("shown once, never sent\n")
-        val sink = sink()
-        sink.start(installCrashHandler = false)
-        sink.awaitIdle()
-
-        assertTrue(
-            "the premise: the first read surfaces it",
-            sink.readPreviousRun()!!.contains("shown once, never sent"),
-        )
-
-        // Hold the worker so the second read is still waiting when the interrupt
-        // lands — a completed future hands back its value without checking.
-        val holding = CountDownLatch(1)
-        val released = CountDownLatch(1)
-        sink.addCrashListener {
-            holding.countDown()
-            released.await()
-        }
-        holding.await()
-
-        var answer: String? = "unset"
-        val reader = Thread {
-            Thread.currentThread().interrupt()
-            answer = sink.readPreviousRun()
-            Thread.interrupted()
-        }
-        reader.start()
-        reader.join(5_000)
-        released.countDown()
-        assertNull("the second caller was told nothing", answer)
-
-        sink.awaitIdle()
-        sink.clearPreviousRun()
-        sink.awaitIdle()
-
-        assertTrue(
-            "so the clear that follows it deletes nothing",
-            File(dir, "androidlog-prev-1.log").isFile,
-        )
-    }
-
-    @Test
-    fun `a read the caller never received surfaces nothing to clear`() {
-        // Interrupting the wait abandons the answer, not the queued task — which
-        // still records what it surfaced. A clear following the documented
-        // read-then-clear flow would then delete a run that reached no report.
-        File(dir, "androidlog-prev-1.log").writeText("never sent to anyone\n")
-        val sink = sink()
-        sink.start(installCrashHandler = false)
-        sink.awaitIdle()
-
-        // The read has to still be *waiting* when the interrupt is seen, so the
-        // worker is held first. Without that the task can finish before `get()`
-        // is entered, and a completed future returns its value without ever
-        // looking at the flag.
-        val holding = CountDownLatch(1)
-        val released = CountDownLatch(1)
-        sink.addCrashListener {
-            holding.countDown()
-            released.await()
-        }
-        holding.await()
-
-        var answer: String? = "unset"
-        var stillInterrupted = false
-        val reader = Thread {
-            // Set before the call, so `get()` throws as soon as it blocks.
-            Thread.currentThread().interrupt()
-            answer = sink.readPreviousRun()
-            stillInterrupted = Thread.interrupted()
-        }
-        reader.start()
-        reader.join(5_000)
-        released.countDown()
-
-        assertNull("the caller was told nothing", answer)
-        assertTrue("and is still being asked to stop", stillInterrupted)
-
-        sink.awaitIdle()
-        sink.clearPreviousRun()
-        sink.awaitIdle()
-        assertTrue(
-            "a run nobody was shown is not deleted by the clear that follows",
-            File(dir, "androidlog-prev-1.log").exists(),
-        )
     }
 
     @Test
@@ -2102,6 +1978,87 @@ class DebugFileSinkTest {
         )
         assertTrue("so its crash is still reported", sink.unacknowledgedCrash)
         assertEquals("and the bound still held", MAX_KEPT, previous().size)
+    }
+
+    @Test
+    fun `a caller that never received a handle has nothing to clear`() {
+        // The ticket bookkeeping this replaced existed to decide whether one
+        // shared slot still meant anything. A handle answers it by construction:
+        // a caller whose read was refused holds nothing, so there is nothing it
+        // could pass to a clear (Codex, PR #4).
+        File(dir, "androidlog-prev-1.log").writeText("never sent\n")
+        val worker = RefusesSubmitOnce(ScheduledThreadPoolExecutor(1))
+        val sink = DebugFileSink(log(), { dir }, 0L, {}, { "1" }, { worker })
+        sink.start(installCrashHandler = false)
+        sink.awaitIdle()
+
+        worker.arm = true
+        assertNull("the read is refused outright", sink.readPreviousRun())
+        sink.awaitIdle()
+
+        assertEquals(
+            "so the run is untouched",
+            "never sent\n",
+            File(dir, "androidlog-prev-1.log").readText(),
+        )
+    }
+
+    @Test
+    fun `overlapping reports each clear only what they were given`() {
+        // The failure this closes: the files used to live in one slot, so the
+        // earlier report's clear consumed whatever the *later* read had
+        // surfaced — destroying a run that report never contained, and whose own
+        // report might still fail (Codex, PR #4).
+        File(dir, "androidlog-prev-1.log").writeText("in both reports\n")
+        val sink = sink()
+        sink.start(installCrashHandler = false)
+        sink.awaitIdle()
+
+        val first = sink.readPreviousRun()!!
+        assertTrue("the premise", first.text.contains("in both reports"))
+
+        // A run that only the second read can see.
+        File(dir, "androidlog-prev-2.log").writeText("only in the second\n")
+        val second = sink.readPreviousRun()!!
+        assertTrue("the premise", second.text.contains("only in the second"))
+
+        sink.clearPreviousRun(first)
+        sink.awaitIdle()
+
+        assertFalse(
+            "the first report's own run is consumed",
+            File(dir, "androidlog-prev-1.log").exists(),
+        )
+        assertEquals(
+            "and the one it never contained survives for the report that did",
+            "only in the second\n",
+            File(dir, "androidlog-prev-2.log").readText(),
+        )
+    }
+
+    @Test
+    fun `a dismissal follows its rename into a report already in flight`() {
+        // The clear deletes the paths its handle names, so a dismissal renaming
+        // the crash suffix off mid-report has to reach into that handle — or the
+        // delete misses and a log the user already sent rides the next one too.
+        current().writeText("crashed, and being shared\n")
+        File(dir, "androidlog.log.crash").writeText("1")
+        val sink = sink()
+        sink.start(installCrashHandler = false)
+        sink.awaitIdle()
+
+        val inFlight = sink.readPreviousRun()!!
+        assertTrue("the premise", inFlight.text.contains("crashed, and being shared"))
+        assertTrue("under the crash name", previous().single().name.endsWith(".crash.log"))
+
+        sink.acknowledgeCrashBanner()
+        sink.awaitIdle()
+        assertTrue("renamed out from under it", previous().single().name.endsWith(".log"))
+
+        sink.clearPreviousRun(inFlight)
+        sink.awaitIdle()
+
+        assertEquals("the clear still reached it", 0, previous().size)
     }
 
     @Test

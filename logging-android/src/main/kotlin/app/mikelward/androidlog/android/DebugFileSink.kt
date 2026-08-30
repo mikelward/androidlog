@@ -3,6 +3,7 @@ package app.mikelward.androidlog.android
 import android.content.Context
 import app.mikelward.androidlog.DebugLog
 import java.io.File
+import java.lang.ref.WeakReference
 import java.nio.file.Files
 import java.nio.file.NoSuchFileException
 import java.nio.file.attribute.BasicFileAttributes
@@ -121,6 +122,33 @@ private const val TRUNCATION_MARKER = "…(truncated)"
  * the derived crash state, and once-per-spell failure reporting. From
  * `typelauncher`: the write debounce, the atomic replace, and the bounded tail.
  */
+/**
+ * One report's worth of prior runs: the text to send, and the files it was
+ * built from.
+ *
+ * Handed back by [DebugFileSink.readPreviousRun] and consumed by
+ * [DebugFileSink.clearPreviousRun], so a report deletes exactly what it
+ * contained. That pairing is the point: the files used to live in one slot on
+ * the sink, which meant a clear consumed whatever the *latest* read had
+ * surfaced rather than what the caller clearing was shown — so two overlapping
+ * report flows could have the earlier one destroy a run only the later one had
+ * read, and whose own report might still fail (Codex, PR #4).
+ *
+ * A caller that never received a handle therefore cannot delete anything, which
+ * is what retired the ticket bookkeeping that used to answer the same question
+ * indirectly.
+ */
+class PreviousRun internal constructor(
+    /** The report, oldest run first and bounded to the newest content. */
+    val text: String,
+    /**
+     * What to delete once it has been sent. Mutable and worker-owned: a
+     * dismissal can rename a file while this report is in flight, and the clear
+     * has to follow it or miss.
+     */
+    internal val files: MutableList<File>,
+)
+
 class DebugFileSink internal constructor(
     private val log: DebugLog,
     dirProvider: () -> File,
@@ -1039,113 +1067,90 @@ class DebugFileSink internal constructor(
 
     // ------------------------------------------------------------ prior runs
 
-    // The files that [readPreviousRun] last actually read, so [clearPreviousRun]
-    // deletes only those — a file that failed to read is left for next time.
-    private var lastSurfaced: List<File> = emptyList()
-
     /**
-     * Which read [lastSurfaced] came from, and which read was abandoned.
+     * Handles handed out by [readPreviousRun] and not yet cleared.
      *
-     * A read is ticketed on the calling thread before it is submitted. The task
-     * stamps the ticket beside the list it surfaced; a caller that never got an
-     * answer records the same ticket as abandoned. [clearPreviousRun] then
-     * *derives* whether the standing list reached anybody instead of relying on
-     * an undo that has to be enqueued and can itself be refused (Codex, PR #4).
-     * Two fields and a comparison rather than a second task, so the invalidation
-     * cannot be lost the way the thing it invalidates could.
+     * Worker-owned, and here for exactly one reason: the crash-banner dismissal
+     * renames a file that an in-flight report may already be holding, and that
+     * rename has to be followed into every handle that names it or the eventual
+     * clear misses and the log rides the next report too.
      *
-     * [abandonedTicket] only ever moves up, because the failure handlers are not
-     * ordered against each other and a plain write let an older one replace a
-     * newer abandonment with a smaller number.
+     * It replaced a single `lastSurfaced` list, plus three ticket fields that
+     * existed only to police it. Those answered "is the one shared slot still
+     * meaningful?", and three review rounds each found a case they could not:
+     * an enqueue refused before any task existed, a non-monotonic write from an
+     * out-of-order handler, and two reads that both *succeeded* — where the
+     * earlier caller's clear deleted a file only the later read had surfaced
+     * (Codex, PR #4). A handle carries its own set, so the question is gone
+     * rather than answered again: a caller can only ever clear what it was
+     * given, and a caller that was given nothing has nothing to clear.
      *
-     * The comparison is `<=` rather than `==`, because a read can fail *before*
-     * its task exists: a refused `submit` stamps no ticket at all, so an equality
-     * check saw the earlier read's number, called the list current, and left an
-     * unshared run deletable (Codex, PR #4). `<=` asks the question that actually
-     * matters — has any read surfaced a list *since* the last one that came back
-     * empty-handed — which covers a task that ran and one that never existed
-     * alike. Erring toward keeping costs a retention slot for one more cycle;
-     * erring toward deleting destroys a diagnostic nobody ever read.
+     * Held **weakly**, because a handle is only worth remapping while somebody
+     * still has it. A report the user opens and then cancels never calls
+     * [clearPreviousRun] — that is the documented flow, not a mistake — so
+     * strong references would accumulate one handle and its file list per
+     * canceled attempt, for the life of a process that is normally the app's
+     * (Codex, PR #6). A dropped handle is unreachable, so it can never be
+     * cleared and never needs remapping; collecting it is exactly right.
+     * Entries whose referent is gone are pruned as they are passed over.
      */
-    private val readTickets = AtomicLong()
-    private var surfacedTicket = 0L
-    private val abandonedTicket = AtomicLong()
+    private val outstanding = mutableListOf<WeakReference<PreviousRun>>()
+
+    /** Live handles, dropping the entries whose callers have let go. */
+    private fun liveHandles(): List<PreviousRun> {
+        val live = mutableListOf<PreviousRun>()
+        outstanding.removeAll { reference ->
+            val handle = reference.get()
+            if (handle != null) live += handle
+            handle == null
+        }
+        return live
+    }
 
     /**
-     * Every unshared prior run's log, oldest first and newest-bounded, or null if
-     * the last run(s) left nothing.
+     * Every unshared prior run's log, oldest first and newest-bounded, or null
+     * when the last run(s) left nothing to send — or when the read itself could
+     * not be completed, which is reported to the log rather than to the caller.
      *
      * Runs on the worker, so it is ordered *after* the startup rotation [start]
      * queued there — otherwise a share racing a slow rotation could scan before
      * `debug.log` is renamed and miss the just-ended run. Call it off the main
      * thread: it blocks on the worker and reads up to [MAX_PREVIOUS_RUNS] files.
      * A file that fails to read is skipped and left in place, never destroyed —
-     * it is not added to the set [clearPreviousRun] deletes.
+     * it is not added to the handle's set, so clearing this report leaves it for
+     * the next one.
      *
-     * **One report flow at a time.** What a read surfaced is held in a single
-     * slot, so [clearPreviousRun] consumes whatever the *latest* read surfaced
-     * rather than what the caller clearing was shown. Two overlapping flows can
-     * therefore have the earlier one's clear delete a file only the later one
-     * surfaced — and that file's own report may still fail (Codex, PR #4). Read,
-     * share, clear; do not start a second report before the first has cleared.
-     * Stated rather than enforced because enforcing it means handing the caller
-     * a per-read handle, which is a change to this signature — named, with the
-     * hard part called out, under *Not built yet* in `TODO.md`.
+     * The handle it answers with is what [clearPreviousRun] consumes, so a
+     * report deletes exactly the files it was built from — overlapping flows
+     * included, and a caller that got nothing deletes nothing.
      */
-    fun readPreviousRun(): String? {
-        val ticket = readTickets.incrementAndGet()
-        return runCatching { worker.submit<String?> { readPreviousRunOnWorker(ticket) }.get() }
+    fun readPreviousRun(): PreviousRun? =
+        runCatching { worker.submit<PreviousRun?> { readPreviousRunOnWorker() }.get() }
             .onFailure { failure ->
-                // The caller got nothing. The task may still be queued and may
-                // still set `lastSurfaced`, which means "what the last read
-                // surfaced" — and this read surfaced nothing to anybody. Left
-                // standing, a `clearPreviousRun` following the documented
-                // read-then-clear flow would delete runs that reached no
-                // report, unrecoverably (Codex, PR #4). The same reasoning as
-                // the failed listing inside the task, one level up.
-                //
-                // Recorded rather than undone. Enqueuing the undo made the fix
-                // depend on a second task being accepted, and the read having
-                // been accepted says nothing about that -- the submit landed
-                // moments earlier, and a queue can fill in between. It also
-                // could not see a list an *earlier* read had left standing
-                // (Codex, PR #4). A ticket cannot be refused.
-                //
-                // Set on every failure, including a `submit` that was refused
-                // outright and so never produced a task to stamp anything: the
-                // caller got nothing either way, and that is the whole question.
-                // Kept monotonic rather than assigned. Ticket *allocation* is
-                // atomic, but the failure handlers are not ordered against each
-                // other: with concurrent readers a descheduled older one can run
-                // last, and a plain write then replaces a newer abandonment with
-                // its own smaller number -- leaving the comparison below reading
-                // "some read surfaced a list after the last empty-handed one"
-                // when the opposite is true (Codex, PR #4). Only ever moves up.
-                abandonedTicket.accumulateAndGet(ticket, ::maxOf)
+                // Nothing to undo. The task may still be queued and may still
+                // build a handle, but this caller never received it and no other
+                // caller can name it, so nothing it lists can be deleted by
+                // anybody. That is the whole reason the ticket fields are gone:
+                // they existed to decide whether a *shared* slot still meant
+                // anything, and there is no shared slot now (Codex, PR #4).
                 log.failure(failure, "Earlier runs could not be read")
                 // `get()` clears the flag when it throws this, and swallowing it
                 // would strand a caller that is being asked to stop.
                 if (failure is InterruptedException) Thread.currentThread().interrupt()
             }
             .getOrNull()
-    }
 
-    private fun readPreviousRunOnWorker(ticket: Long): String? {
+    private fun readPreviousRunOnWorker(): PreviousRun? {
         // The listing itself, not the best-effort view: a directory that could
         // not be read is a different fact from one with nothing in it, and
         // collapsing them here made an unavailable prior log read as no prior log
         // — the same swallow as the per-file one, one level up (Codex, PR #4).
-        // `lastSurfaced` is emptied, because it means "what the last read
-        // surfaced" and this read surfaced nothing. An earlier read's list left
-        // standing here would have `clearPreviousRun` delete logs that were *not*
-        // in the report just sent, which is unrecoverable (Codex, PR #4) -- and
-        // the retry it was meant to preserve happens anyway, since those files
-        // are still in the directory for the next successful read to find.
+        // The handle lists nothing, so clearing this report deletes nothing --
+        // the files are still in the directory for the next successful read to
+        // find, which is the retry this preserves.
         val files = previousFilesOrNull() ?: run {
-            lastSurfaced = emptyList()
-            surfacedTicket = ticket
             log.warning("Earlier runs could not be listed")
-            return "[earlier runs could not be listed]"
+            return handleFor("[earlier runs could not be listed]", mutableListOf())
         }
         val read = mutableListOf<File>()
         var unreadable = 0
@@ -1159,16 +1164,32 @@ class DebugFileSink internal constructor(
                 emptyList()
             }
         }.filter { it.isNotEmpty() }
-        lastSurfaced = read
-        surfacedTicket = ticket
         if (unreadable > 0) log.warning("%s earlier run(s) could not be read", unreadable)
-        if (lines.isEmpty()) return unreadableNotice(unreadable)
+        if (lines.isEmpty()) return handleFor(unreadableNotice(unreadable), read)
         // After the bound, not before: a notice prepended first would be the
         // oldest line and so the first one trimmed.
         val tail = boundedLogTail(lines, PERSIST_BUDGET_CHARS).joinToString("\n")
-        if (tail.isBlank()) return unreadableNotice(unreadable)
-        return listOfNotNull(unreadableNotice(unreadable), tail).joinToString("\n")
+        if (tail.isBlank()) return handleFor(unreadableNotice(unreadable), read)
+        return handleFor(
+            listOfNotNull(unreadableNotice(unreadable), tail).joinToString("\n"),
+            read,
+        )
     }
+
+    /**
+     * A handle for [text], registered so a dismissal's rename can be followed
+     * into it — or null when there is nothing to report, which is also nothing
+     * to clear. Null therefore keeps its old meaning here: *the last run(s) left
+     * nothing*, not *the read failed*, which is what [readPreviousRun] answers
+     * null for when its own wait does not complete.
+     */
+    private fun handleFor(text: String?, files: MutableList<File>): PreviousRun? =
+        text?.let {
+            PreviousRun(it, files).also { handle ->
+                liveHandles()
+                outstanding += WeakReference(handle)
+            }
+        }
 
     /**
      * A line for the report itself when a prior run could not be read, or null.
@@ -1183,9 +1204,10 @@ class DebugFileSink internal constructor(
         if (unreadable > 0) "[$unreadable earlier run(s) could not be read]" else null
 
     /**
-     * Deletes only the prior-run files the last read surfaced. On the worker too,
-     * so it cannot race the mirror's writes, and so it reads and mutates
-     * [lastSurfaced] under the same single-threaded ordering as [readPreviousRun].
+     * Deletes exactly the files [run] was built from — the handle [readPreviousRun]
+     * answered with, so a report consumes what it actually contained and nothing
+     * else. On the worker too, so it cannot race the mirror's writes, and so the
+     * handles are read and mutated under one single-threaded ordering.
      *
      * **Enqueue-only — nothing is waited on**, so it is safe from a report's
      * completion callback on the main thread. It used to block until every
@@ -1196,18 +1218,12 @@ class DebugFileSink internal constructor(
      * [acknowledgeCrashBanner] does not wait, and it is why [readPreviousRun] is
      * the odd one out — it has an answer to give back.
      */
-    fun clearPreviousRun() {
+    fun clearPreviousRun(run: PreviousRun) {
         runCatching {
             worker.execute {
-                // Did the list this is about to delete ever reach a report?
-                // Only if some read surfaced it *after* the last read that came
-                // back with nothing -- see the ticket fields. Derived here
-                // rather than undone in the reader, because an undo has to be
-                // enqueued and an enqueue can be refused (Codex, PR #4).
-                if (surfacedTicket <= abandonedTicket.get()) lastSurfaced = emptyList()
                 var resumed = false
                 val undeleted = mutableListOf<File>()
-                lastSurfaced.forEach { file ->
+                run.files.toList().forEach { file ->
                     if (!discardContents(file)) {
                         undeleted += file
                         return@forEach
@@ -1238,7 +1254,12 @@ class DebugFileSink internal constructor(
                 if (undeleted.isNotEmpty()) {
                     log.warning("%s shared run(s) could not be discarded", undeleted.size)
                 }
-                lastSurfaced = undeleted
+                run.files.clear()
+                run.files += undeleted
+                // Nothing left for a dismissal's rename to follow into, so stop
+                // carrying it. A handle still holding an undeleted file stays,
+                // because the next share retries that discard through it.
+                if (run.files.isEmpty()) outstanding.removeAll { it.get() === run }
                 // Clearing the flag only lets *future* writes through, and this
                 // run has been accumulating in the buffer with none of them
                 // landing. A silent kill before the next entry would lose the
@@ -1650,7 +1671,10 @@ class DebugFileSink internal constructor(
                         // report as well — a dismissal landing between
                         // the read and the clear. Same worker as both of those,
                         // so this write is ordered against them.
-                        lastSurfaced = lastSurfaced.map { if (it == file) plain else it }
+                        liveHandles().forEach { handle ->
+                            val at = handle.files.indexOf(file)
+                            if (at >= 0) handle.files[at] = plain
+                        }
                     }
                 }.onFailure { log.failure(it, "A crash-banner dismissal failed") }
                 // The third of the three points the record changes. A rename that

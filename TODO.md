@@ -56,6 +56,28 @@ The name went with it, which is a second small win: `mirrored` named a
 file sink's own — and exact — use of "mirror" for the on-disk copy of the
 in-memory buffer. One meaning now.
 
+### 4. The read/clear contract — **a per-read handle, shipped**
+
+`readPreviousRun()` used to record what it surfaced in one field, and
+`clearPreviousRun()` deleted whatever was in it. Three ticket fields existed only
+to police that slot, and three review rounds each found a case they could not
+answer: an enqueue refused before any task existed, a non-monotonic write from an
+out-of-order failure handler, and — the one that showed the question was wrong —
+two reads that both *succeeded*, where the earlier caller's clear deleted a run
+only the later read had surfaced (Codex, PR #4).
+
+`readPreviousRun` now returns a `PreviousRun` handle carrying its own file set,
+and `clearPreviousRun(handle)` consumes exactly that. All three ticket fields and
+the shared slot are gone: a caller can only clear what it was given, and one that
+was given nothing has nothing to clear.
+
+The hard part was the crash-banner dismissal, which renames a file while a report
+may be in flight. That rename is followed into every outstanding handle, so a
+clear still reaches its file — the same reason the old code remapped the shared
+list, keyed per handle instead. A handle whose caller never received it stays in
+that list; it costs an entry and a comparison, never a file, since nothing can
+ask for its contents to be deleted.
+
 ## Decisions needing review
 
 Taken under autopilot, so each says what the alternative was and what undoing it
@@ -215,35 +237,6 @@ own `runCatching`, before the snapshot and after the crash marker.
   `runCatching` would take the crash marker and the snapshot down with it (Codex
   on typelauncher #689).
 - **Reversible:** a default of `{}`, so no consumer is forced to have one.
-
-### The read/clear contract is a single shared slot, and needs a per-read handle
-
-`readPreviousRun()` records what it surfaced in one field and `clearPreviousRun()`
-deletes whatever is in it. With two report flows overlapping that is wrong in a
-way no amount of ticketing fixes: read 1 surfaces {A}, read 2 surfaces {A, B}
-because B became readable, and report 1 finishing first then deletes B — which
-was never in report 1, and whose own report may still fail (Codex, PR #4).
-
-**This is the class the last several rounds were instances of.** The tickets
-(`readTickets`, `surfacedTicket`, `abandonedTicket`) exist only to answer "is
-the single shared slot still meaningful?", and each round found another case
-they could not answer: a refused enqueue, a non-monotonic write, and now two
-reads that both *succeeded*. The fix retires the question rather than answering
-it again — `readPreviousRun` hands back a handle carrying its own file set, and
-`clearPreviousRun(handle)` consumes exactly that. All three fields go with it.
-
-- **Why not in PR #4:** it is a public API change (`readPreviousRun` stops
-  returning a bare `String?`) and it has a genuinely hard part — the crash-banner
-  dismissal renames a file while a report may be in flight, and remapping that
-  across *several* outstanding handles is a different problem from remapping one
-  shared list. That deserves its own review rather than a fixup at the end of a
-  seven-commit branch.
-- **What holds the line meanwhile:** the KDoc states the single-flow contract, so
-  a caller running two concurrent reports is doing something the API says not to.
-  The follow-up makes it impossible rather than merely contracted.
-- **Still free to do:** no consumer has migrated, so the API shape costs nothing
-  to change — and this must land before the first migration, when it stops being
-  free.
 
 ## Not built yet
 
