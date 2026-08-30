@@ -132,6 +132,23 @@ dependency and coroutines would reach every consumer's APK to deliver one
 boolean. Wrapping the listener in a `MutableStateFlow` is three lines in the app,
 and the flow belongs there — the derivation is the part worth sharing.
 
+A few lines a run — what ended the previous process, when the package was last
+updated — go through `pinnedEvent(...)` instead, which records the line and
+keeps a second reference so it survives the ring evicting it:
+
+```kotlin
+SnoozemoLog.pinnedEvent("previous process ended as %s", reason)
+```
+
+They are written once each, and a busy device fills a few hundred ring entries
+in well under two hours — so by the time a user shares a report, the lines
+explaining how the run started are routinely gone, which is what they were
+added to answer. The persisted file holds a slice of its budget back for them,
+since a tail keeps the newest and drops the oldest, which is the opposite of
+what they need. Reserve it for lines written a handful of times a run: the
+pinned buffer is bounded too, so a chatty caller evicts the start-up lines from
+the one place keeping them.
+
 The rule that matters: **a log call is a hard-coded format string plus
 arguments.** The literal is safe by construction; each argument is carried or
 withheld on its own by its type, and every `String` is withheld unless the call
