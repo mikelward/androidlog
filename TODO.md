@@ -552,6 +552,88 @@ own `runCatching`, before the snapshot and after the crash marker.
 
 ## Not built yet
 
+- **Require `lanes`, `codex`, `codex-review-check / codex-review-check`, and
+  `zizmor` in the main ruleset** (plus conversations resolved, and branches up
+  to date), once each has reported at least once — a step outside what a
+  session without ruleset API access can do. Until the ruleset itself names
+  them they are published and ignored.
+
+  **`codex-review-check` belongs in that list and is easy to leave out**
+  (Codex, PR #19 — this entry did leave it out). It is a *separate check
+  context* from the `codex` status, which the sweep writes without consulting
+  it, so requiring only the other three leaves it advisory: a pull request
+  could edit or delete the byte-pinned Codex workflows — the sweep that
+  publishes the verdict included — turn this check red, and merge anyway,
+  leaving the gate quietly misconfigured for every pull request after it. A
+  check nobody requires is a comment.
+
+  Name it with **both halves**: GitHub reports a reusable-workflow job as
+  `<calling job> / <called job>`, and both are called `codex-review-check` so
+  the required-checks search finds one unambiguous match rather than a generic
+  `check` that could belong to any workflow. `mikelward/codex-review`'s
+  `docs/CONSUMER.md` (*"Three ruleset settings, and they are load-bearing
+  together"*) is the source for all of this, including why branches must be up
+  to date: Codex's verdict never reads the base, so a base that advances under
+  a standing `codex: success` leaves it standing and mergeable, and requiring
+  up-to-date branches is the only thing that observes the move.
+
+  Nothing here needs a migration first. `ci.yml` adopts the post-rename
+  `lanes` check name directly (mikelward/lanes#9), so there is no `gate` →
+  `lanes` step to stage; `codex-review.yml` republishes Codex's verdict as
+  the `codex` commit status a ruleset can require; and `zizmor.yml` runs
+  unfiltered on every pull request precisely so `zizmor` *can* be required —
+  a paths-filtered workflow creates no check run at all on a non-matching
+  pull request, which a ruleset then waits on forever.
+
+  **Before the merge the sweep runs only when a comment lands, so don't read
+  an absent `codex` status as broken wiring.** `schedule` and
+  `pull_request_target` load the workflow from the default branch, so neither
+  fires for a pull request that is only *adding* `codex-review.yml` — no run
+  on open, none on push, none on the hourly cron. The two comment events are
+  different, and the difference is easy to get backwards: `issue_comment` and
+  `pull_request_review_comment` are **not** base-ref-pinned, and run the
+  branch's own copy (`mikelward/codex-review`'s `docs/CONSUMER.md` records
+  this, along with why the exposure is accepted). So the first comment or
+  review reply on such a pull request is what starts the sweep, and the status
+  appears from then on — as it did on #19.
+
+  Requiring the check still waits for the merge: until then a head with no
+  comment on it has no `codex` status at all, and a required check nothing
+  posts blocks the pull request forever.
+
+  **Do not require `sweep`.** It is the sweep job's own check run, not the
+  verdict, and requiring it gates merges on the poller rather than on what
+  the poller found — the reasoning is in mikelward/codex-review's
+  `docs/CONSUMER.md`, along with why branches must be up to date.
+
+- **A pull request can still supply the definitions its own required checks
+  run under** (Codex, PR #19). Every lane and scan job here triggers on plain
+  `pull_request`, and that trigger loads the job DEFINITION from the pull
+  request's own merge ref — so a pull request touching `.github/workflows/`
+  can rewrite the `lanes` or `zizmor` job to `exit 0` and mint its own green
+  required check. The same reach extends to the files those jobs read from the
+  checkout: `.github/zizmor.yml`, whose exemptions the scan applies to the very
+  workflows it is auditing.
+
+  **This is not androidlog's to fix, and it is already designed elsewhere.**
+  It is identical in all twenty-one siblings, and `mikelward/lanes`' own
+  `TODO.md` (*"Trusted verdicts need an explicit publisher"*) carries the
+  design after seven rounds of review, including two superseded attempts worth
+  not re-walking. The fix is a `pull_request_target` workflow whose verdict is
+  posted as a commit status by a dedicated GitHub App, from an environment the
+  pull request's own code cannot reach — piloted in `mikelward/yaml-lite` and
+  `mikelward/typelauncher`, and needing engine changes (`lanes.mjs` does not
+  understand `pull_request_target` today) plus a `lanes` environment and App
+  secrets here. Adopting it in this repository alone would diverge from the
+  fleet without closing anything the pilot has not already closed.
+
+  **The narrower policy-file variant is closed, and stays closed.**
+  `.github/lanes.conf` cannot reclassify the pull request that edits it: the
+  engine hard-codes that path as code (`isDocs`, `lanes.mjs`), and refuses a
+  symlink or a different spelling anywhere along it. So a pull request touching
+  the policy always rides the code lane and runs the full suite. Don't
+  "harden" that with a second mechanism.
+
 - **Find a way to move AGP across the fleet in one step, or to stop needing
   to.** A composite build cannot mix Android Gradle plugin versions —
   `AgpVersionCompatibilityRule` refuses to compare 9.3.1 against 9.3.2 at all —
