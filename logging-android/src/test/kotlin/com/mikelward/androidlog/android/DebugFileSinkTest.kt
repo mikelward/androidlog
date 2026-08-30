@@ -38,7 +38,111 @@ class DebugFileSinkTest {
 
     private fun log() = DebugLog(readMillis = { 0L })
 
+    /**
+     * `awaitIdle` is the seam a consuming app's tests wait on, and its
+     * visibility is the whole of what it promises. A test *inside* this module
+     * cannot tell the difference — `internal` is visible here either way — so
+     * this asks the question a consumer asks: is there a public method by that
+     * name on the class? Kotlin mangles an internal function's JVM name, so
+     * narrowing the visibility back makes this throw rather than pass quietly,
+     * which is the only way the disappearance surfaces before it surfaces as
+     * four apps failing to compile.
+     */
+    @Test
+    fun `awaitIdle is public so a consuming app's tests can wait on the worker`() {
+        val method = DebugFileSink::class.java.getMethod("awaitIdle")
+        assertTrue(
+            "awaitIdle is not public on the JVM class consumers compile against",
+            java.lang.reflect.Modifier.isPublic(method.modifiers),
+        )
+    }
+
     private fun sink(log: DebugLog = log(), at: File = dir) = DebugFileSink(log, at)
+
+    /**
+     * The promise [DebugFileSink.awaitIdle] makes, under the debounce a
+     * consuming app actually runs with.
+     *
+     * The mirror write is *scheduled* rather than queued, so with a real
+     * debounce a barrier submitted with no delay is eligible first and the
+     * wait returns before the write it was supposed to cover (Codex, PR #18).
+     * A debounce of zero hides that entirely — every other test here uses one,
+     * which is why none of them caught it — so this one uses a window far
+     * longer than the assertion could outlast by chance: if `awaitIdle` did not
+     * bring the write forward, the file is still absent or empty when it
+     * returns, and a ten-second wait cannot be mistaken for a slow machine.
+     */
+    @Test
+    fun `awaitIdle covers a write still inside its debounce window`() {
+        val log = log()
+        val sink = DebugFileSink(log, { dir }, 10_000L, {}, { "1" })
+        log.addSink(sink)
+        log.event("armed at %s", 3)
+        sink.awaitIdle()
+        assertTrue(
+            "awaitIdle returned before the debounced write landed",
+            current().exists() && current().readText().contains("armed at 3"),
+        )
+    }
+
+    /**
+     * A forced write reports what its window held, and reporting records a
+     * line — so the obvious worry is that the complaint explaining why the
+     * file is short lands only in the *next* window, which `awaitIdle` would
+     * return ahead of (Codex, PR #18).
+     *
+     * It does not, and this pins the ordering that makes it not: the window
+     * reports **before** it reads the snapshot, so its own complaints are in
+     * the buffer that this same write persists. Reordering the report after
+     * the read — or moving it out of the window — fails this, which is the
+     * point of asserting it rather than reasoning about it again later.
+     *
+     * Arranged through the one complaint that needs no broken filesystem: a
+     * worker that refuses the first scheduling, held and said by the first
+     * write that does land. The debounce is a real one, so the write under
+     * test is genuinely the forced one.
+     */
+    @Test
+    fun `a complaint the forced write records lands in the file it explains`() {
+        val log = log()
+        val sink = DebugFileSink(
+            log,
+            { dir },
+            10_000L,
+            {},
+            { "1" },
+            { RefusesFirstSchedule(ScheduledThreadPoolExecutor(1)) },
+        )
+        log.addSink(sink)
+
+        log.event("the entry whose write was refused")
+        log.event("the entry whose write lands")
+        sink.awaitIdle()
+
+        val text = current().readText()
+        assertTrue(text, text.contains("the entry whose write lands"))
+        assertTrue(
+            "the complaint the forced write recorded is missing from the file it explains",
+            text.contains("could not be scheduled, so this run"),
+        )
+    }
+
+    /**
+     * And the debounce still coalesces afterwards: bringing one write forward
+     * must not strand the pending flag, or `log` would never schedule another
+     * and the mirror would go silently stale for the life of the process.
+     */
+    @Test
+    fun `a write after awaitIdle is still scheduled`() {
+        val log = log()
+        val sink = DebugFileSink(log, { dir }, 0L, {}, { "1" })
+        log.addSink(sink)
+        log.event("first %s", 1)
+        sink.awaitIdle()
+        log.event("second %s", 2)
+        sink.awaitIdle()
+        assertTrue(current().readText(), current().readText().contains("second 2"))
+    }
 
     /** A sink whose rotation destination is a name the test can arrange first. */
     private fun sinkRotatingTo(name: String, log: DebugLog = log()) =

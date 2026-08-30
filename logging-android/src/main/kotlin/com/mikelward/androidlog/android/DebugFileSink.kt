@@ -12,7 +12,6 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -236,7 +235,16 @@ class DebugFileSink internal constructor(
     // lock. See [workerFactory] for the rest, and for why it is injectable.
     private val worker: ScheduledExecutorService = workerFactory()
 
-    private val writePending = AtomicBoolean(false)
+    /**
+     * The outstanding debounced write, as an identity token, or null when none
+     * is pending. A token rather than a boolean because three parties reach for
+     * it — the scheduled task, [awaitIdle], and [log]'s own handler for a
+     * scheduling the worker refused — and a bare flag cannot tell whose window
+     * it is clearing. Each of them clears by compare-and-set against the token
+     * it is acting for, so a slow party can only ever clear its own attempt and
+     * never a newer one that has taken the slot since (Codex, PR #18).
+     */
+    private val writeToken = AtomicReference<Any?>(null)
 
     // ---------------------------------------------------------------- listing
 
@@ -861,26 +869,29 @@ class DebugFileSink internal constructor(
     override fun log(line: String) {
         // Debounced coalesce: the first line since the last write schedules one
         // write [writeDebounceMs] out; every line until then is already captured by
-        // that write's snapshot read, so none queues another. `writePending` is
+        // that write's snapshot read, so none queues another. The token is
         // cleared inside the scheduled task rather than before the delay, so the
         // whole window coalesces into a single full-file write instead of one per
         // entry. Enqueue-only, so this returns to the caller at once — which is
         // what `Sink` requires, since this runs inside the fan-out.
-        if (writePending.compareAndSet(false, true)) {
+        val token = Any()
+        if (writeToken.compareAndSet(null, token)) {
             runCatching {
                 worker.schedule(
-                    {
-                        writePending.set(false)
-                        reportPurgeFailure()
-                        reportStandDown()
-                        reportWriteScheduleFailures()
-                        writeSnapshot()
-                    },
+                    // Named rather than unconditional: `awaitIdle` may have run
+                    // this window's write already, and the token is what says so.
+                    { runDebouncedWrite(token) },
                     writeDebounceMs,
                     TimeUnit.MILLISECONDS,
                 )
             }.onFailure { failure ->
-                writePending.set(false)
+                // Conditional, and that is the whole point of the token. This
+                // thread can be descheduled between the refusal and here, long
+                // enough for `awaitIdle` to clear the slot and a later line to
+                // claim it with a write that *was* accepted; an unconditional
+                // clear would cancel that newer write and leave the file stale
+                // until another line happened along (Codex, PR #18).
+                writeToken.compareAndSet(token, null)
                 // Held rather than said here, and this is the one enqueue that
                 // could not simply report: `log` runs inside the core's fan-out,
                 // so a line recorded from it is dropped by the delivering-thread
@@ -894,6 +905,24 @@ class DebugFileSink internal constructor(
                 writeScheduleFailure.compareAndSet(null, failure)
             }
         }
+    }
+
+    /**
+     * Worker-only: the body [log] debounces, and what [awaitIdle] runs early
+     * when it brings that window to an end. Clearing the token here rather than
+     * before the delay is what coalesces the whole window into one full-file
+     * write instead of one per entry.
+     *
+     * The compare-and-set is what makes the window run exactly once no matter
+     * which of the two gets there first: whichever claims [token] does the
+     * write, and the other returns having done nothing.
+     */
+    private fun runDebouncedWrite(token: Any) {
+        if (!writeToken.compareAndSet(token, null)) return
+        reportPurgeFailure()
+        reportStandDown()
+        reportWriteScheduleFailures()
+        writeSnapshot()
     }
 
     /** Refused mirror-write schedulings, held for the first write that lands. */
@@ -1782,8 +1811,54 @@ class DebugFileSink internal constructor(
         }.onFailure { log.failure(it, "The crash flush could not be scheduled") }
     }
 
-    /** Blocks until the worker has drained its queue, including the rotation. */
-    internal fun awaitIdle() {
+    /**
+     * Blocks until the worker has drained its queue, including the rotation.
+     *
+     * A test seam, and public because the consuming apps need it as much as
+     * this repository's own tests do: everything this sink does to a file
+     * happens on one worker thread, so a consumer's test that writes a line and
+     * then asserts on the file is asserting against a race unless it can wait
+     * for that worker. The alternatives a consumer is left with otherwise are
+     * both worse — a sleep, which is the flake this fleet's testing rules
+     * forbid outright, or [readPreviousRun] used as an accidental barrier,
+     * which drains the queue only as a side effect of doing something else
+     * entirely.
+     *
+     * Not for production code: nothing on a running device should be waiting on
+     * the log's worker, which is the whole reason the worker exists.
+     */
+    fun awaitIdle() {
+        // The mirror write is *scheduled*, not queued: it becomes eligible
+        // `writeDebounceMs` from now, while a barrier submitted with no delay
+        // is eligible immediately and would be run first. Waiting on the
+        // barrier alone therefore returns before the write the caller is
+        // actually waiting for -- 500 ms before it, in a consumer's app, which
+        // is exactly the caller this method exists for (Codex, PR #18).
+        //
+        // So end the window early instead of waiting it out: run the write's
+        // own body on the worker now, for the same token that
+        // gates it. Whichever of the two runs first does the write and clears
+        // the flag, and the other finds it clear and does nothing -- so there
+        // is no cancellation to race, and no held `ScheduledFuture` that a
+        // slow scheduling thread could publish over a newer one (Codex,
+        // PR #18).
+        //
+        // One forced window is enough, and that turns on an ordering worth
+        // stating: [runDebouncedWrite] reports what the window held -- a purge
+        // failure, a stand-down, a refused scheduling -- *before* it reads the
+        // snapshot, so each of those complaints is already in the buffer this
+        // same write persists. Recording them does schedule a further window,
+        // but that window has nothing left to add, so draining until the worker
+        // is quiescent would buy nothing -- and a write that keeps failing keeps
+        // reporting, which makes the drain a cycle rather than a wait (Codex,
+        // PR #18).
+        //
+        // What this cannot cover is a line logged by the *caller* after the
+        // call began, which is the caller's own ordering to get right -- nor a
+        // write that fails outright, whose own failure is reported after the
+        // snapshot was read. The file is stale then because the write failed,
+        // which no amount of waiting fixes.
+        worker.submit { writeToken.get()?.let { runDebouncedWrite(it) } }.get()
         worker.submit {}.get()
     }
 }
