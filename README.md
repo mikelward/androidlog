@@ -115,8 +115,12 @@ SnoozemoLog.addSink(files)
 write. Everything it does touches disk on its own daemon worker, so neither call
 blocks the cold-start path.
 
-The previous run is then `files.readPreviousRun()` and `files.clearPreviousRun()`
-once a report has been sent. `files.unacknowledgedCrash` says whether a prior run
+The previous run is then `files.readPreviousRun()`, which hands back a handle —
+its `text` is the report, and `files.clearPreviousRun(handle)` consumes exactly
+the runs that report was built from once it has been sent. The pairing is the
+point: a report deletes what it contained and nothing else, so two overlapping
+report flows cannot have the first one destroy a run only the second had read.
+A caller that got no handle deletes nothing. `files.unacknowledgedCrash` says whether a prior run
 ended in an uncaught exception and the user has neither shared nor dismissed it —
 the state a post-crash banner shows on. It is *derived* on the worker rather than
 maintained by screens, so two screens cannot write stale answers over each other;
