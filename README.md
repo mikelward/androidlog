@@ -18,7 +18,7 @@ and nothing propagated it.
 | Module | What it is | What it holds |
 |---|---|---|
 | `:logging-core` | Plain Kotlin JVM. No Android, enforced by `verifyNoAndroid`. | The bounded buffer, the recording gate, the sink interface, the format-plus-arguments contract, the type rule that is the privacy floor, throwable rendering. |
-| `:logging-android` | Android library, `minSdk` 31, **no resources**. | The platform sinks. Logcat today; the persisted file, rotation and the crash pin next. |
+| `:logging-android` | Android library, `minSdk` 31, **no resources**. | The platform sinks: logcat, and the persisted file with its rotation and crash record. |
 
 A third module, `:logging-report` — the share sheet, the clipboard fallback and
 the FileProvider glue — is deliberately not here yet. It is the one part that
@@ -101,6 +101,32 @@ SnoozemoLog.addSink(LogcatSink("SnoozemoDebug"))
 SnoozemoLog.event("departed anchor, distance %sm accuracy %sm", 180, 12)
 SnoozemoLog.failure(e, "departure test failed for %s", safe("wifi"))
 ```
+
+To keep the log across the process ending — a crash *or* a silent kill — add
+the file sink, early in `Application.onCreate`:
+
+```kotlin
+val files = DebugFileSink(SnoozemoLog, this)
+files.start()               // rotates the previous run aside, installs a crash handler
+SnoozemoLog.addSink(files)
+```
+
+`start()` before `addSink`, so the rotation is queued ahead of this run's first
+write. Everything it does touches disk on its own daemon worker, so neither call
+blocks the cold-start path.
+
+The previous run is then `files.readPreviousRun()` and `files.clearPreviousRun()`
+once a report has been sent. `files.unacknowledgedCrash` says whether a prior run
+ended in an uncaught exception and the user has neither shared nor dismissed it —
+the state a post-crash banner shows on. It is *derived* on the worker rather than
+maintained by screens, so two screens cannot write stale answers over each other;
+observe it with `addCrashListener`, ask for a refresh with `requestCrashRecompute()`
+when a screen opens, and lower it with `acknowledgeCrashBanner()`.
+
+It is not a `StateFlow`, because this library takes no third-party runtime
+dependency and coroutines would reach every consumer's APK to deliver one
+boolean. Wrapping the listener in a `MutableStateFlow` is three lines in the app,
+and the flow belongs there — the derivation is the part worth sharing.
 
 The rule that matters: **a log call is a hard-coded format string plus
 arguments.** The literal is safe by construction; each argument is carried or
