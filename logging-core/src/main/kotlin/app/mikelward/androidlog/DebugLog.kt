@@ -92,8 +92,30 @@ open class DebugLog(
         private val TIMESTAMP: DateTimeFormatter =
             DateTimeFormatter.ofPattern("MM-dd HH:mm:ss.SSS", Locale.US)
 
-        /** The level character on a marker entry, as `D` and `W` are on the rest. */
+        /**
+         * The level character on a **synthesized** anchor — the one [anchored]
+         * prepends to a snapshot, where there is no entry to borrow a level
+         * from and nothing filters by severity.
+         *
+         * A *delivered* anchor takes the level of the entry it precedes
+         * instead, so that a destination filtering by severity cannot drop it
+         * while keeping what it explains. See [deliver].
+         */
         internal const val MARKER_LEVEL = 'I'
+
+        /**
+         * Orders the level characters so a delivered anchor can tell when a
+         * later entry outranks it. Anything unrecognized ranks as `D`, which
+         * is the severity `LogcatSink` gives it — so an app's own level
+         * behaves the same way here as it does there.
+         */
+        private fun severityRank(level: Char): Int = when (level) {
+            'V' -> 0
+            'I' -> 2
+            'W' -> 3
+            'E' -> 4
+            else -> 1
+        }
     }
 
     init {
@@ -203,9 +225,22 @@ open class DebugLog(
      */
     private val sinkAnchors = IdentityHashMap<Sink, Registration>()
 
-    /** One sink's place in the registry: the offset it has actually been anchored to. */
+    /**
+     * One sink's place in the registry: the offset it has actually been
+     * anchored to, and the highest severity that anchor went out at.
+     *
+     * The severity matters because a destination may filter by it — logcat
+     * does, and handing the level over is what made that possible. An anchor
+     * written once, at one level, is dropped by exactly the filter that keeps
+     * the higher-severity entries it exists to explain, leaving their local
+     * timestamps with no offset to read them against (Codex, PR #9). So a
+     * later entry that outranks the anchor gets one of its own.
+     */
     private class Registration {
         var offset: ZoneOffset? = null
+
+        /** Rank of the level the current [offset]'s anchor was last sent at. */
+        var anchoredRank: Int = Int.MIN_VALUE
     }
 
     /**
@@ -232,6 +267,20 @@ open class DebugLog(
      */
     fun interface Sink {
         fun log(line: String)
+
+        /**
+         * The same line, with the level character it was recorded at.
+         *
+         * Defaulted to [log] so a sink written as a lambda stays a lambda and
+         * every existing one keeps working. A sink that maps onto a destination
+         * with its own severities — logcat — overrides this instead of parsing
+         * the level back out of the rendered line, which is a second and weaker
+         * copy of a decision already made here.
+         *
+         * `V`, `D`, `I`, `W`, `E` for the five recording levels, and `I` for the
+         * offset markers this class synthesizes.
+         */
+        fun log(line: String, level: Char) = log(line)
 
         /**
          * The buffer was emptied because recording was turned off.
@@ -365,7 +414,10 @@ open class DebugLog(
                 // announce the offset again rather than assume it still stands.
                 // Every sink re-announces after a re-enable rather than
                 // assuming the offset it last saw still stands.
-                sinkAnchors.values.forEach { it.offset = null }
+                sinkAnchors.values.forEach {
+                    it.offset = null
+                    it.anchoredRank = Int.MIN_VALUE
+                }
                 // Last, so a sink acting on this sees the emptied buffer rather
                 // than the one being discarded.
                 notifyCleared()
@@ -494,6 +546,45 @@ open class DebugLog(
     /** A warning carrying the exception behind it. Same contract as [event]. */
     fun failure(throwable: Throwable, format: String, vararg args: Any?): Boolean =
         record('W', format, args, throwable)
+
+    /**
+     * Below [event]: high-frequency detail worth having in the buffer but not
+     * worth reading past. Same contract as [event] in every other respect.
+     *
+     * The five levels exist because a consumer had five and the level reaches
+     * logcat, where it is what a developer filters on. Three would have flattened
+     * `V`, `D` and `I` into one and silently cost that (clothescast, 278 call
+     * sites).
+     */
+    fun verbose(format: String, vararg args: Any?): Boolean =
+        record('V', format, args, throwable = null)
+
+    /** Above [event]: worth reading on a first pass. Same contract as [event]. */
+    fun info(format: String, vararg args: Any?): Boolean =
+        record('I', format, args, throwable = null)
+
+    /**
+     * Above [warning]: something is broken rather than merely surprising.
+     *
+     * A throwable passed as an argument is rerouted to the overload below, for
+     * [warning]'s reason — bound as a formatting argument it would render
+     * through a `toString()` this library did not write.
+     */
+    fun error(format: String, vararg args: Any?): Boolean {
+        val throwable = args.firstNotNullOfOrNull { untaggedLogValue(it) as? Throwable }
+        if (throwable != null) {
+            return error(
+                throwable,
+                "$format [throwable passed to error(); use error(throwable, ...)]",
+                *args,
+            )
+        }
+        return record('E', format, args, throwable = null)
+    }
+
+    /** An error carrying the exception behind it. Same contract as [event]. */
+    fun error(throwable: Throwable, format: String, vararg args: Any?): Boolean =
+        record('E', format, args, throwable)
 
     /**
      * The captured lines, oldest first, with an offset anchor before the oldest
@@ -749,7 +840,7 @@ open class DebugLog(
                 // before this session opened.
                 reportClearFailures(now)
                 reportDroppedFromSink(now)
-                append(entry, now, pinned)
+                append(entry, now, level, pinned)
             }
         }
         return true
@@ -763,7 +854,7 @@ open class DebugLog(
      * lines in the order the buffer took them, and so a retried anchor still
      * precedes the first entry that sink sees.
      */
-    private fun append(entry: String, at: ZonedDateTime?, pinned: Boolean = false) {
+    private fun append(entry: String, at: ZonedDateTime?, level: Char, pinned: Boolean = false) {
         val line = Line(entry, at?.offset)
         if (buffer.size >= maxEntries) buffer.removeFirst()
         buffer.addLast(line)
@@ -773,7 +864,7 @@ open class DebugLog(
             if (pinnedBuffer.size >= maxPinnedEntries) pinnedBuffer.removeFirst()
             pinnedBuffer.addLast(line)
         }
-        deliver(entry, at)
+        deliver(entry, at, level)
     }
 
     /**
@@ -806,7 +897,7 @@ open class DebugLog(
         // append-only, so that is where it keeps (Codex, PR #3). Holding the
         // count back instead would mean it never surfaced at that bound at all,
         // since every entry evicts the last.
-        append(notice, at)
+        append(notice, at, 'W')
     }
 
     /**
@@ -891,10 +982,10 @@ open class DebugLog(
         }.getOrNull() ?: return
         clearFailures = 0
         clearFailure = null
-        append(notice, at)
+        append(notice, at, 'W')
     }
 
-    private fun deliver(entry: String, at: ZonedDateTime?) {
+    private fun deliver(entry: String, at: ZonedDateTime?, level: Char) {
         val offset = at?.offset
         // Cleared in a `finally`: a sink is isolated by `runCatching` below, so
         // nothing here should escape, but leaving this set would silently drop
@@ -914,18 +1005,35 @@ open class DebugLog(
                 // sink unregistered earlier in this same fan-out, so it gets
                 // nothing more.
                 val registration = sinkAnchors[sink] ?: continue
-                if (offset != null && registration.offset != offset) {
-                    val marker = "${TIMESTAMP.format(at)} $MARKER_LEVEL timezone offset $offset"
-                    val anchored = runCatching { sink.log(marker) }.isSuccess
+                // The anchor goes out at this entry's own level, and again
+                // whenever a later entry outranks the last one sent. A
+                // severity filter keeps a line only above its threshold, so
+                // anchoring once at a fixed level would let `Tag:W` drop the
+                // offset while keeping the warnings that need it. Re-anchoring
+                // on the running maximum means every entry a filter retains
+                // was preceded by an anchor that same filter retained -- and
+                // costs nothing on the common path, where the offset never
+                // changes and no anchor is written at all.
+                val rank = severityRank(level)
+                val changed = registration.offset != offset
+                if (offset != null && (changed || rank > registration.anchoredRank)) {
+                    val marker = "${TIMESTAMP.format(at)} $level timezone offset $offset"
+                    val anchored = runCatching { sink.log(marker, level) }.isSuccess
                     // Compared by identity, not membership: the callback may have
                     // unregistered this sink, or removed and re-added it, and a
                     // fresh registration is waiting for an anchor of its own.
                     // Writing this one's result into it would mark it anchored by a
                     // marker its destination never saw.
                     if (sinkAnchors[sink] !== registration) continue
-                    if (anchored) registration.offset = offset
+                    if (anchored) {
+                        registration.offset = offset
+                        // The new maximum either way: on a change the count
+                        // restarts here, and otherwise this rank is the one
+                        // that just beat it.
+                        registration.anchoredRank = rank
+                    }
                 }
-                runCatching { sink.log(entry) }
+                runCatching { sink.log(entry, level) }
             }
         } finally {
             deliveringThread = null

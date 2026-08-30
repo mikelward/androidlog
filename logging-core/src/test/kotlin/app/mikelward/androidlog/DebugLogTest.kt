@@ -46,8 +46,8 @@ class DebugLogTest {
      * off the front.
      */
     private fun isMarker(line: String): Boolean =
-        " ${DebugLog.MARKER_LEVEL} timezone offset " in line ||
-            line.startsWith("${DebugLog.MARKER_LEVEL} timezone offset ")
+        Regex(" [A-Z] timezone offset ").containsMatchIn(line) ||
+            Regex("^[A-Z] timezone offset ").containsMatchIn(line)
 
     private val originalZone: TimeZone = TimeZone.getDefault()
 
@@ -128,7 +128,9 @@ class DebugLogTest {
         log.addSink { error("this sink is broken") }
         log.addSink { seen += it }
         log.event("recorded %s", 1)
-        val delivered = seen.filter { " D " in it }
+        // Told apart by text, not by level: a delivered anchor now carries the
+        // level of the entry it precedes, so `" D "` no longer separates them.
+        val delivered = seen.filterNot { isMarker(it) }
         assertEquals(1, delivered.size)
         assertTrue(delivered.single().endsWith("recorded 1"))
         assertEquals(1, log.events().size)
@@ -143,7 +145,7 @@ class DebugLogTest {
         log.event("first")
         log.removeSink(sink)
         log.event("second")
-        assertEquals(1, seen.count { " D " in it })
+        assertEquals(1, seen.count { !isMarker(it) })
     }
 
     @Test
@@ -274,7 +276,7 @@ class DebugLogTest {
         log.event("after the opt-out")
         assertEquals(
             listOf("in flight"),
-            seen.filter { " D " in it }.map { it.substringAfter(" D ") },
+            seen.filterNot { isMarker(it) }.map { it.substringAfter(" D ") },
         )
     }
 
@@ -378,7 +380,7 @@ class DebugLogTest {
         // The sink stream is where a timestamped marker is written, so that is
         // where the two stamps have to agree.
         assertEquals(2, seen.size)
-        assertEquals(seen[1].substringBefore(" D "), seen[0].substringBefore(" I "))
+        assertEquals(seen[1].substringBefore(" D "), seen[0].substringBefore(" D "))
         assertEquals(1, ticks.get() / 60_000)
     }
 
@@ -472,7 +474,7 @@ class DebugLogTest {
         fast.join(5_000)
         assertEquals(
             listOf("first", "second"),
-            seen.filter { " D " in it }.map { it.substringAfter(" D ") },
+            seen.filterNot { isMarker(it) }.map { it.substringAfter(" D ") },
         )
     }
 
@@ -490,8 +492,75 @@ class DebugLogTest {
 
         log.event("first entry the sink sees")
         assertEquals(2, seen.size)
-        assertTrue(seen[0], seen[0].endsWith(" I timezone offset +09:00"))
+        assertTrue(seen[0], seen[0].endsWith(" D timezone offset +09:00"))
         assertTrue(seen[1], seen[1].endsWith(" D first entry the sink sees"))
+    }
+
+    // The three below are one rule: a destination that filters by severity --
+    // logcat, which is why the level is handed over at all -- must never keep an
+    // entry while dropping the anchor that says what its local timestamp means.
+    @Test
+    fun `a delivered anchor takes the level of the entry it precedes`() {
+        TimeZone.setDefault(TimeZone.getTimeZone("Asia/Tokyo"))
+        val log = log()
+        val seen = mutableListOf<Pair<String, Char>>()
+        log.addSink(object : DebugLog.Sink {
+            override fun log(line: String) = error("the level-carrying overload is the one under test")
+            override fun log(line: String, level: Char) {
+                seen += line to level
+            }
+        })
+
+        log.warning("first entry is a warning")
+
+        assertEquals(2, seen.size)
+        assertTrue(seen[0].first, seen[0].first.endsWith(" W timezone offset +09:00"))
+        // Both the rendered level character and the level handed to the sink,
+        // so a reader of the text and a severity filter agree about the line.
+        assertEquals('W', seen[0].second)
+    }
+
+    @Test
+    fun `an entry that outranks the anchor gets an anchor of its own`() {
+        TimeZone.setDefault(TimeZone.getTimeZone("Asia/Tokyo"))
+        val log = log()
+        val seen = mutableListOf<Pair<String, Char>>()
+        log.addSink(object : DebugLog.Sink {
+            override fun log(line: String) = error("the level-carrying overload is the one under test")
+            override fun log(line: String, level: Char) {
+                seen += line to level
+            }
+        })
+
+        log.event("anchored at D")
+        log.error("and now an error, which `Tag:E` would keep")
+
+        val anchors = seen.filter { " timezone offset " in it.first }
+        assertEquals(2, anchors.size)
+        assertEquals('D', anchors[0].second)
+        assertEquals('E', anchors[1].second)
+        // The re-anchor is immediately ahead of the entry that earned it, so a
+        // filtered view reads in order rather than referring backwards.
+        assertEquals(
+            listOf('D', 'D', 'E', 'E'),
+            seen.map { it.second },
+        )
+    }
+
+    @Test
+    fun `an entry the anchor already outranks is not re-anchored`() {
+        TimeZone.setDefault(TimeZone.getTimeZone("Asia/Tokyo"))
+        val log = log()
+        val seen = mutableListOf<String>()
+        log.addSink { seen += it }
+
+        log.warning("anchored at W")
+        log.event("quieter, and already covered")
+        log.verbose("quieter still")
+
+        // One anchor, not three: a `Tag:W` reader has it, and a reader with no
+        // filter has it once rather than on every level change downwards.
+        assertEquals(1, seen.count { " timezone offset " in it })
     }
 
     @Test
@@ -505,7 +574,7 @@ class DebugLogTest {
         assertEquals(emptyList<String>(), seen)
         log.event("first")
         assertEquals(2, seen.size)
-        assertTrue(seen[0], seen[0].endsWith(" I timezone offset +09:00"))
+        assertTrue(seen[0], seen[0].endsWith(" D timezone offset +09:00"))
     }
 
     @Test
@@ -585,7 +654,7 @@ class DebugLogTest {
         // And the next entry offers the anchor again, so the sink does not
         // spend the rest of the process on bare timestamps.
         log.event("second entry")
-        assertTrue(seen[1], seen[1].endsWith(" I timezone offset +09:00"))
+        assertTrue(seen[1], seen[1].endsWith(" D timezone offset +09:00"))
         assertTrue(seen[2], seen[2].endsWith(" D second entry"))
     }
 
@@ -633,7 +702,7 @@ class DebugLogTest {
         log.event("delivered")
         for (recorder in listOf(first, second)) {
             assertEquals(2, recorder.lines.size)
-            assertTrue(recorder.lines[0], recorder.lines[0].endsWith(" I timezone offset +09:00"))
+            assertTrue(recorder.lines[0], recorder.lines[0].endsWith(" D timezone offset +09:00"))
             assertTrue(recorder.lines[1], recorder.lines[1].endsWith(" D delivered"))
         }
     }
@@ -645,7 +714,7 @@ class DebugLogTest {
         val seen = mutableListOf<String>()
         val throwOnNextMarker = AtomicBoolean(false)
         log.addSink { line ->
-            if (" I timezone offset " in line && throwOnNextMarker.compareAndSet(true, false)) {
+            if (" D timezone offset " in line && throwOnNextMarker.compareAndSet(true, false)) {
                 error("sink refused the marker")
             }
             seen += line
@@ -660,7 +729,7 @@ class DebugLogTest {
         assertTrue(seen.none { it.endsWith("+09:00") })
 
         log.event("later still")
-        assertTrue(seen.any { it.endsWith(" I timezone offset +09:00") })
+        assertTrue(seen.any { it.endsWith(" D timezone offset +09:00") })
     }
 
     @Test
@@ -712,7 +781,7 @@ class DebugLogTest {
         log.event("second")
 
         // It leaves on the marker, so the marker is all it ever sees.
-        assertEquals(listOf("01-01 00:00:00.000 I timezone offset Z"), seen)
+        assertEquals(listOf("01-01 00:00:00.000 D timezone offset Z"), seen)
     }
 
     @Test
@@ -739,13 +808,13 @@ class DebugLogTest {
         log.event("first")
         // The rotation happened on the anchor, so the entry behind it belongs
         // to the destination that is gone; the new one starts clean.
-        assertEquals(listOf("01-01 00:00:00.000 I timezone offset Z"), seen)
+        assertEquals(listOf("01-01 00:00:00.000 D timezone offset Z"), seen)
 
         log.event("second")
         assertEquals(
             listOf(
-                "01-01 00:00:00.000 I timezone offset Z",
-                "01-01 00:00:00.000 I timezone offset Z",
+                "01-01 00:00:00.000 D timezone offset Z",
+                "01-01 00:00:00.000 D timezone offset Z",
                 "01-01 00:00:00.000 D second",
             ),
             seen,
@@ -1088,6 +1157,98 @@ class DebugLogTest {
 
         log.setRecording(false)
         assertFalse(log.warning("boom %s", IllegalStateException("boom")))
+    }
+
+    // ---------------------------------------------------------------- levels
+
+    @Test
+    fun `each level records under its own character`() {
+        val log = log()
+        log.verbose("v")
+        log.event("d")
+        log.info("i")
+        log.warning("w")
+        log.error("e")
+
+        val levels = log.events().map { it.split(" ")[2].first() }
+        assertEquals(log.events().toString(), listOf('V', 'D', 'I', 'W', 'E'), levels)
+    }
+
+    @Test
+    fun `a sink is told the level each line was recorded at`() {
+        // Handed over rather than parsed back out of the rendered line, so a
+        // destination with its own severities maps instead of guessing.
+        val log = log()
+        val seen = mutableListOf<Char>()
+        log.addSink(object : DebugLog.Sink {
+            override fun log(line: String) = Unit
+            override fun log(line: String, level: Char) {
+                if (!isMarker(line)) seen += level
+            }
+        })
+
+        log.verbose("v")
+        log.info("i")
+        log.error("e")
+
+        assertEquals(listOf('V', 'I', 'E'), seen)
+    }
+
+    @Test
+    fun `a sink that only implements the line still receives every entry`() {
+        // The level-carrying overload is defaulted, so a sink written as a
+        // lambda keeps working unchanged.
+        val log = log()
+        val seen = mutableListOf<String>()
+        log.addSink(DebugLog.Sink { seen += it })
+
+        log.verbose("v")
+        log.error("e")
+
+        assertEquals(seen.toString(), 2, seen.count { !isMarker(it) })
+    }
+
+    @Test
+    fun `an error carries its exception's type and frames but never its message`() {
+        val log = log()
+        log.error(IllegalStateException("a message nobody may see"), "broke")
+
+        val entry = log.events().single()
+        assertTrue(entry, "IllegalStateException" in entry)
+        assertFalse(entry, "a message nobody may see" in entry)
+    }
+
+    @Test
+    fun `a throwable passed to error as an argument is rerouted, not rendered`() {
+        // Same misuse `warning` reroutes: bound as a formatting argument it
+        // would render through a toString() this library did not write.
+        val log = log()
+        log.error("broke %s", IllegalStateException("a message nobody may see"))
+
+        val entry = log.events().single()
+        assertTrue(entry, "use error(throwable" in entry)
+        assertFalse(entry, "a message nobody may see" in entry)
+    }
+
+    @Test
+    fun `the floor applies to every level`() {
+        val log = log()
+        log.verbose("as %s vouched %s count %s", "unvouched", safe("gfs"), 7)
+        log.info("as %s vouched %s count %s", "unvouched", safe("gfs"), 7)
+        log.error("as %s vouched %s count %s", "unvouched", safe("gfs"), 7)
+
+        // Both directions, because one of them alone is a false pass: a floor
+        // that widened to withhold everything satisfies the withholding
+        // assertion while leaving these levels useless for the diagnostics
+        // they exist to carry (AGENTS.md, "assert both directions"; Codex,
+        // PR #9). So each level is asserted whole, rather than by counting
+        // placeholders.
+        assertEquals(
+            log.events().toString(),
+            List(3) { "as \u2022\u2022\u2022 vouched gfs count 7" },
+            log.events().map { it.substringAfter(" ").substringAfter(" ").substringAfter(" ") },
+        )
+        assertTrue(log.events().toString(), log.events().none { "unvouched" in it })
     }
 
     // --------------------------------------------------------------- pinning
