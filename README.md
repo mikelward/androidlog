@@ -108,6 +108,26 @@ withheld on its own by its type, and every `String` is withheld unless the call
 site wraps it in `safe(...)`. Interpolating into the format string defeats that,
 and nothing can enforce it but review.
 
+### What a consuming app inherits
+
+`:logging-android` ships a `consumer-rules.pro`, which AGP merges into every
+consuming app's R8 configuration. It holds one rule:
+
+```proguard
+-keepnames class ** extends java.lang.Throwable
+```
+
+A throwable is rendered into the log as its class name and nothing else — that
+is what makes it safe to carry, since the no-messages floor keeps the message
+out. Renamed by R8, that name reads `app.example.a.b` in a log a user pastes
+into an email, and the one thing a failure line exists to say is gone unless the
+reader also has the mapping file for that exact build. Platform and JDK
+exceptions were never affected; R8 does not rename what it does not compile.
+
+`-keepnames` prevents renaming only, so an exception class nothing references is
+still shrunk away. Measured on Type Launcher's release build: **+6,496 bytes of
+dex (0.17%)**, which lands as one 16 KiB page in the APK.
+
 ## Building
 
 ```sh
