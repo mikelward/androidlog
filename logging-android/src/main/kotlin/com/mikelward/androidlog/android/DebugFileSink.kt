@@ -1411,7 +1411,7 @@ class DebugFileSink internal constructor(
      * registration its promised first value twice (Codex, PR #4). Asking only
      * whether the listener is currently in the list cannot tell those apart.
      */
-    private class Registration(val listener: CrashListener) {
+    private class Registration<L : Any>(val listener: L) {
         @Volatile
         var live = true
 
@@ -1434,7 +1434,7 @@ class DebugFileSink internal constructor(
         var notified = false
     }
 
-    private val crashListeners = CopyOnWriteArrayList<Registration>()
+    private val crashListeners = CopyOnWriteArrayList<Registration<CrashListener>>()
 
     /**
      * Guards the check-and-add and the mark-and-remove, which
@@ -1448,6 +1448,128 @@ class DebugFileSink internal constructor(
      * lock-free on the worker.
      */
     private val registry = Any()
+
+    /**
+     * Registers [listener] against [listeners] and queues its first value.
+     *
+     * Shared by every signal this sink publishes, deliberately: registration
+     * identity, liveness, delivery-once and the per-registration spell are four
+     * separate races that were each found and fixed on the crash banner (Codex,
+     * PR #4), and a second signal reimplementing "roughly that" would reopen
+     * whichever of them it got subtly wrong. One implementation, one suite.
+     */
+    private fun <L : Any, V> addListener(
+        listeners: CopyOnWriteArrayList<Registration<L>>,
+        listener: L,
+        currentValue: () -> V,
+        deliver: (L, V) -> Unit,
+        threwMessage: String,
+    ) {
+        val registration = synchronized(registry) {
+            if (listeners.any { it.listener === listener }) return
+            Registration(listener).also { listeners += it }
+        }
+        // Delivered rather than assumed. `start()` runs in `Application.onCreate`
+        // and publishes there, so by the time a screen registers the value is
+        // usually already settled — and publication notifies only on a *change*,
+        // so a later recompute deriving the same answer sends nothing. A
+        // listener-backed UI starting at the initial value would then miss a
+        // state that was already set until it changed twice (Codex, PR #4). On
+        // the worker, like every other delivery, so that contract holds here too.
+        runCatching {
+            worker.execute {
+                // Still this registration? A screen can register and go away
+                // before the worker gets here, and the remove promised to stop
+                // notifying it — delivering anyway can drive disposed UI
+                // (Codex, PR #4).
+                if (!registration.live) return@execute
+                // A publication queued ahead of this may already have given it
+                // one, and one is what was promised. See [Registration.notified].
+                if (registration.notified) return@execute
+                registration.notified = true
+                // Reported like any other delivery, and on the same spell: an
+                // observer that throws on its first value fails exactly as
+                // silently as one that throws on its tenth.
+                runCatching { deliver(listener, currentValue()) }
+                    .onFailure { failure ->
+                        registration.failing = beginSpell(registration.failing) {
+                            log.failure(failure, threwMessage)
+                        }
+                    }
+                    .onSuccess { registration.failing = false }
+            }
+        }.onFailure { log.failure(it, "A listener's first value could not be scheduled") }
+    }
+
+    /** Shared by every signal; see [addListener]. */
+    private fun <L : Any> removeListener(
+        listeners: CopyOnWriteArrayList<Registration<L>>,
+        listener: L,
+    ) {
+        synchronized(registry) {
+            // Marked before it is dropped, so a delivery already queued against
+            // this registration sees it gone even between the two steps.
+            listeners.forEach { if (it.listener === listener) it.live = false }
+            listeners.removeIf { it.listener === listener }
+        }
+        // No spell to clear: it lives on the registration, which has just gone
+        // with it. The reset that used to be enqueued here could not have worked
+        // anyway — a first delivery queued before it ran under the old flag.
+    }
+
+    /**
+     * Worker-only. Hands [value] to every registration that is owed it — one
+     * whose value [changed], **and any still owed its first**, whether it
+     * changed or not.
+     *
+     * Registration promises one delivery, and the task that carries it can be
+     * refused: the listener then sits registered with nothing sent, and since
+     * publication is change-only, a later recompute deriving the same answer
+     * sent nothing either, so a screen opened over an already-set state missed
+     * it until the state happened to change (Codex, PR #4). This is the retry,
+     * and it costs nothing when there is none owed. Each failure contained.
+     */
+    private fun <L : Any, V> publish(
+        listeners: CopyOnWriteArrayList<Registration<L>>,
+        changed: Boolean,
+        value: V,
+        deliver: (L, V) -> Unit,
+        threwMessage: String,
+    ) {
+        for (registration in listeners) {
+            // Told already, and nothing has changed since: there is nothing this
+            // pass owes it. `notified` is what separates the two reasons to be
+            // here, so a first delivery is never sent twice.
+            if (!changed && registration.notified) continue
+            // The list iterates a snapshot, so one removed while a slow listener
+            // ahead of it was still running is still in this loop — and would be
+            // notified after the remove returned, driving disposed UI (Codex,
+            // PR #4). The same question the queued first value asks.
+            if (!registration.live) continue
+            // Before the call, not after: a listener that throws was still handed
+            // a value, and its queued first delivery must not stand in for one.
+            registration.notified = true
+            runCatching { deliver(registration.listener, value) }
+                .onFailure { failure ->
+                    // Isolated, so one observer cannot stop the next -- but not
+                    // unsaid: an observer that throws stops updating, and the
+                    // screen it was driving then shows a value that has quietly
+                    // stopped moving, with nothing to explain why (Codex, PR #4).
+                    // Once per spell, since a listener that throws once tends to
+                    // throw on every change, and reporting fans out to this sink.
+                    // Per *registration*, not per sink: a shared latch let one
+                    // observer's spell swallow a different observer's very first
+                    // failure, and the ordering that produced it was ordinary —
+                    // a first delivery queued ahead of the removal that would
+                    // have cleared the flag (Codex, PR #4). A spell is about one
+                    // broken observer, so it belongs to that observer.
+                    registration.failing = beginSpell(registration.failing) {
+                        log.failure(failure, threwMessage)
+                    }
+                }
+                .onSuccess { registration.failing = false }
+        }
+    }
 
     @Volatile
     private var unacknowledgedCrashValue = false
@@ -1493,41 +1615,13 @@ class DebugFileSink internal constructor(
      * re-derived from what is actually on disk.
      */
     fun addCrashListener(listener: CrashListener) {
-        val registration = synchronized(registry) {
-            if (crashListeners.any { it.listener === listener }) return
-            Registration(listener).also { crashListeners += it }
-        }
-        // Delivered rather than assumed. `start()` runs in `Application.onCreate`
-        // and publishes there, so by the time a screen registers the value is
-        // usually already settled — and publication notifies only on a *change*,
-        // so a later `requestCrashRecompute()` deriving the same answer sends
-        // nothing. A listener-backed UI starting at `false` would then miss a
-        // banner that was already raised until the state changed twice (Codex,
-        // PR #4). On the worker, like every other delivery, so the contract
-        // above holds for this one too.
-        runCatching {
-            worker.execute {
-                // Still this registration? A screen can register and go away
-                // before the worker gets here, and [removeCrashListener]
-                // promised to stop notifying it — delivering anyway can drive
-                // disposed UI (Codex, PR #4).
-                if (!registration.live) return@execute
-                // A publication queued ahead of this may already have given it
-                // one, and one is what was promised. See [Registration.notified].
-                if (registration.notified) return@execute
-                registration.notified = true
-                // Reported like any other delivery, and on the same spell: an
-                // observer that throws on its first value fails exactly as
-                // silently as one that throws on its tenth.
-                runCatching { listener.onUnacknowledgedCrashChanged(unacknowledgedCrashValue) }
-                    .onFailure { failure ->
-                        registration.failing = beginSpell(registration.failing) {
-                            log.failure(failure, "A crash-state listener threw")
-                        }
-                    }
-                    .onSuccess { registration.failing = false }
-            }
-        }.onFailure { log.failure(it, "A listener's first value could not be scheduled") }
+        addListener(
+            listeners = crashListeners,
+            listener = listener,
+            currentValue = { unacknowledgedCrashValue },
+            deliver = CrashListener::onUnacknowledgedCrashChanged,
+            threwMessage = "A crash-state listener threw",
+        )
     }
 
     /**
@@ -1544,15 +1638,7 @@ class DebugFileSink internal constructor(
      * it has stopped observing. Written up in `TODO.md`.
      */
     fun removeCrashListener(listener: CrashListener) {
-        synchronized(registry) {
-            // Marked before it is dropped, so a delivery already queued against
-            // this registration sees it gone even between the two steps.
-            crashListeners.forEach { if (it.listener === listener) it.live = false }
-            crashListeners.removeIf { it.listener === listener }
-        }
-        // No spell to clear: it lives on the registration, which has just gone
-        // with it. The reset that used to be enqueued here could not have worked
-        // anyway — a first delivery queued before it ran under the old flag.
+        removeListener(crashListeners, listener)
     }
 
     /**
@@ -1656,41 +1742,13 @@ class DebugFileSink internal constructor(
     private fun publishUnacknowledgedCrash(value: Boolean) {
         val changed = unacknowledgedCrashValue != value
         if (changed) unacknowledgedCrashValue = value
-        for (registration in crashListeners) {
-            // Told already, and nothing has changed since: there is nothing this
-            // pass owes it. `notified` is what separates the two reasons to be
-            // here, so a first delivery is never sent twice.
-            if (!changed && registration.notified) continue
-            // The list iterates a snapshot, so one removed while a slow listener
-            // ahead of it was still running is still in this loop — and would be
-            // notified after `removeCrashListener` returned, driving disposed UI
-            // (Codex, PR #4). The same question the queued first value asks.
-            if (!registration.live) continue
-            // Before the call, not after: a listener that throws was still handed
-            // a value, and its queued first delivery must not stand in for one.
-            registration.notified = true
-            runCatching {
-                registration.listener.onUnacknowledgedCrashChanged(unacknowledgedCrashValue)
-            }
-                .onFailure { failure ->
-                    // Isolated, so one observer cannot stop the next -- but not
-                    // unsaid: an observer that throws stops updating, and the
-                    // screen it was driving then shows a banner that has quietly
-                    // stopped moving, with nothing to explain why (Codex, PR #4).
-                    // Once per spell, since a listener that throws once tends to
-                    // throw on every change, and reporting fans out to this sink.
-                    // Per *registration*, not per sink: a shared latch let one
-                    // observer's spell swallow a different observer's very first
-                    // failure, and the ordering that produced it was ordinary —
-                    // a first delivery queued ahead of the removal that would
-                    // have cleared the flag (Codex, PR #4). A spell is about one
-                    // broken observer, so it belongs to that observer.
-                    registration.failing = beginSpell(registration.failing) {
-                        log.failure(failure, "A crash-state listener threw")
-                    }
-                }
-                .onSuccess { registration.failing = false }
-        }
+        publish(
+            listeners = crashListeners,
+            changed = changed,
+            value = unacknowledgedCrashValue,
+            deliver = CrashListener::onUnacknowledgedCrashChanged,
+            threwMessage = "A crash-state listener threw",
+        )
     }
 
     /**
