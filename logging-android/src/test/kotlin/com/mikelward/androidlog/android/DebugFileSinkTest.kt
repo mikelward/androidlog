@@ -1215,6 +1215,34 @@ class DebugFileSinkTest {
     }
 
     @Test
+    fun `an opt-out purge the worker refuses says so to the caller too`() {
+        // The log line is not enough here and that is the whole point of the
+        // outcome: `DebugLog` holds the rejection until recording comes back,
+        // and recording is exactly what the user has just turned off, so it may
+        // never be emitted at all (Codex, PR #20).
+        val log = log()
+        val sink = DebugFileSink(log, { dir }, 0L, {}, { "1" }, { refusingWorker() })
+        log.addSink(sink)
+        assertFalse("precondition: nothing has failed yet", sink.storageOutcomes.optOutPurgeFailed)
+
+        log.setRecording(false)
+
+        assertTrue(sink.storageOutcomes.optOutPurgeFailed)
+    }
+
+    @Test
+    fun `a dismissal the worker refuses says so to the caller too`() {
+        // The task never runs, so the crash file and the banner both stay and
+        // no worker publication will ever say so.
+        val sink = DebugFileSink(log(), { dir }, 0L, {}, { "1" }, { refusingWorker() })
+        assertFalse("precondition: nothing has failed yet", sink.storageOutcomes.crashDismissalFailed)
+
+        sink.acknowledgeCrashBanner()
+
+        assertTrue(sink.storageOutcomes.crashDismissalFailed)
+    }
+
+    @Test
     fun `a listener removed while a slower one is still running is not notified`() {
         // The registry iterates a snapshot, so a removal that lands while an
         // earlier listener is still running does not take the later one out of
@@ -2381,5 +2409,205 @@ class DebugFileSinkTest {
             1,
             log.snapshot().count { it.contains("could not list the log directory") },
         )
+    }
+
+    // ------------------------------------------------------- storage outcomes
+
+    @Test
+    fun `an opt-out tells the caller whether it removed this run's log`() {
+        // Both directions. The failure has to reach the caller because it may
+        // never reach the log: the line is held until recording comes back, and
+        // the user has just turned recording off.
+        val log = log()
+        val sink = sink(log)
+        log.addSink(sink)
+        log.event("collected before the opt-out")
+        sink.awaitIdle()
+
+        // Neither deletable (not empty) nor truncatable, so the purge fails.
+        current().delete()
+        File(dir, "androidlog.log/wedged").mkdirs()
+        log.setRecording(false)
+        sink.awaitIdle()
+        assertTrue(sink.storageOutcomes.optOutPurgeFailed)
+        assertFalse("one operation does not answer for the other", sink.storageOutcomes.crashDismissalFailed)
+
+        // Cleared by the same operation next succeeding, so a retry that works
+        // retires the message the failure put on screen.
+        File(dir, "androidlog.log").deleteRecursively()
+        log.setRecording(true)
+        log.event("after")
+        sink.awaitIdle()
+        log.setRecording(false)
+        sink.awaitIdle()
+        assertFalse(sink.storageOutcomes.optOutPurgeFailed)
+    }
+
+    @Test
+    fun `a kept prior run is not reported as a failed opt-out`() {
+        // The purge deliberately leaves a run the rotation could not move: that
+        // is the design, not a failure, and reporting it would light a warning
+        // on every opt-out that followed a failed rotation.
+        val log = log()
+        // The rotation's destination is occupied, so `androidlog.log` stays put
+        // and holds the previous run.
+        val sink = sinkWithFailedRotation(log)
+        log.addSink(sink)
+        assertTrue("the premise: a run was retained in place", current().exists())
+
+        log.setRecording(false)
+        sink.awaitIdle()
+        assertTrue("and it is still there, deliberately", current().exists())
+        assertFalse(sink.storageOutcomes.optOutPurgeFailed)
+    }
+
+    @Test
+    fun `a residual snapshot the opt-out could not remove counts as a failure`() {
+        // The temp file holds this run's own entries mid-write, so an opt-out
+        // that could not remove it left exactly what it promised to delete.
+        // Ignoring its answer reported success for it (Codex, PR #20).
+        val log = log()
+        val sink = sink(log)
+        log.addSink(sink)
+        log.event("collected before the opt-out")
+        sink.awaitIdle()
+
+        // `androidlog.log` itself is removable; only the residual snapshot is
+        // wedged, so this is the temp file's answer alone deciding the outcome.
+        File(dir, "androidlog.log.tmp/wedged").mkdirs()
+        log.setRecording(false)
+        sink.awaitIdle()
+
+        assertTrue(sink.storageOutcomes.optOutPurgeFailed)
+    }
+
+    @Test
+    fun `a dismissal tells the caller whether the banner actually came down`() {
+        // The refusal shape from `a dismissal onto a name already taken`: the
+        // plain name is occupied, so the rename is refused and the banner stays.
+        // Without this the user taps a control that does nothing, and the one
+        // line saying why is in a log they would have to go and read.
+        File(dir, "androidlog-prev-1.crash.log").writeText("the run that crashed\n")
+        File(dir, "androidlog-prev-1.log").writeText("an earlier run, never shared\n")
+        val sink = sink()
+        sink.start(installCrashHandler = false)
+        sink.awaitIdle()
+
+        sink.acknowledgeCrashBanner()
+        sink.awaitIdle()
+        assertTrue("the premise: it really was refused", sink.unacknowledgedCrash)
+        assertTrue(sink.storageOutcomes.crashDismissalFailed)
+        assertFalse("one operation does not answer for the other", sink.storageOutcomes.optOutPurgeFailed)
+
+        // And the retry that works clears it.
+        File(dir, "androidlog-prev-1.log").delete()
+        sink.acknowledgeCrashBanner()
+        sink.awaitIdle()
+        assertFalse("the premise: it worked this time", sink.unacknowledgedCrash)
+        assertFalse(sink.storageOutcomes.crashDismissalFailed)
+    }
+
+    @Test
+    fun `a dismissal that could not look says so rather than reading as done`() {
+        // Nothing was renamed and the recompute leaves the banner where it is,
+        // so the tap had no visible effect -- which is why the outcome is
+        // derived from the banner after the recompute rather than from the
+        // renames: every rename here "succeeded" by not being attempted
+        // (Codex, PR #20).
+        current().writeText("the crash nobody has read yet\n")
+        File(dir, "androidlog.log.crash").writeText("1")
+        val sink = sink()
+        sink.start(installCrashHandler = false)
+        sink.awaitIdle()
+        assertTrue("the premise: the banner is up", sink.unacknowledgedCrash)
+
+        // The rotated crash log becomes unclassifiable: a self-referencing
+        // symlink fails with a real filesystem error rather than "not found",
+        // so the scan will not say whether it crashed and the recompute leaves
+        // the banner exactly where it is.
+        val rotated = previous().single { it.name.endsWith(".crash.log") }
+        assertTrue(rotated.delete())
+        Files.createSymbolicLink(rotated.toPath(), rotated.toPath())
+
+        sink.acknowledgeCrashBanner()
+        sink.awaitIdle()
+        assertTrue("the premise: the banner really did stay up", sink.unacknowledgedCrash)
+        assertTrue(sink.storageOutcomes.crashDismissalFailed)
+    }
+
+    @Test
+    fun `two rejected operations racing do not clear each other's failure`() {
+        // Both outcomes live in one value, so a read-build-assign lets each
+        // caller read the other's field before either writes and then replace
+        // the whole thing — the later write clearing a failure the earlier one
+        // genuinely recorded (Codex, PR #20). Two writers is the ordinary case
+        // on a refusing worker: each rejected operation records its own outcome
+        // from the thread that called it.
+        //
+        // The same barrier-and-repeat shape as the registration race above.
+        repeat(200) {
+            val sink = DebugFileSink(log(), { dir }, 0L, {}, { "1" }, { refusingWorker() })
+            val barrier = CyclicBarrier(2)
+            val racers = listOf(
+                Thread {
+                    barrier.await()
+                    runCatching { sink.onCleared() }
+                },
+                Thread {
+                    barrier.await()
+                    sink.acknowledgeCrashBanner()
+                },
+            ).onEach { it.start() }
+            racers.forEach { it.join(5_000) }
+
+            assertTrue("the opt-out's failure survives", sink.storageOutcomes.optOutPurgeFailed)
+            assertTrue("and so does the dismissal's", sink.storageOutcomes.crashDismissalFailed)
+        }
+    }
+
+    @Test
+    fun `a dismissal with nothing pinned is not reported as refused`() {
+        // The outcome describes a tap that left the banner up, and there is no
+        // banner here to leave. Reporting a refusal would light a message about
+        // a control the user could not have tapped.
+        val sink = sink()
+        sink.acknowledgeCrashBanner()
+        sink.awaitIdle()
+        assertFalse(sink.storageOutcomes.crashDismissalFailed)
+    }
+
+    @Test
+    fun `a storage listener is handed the current value on the worker`() {
+        File(dir, "androidlog-prev-1.crash.log").writeText("crashed\n")
+        File(dir, "androidlog-prev-1.log").writeText("taken\n")
+        val sink = sink()
+        sink.start(installCrashHandler = false)
+        sink.acknowledgeCrashBanner()
+        sink.awaitIdle()
+
+        val seen = mutableListOf<Boolean>()
+        val threads = mutableListOf<String>()
+        val listener = DebugFileSink.StorageListener {
+            seen += it.crashDismissalFailed
+            threads += Thread.currentThread().name
+        }
+        sink.addStorageListener(listener)
+        sink.awaitIdle()
+        // Delivered rather than assumed: registering after the failure still
+        // learns about it, which a change-only signal would not have said.
+        assertEquals(listOf(true), seen)
+        assertTrue(threads.toString(), threads.single().contains("androidlog"))
+
+        // Change-only from there, and silent once removed.
+        File(dir, "androidlog-prev-1.log").delete()
+        sink.acknowledgeCrashBanner()
+        sink.awaitIdle()
+        assertEquals(listOf(true, false), seen)
+        sink.removeStorageListener(listener)
+        File(dir, "androidlog-prev-2.crash.log").writeText("crashed again\n")
+        File(dir, "androidlog-prev-2.log").writeText("taken\n")
+        sink.acknowledgeCrashBanner()
+        sink.awaitIdle()
+        assertEquals("nothing after the removal", listOf(true, false), seen)
     }
 }

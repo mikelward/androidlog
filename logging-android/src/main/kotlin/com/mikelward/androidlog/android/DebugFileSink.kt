@@ -500,12 +500,6 @@ class DebugFileSink internal constructor(
     private fun previousFiles(): List<File> = previousFilesOrNull() ?: emptyList()
 
     /**
-     * Prior runs that crashed — the files that raise the banner — or null when
-     * the directory could not be listed.
-     */
-    private fun crashedFiles(): List<File>? = scanForCrashes()?.crashed
-
-    /**
      * What a pass over the prior runs found: the ones that crashed, and whether
      * any entry refused to say.
      */
@@ -1003,26 +997,52 @@ class DebugFileSink internal constructor(
         // is refusing. `DebugLog` isolates every `onCleared` call and holds
         // what it threw until recording is back on, so letting this out is
         // what puts the failure somewhere a reader finds it (Codex, PR #4).
-        worker.execute {
-            runCatching {
-                // Not while a failed rotation left the previous run here.
-                // That file is a prior run, and the rule above is that prior
-                // runs survive an opt-out (Codex, PR #4).
-                if (retainedPreviousRun() == null && !discardContents(current)) {
-                    purgeFailed = true
-                }
-                discardContents(temp)
-            }.onFailure { failure ->
-                // The same held state as a refusal, because it is the same
-                // outcome: the file survives an opt-out and the next start
-                // rotates it into the shareable set. Swallowed, it left no
-                // record and no diagnostic at all (Codex, PR #4). Nothing
-                // can be said here — recording is already off, which is what
-                // the holding is for.
-                purgeFailed = true
-                purgeFailure = failure
-            }
+        runCatching {
+            worker.execute(::purgeOnWorker)
+        }.onFailure { failure ->
+            // The task never ran, so nothing on the worker will ever publish
+            // this operation's outcome — and `DebugLog` holds the rejection
+            // for a log the user has just turned off (Codex, PR #20).
+            recordStorageFailureOffWorker(optOutPurgeFailed = true)
+            // Still uncontained, for the reason above: letting it out is what
+            // puts the failure somewhere a reader finds it.
+            throw failure
         }
+    }
+
+    /** Worker-only. The body of [onCleared]; see its documentation. */
+    private fun purgeOnWorker() {
+        val kept = runCatching {
+            // Not while a failed rotation left the previous run here.
+            // That file is a prior run, and the rule above is that prior
+            // runs survive an opt-out (Codex, PR #4).
+            val currentLeft = retainedPreviousRun() == null && !discardContents(current)
+            // The temp file counts the same. A residual snapshot there is
+            // this run's own entries, so an opt-out that could not remove
+            // it left exactly what it promised to delete -- and ignoring
+            // its answer reported success for it (Codex, PR #20).
+            val tempLeft = !discardContents(temp)
+            val left = currentLeft || tempLeft
+            if (left) purgeFailed = true
+            left
+        }.onFailure { failure ->
+            // The same held state as a refusal, because it is the same
+            // outcome: the file survives an opt-out and the next start
+            // rotates it into the shareable set. Swallowed, it left no
+            // record and no diagnostic at all (Codex, PR #4). Nothing
+            // can be said here — recording is already off, which is what
+            // the holding is for.
+            purgeFailed = true
+            purgeFailure = failure
+            // Whatever threw, the file this was meant to remove is still
+            // there as far as anyone can tell -- the honest answer, and
+            // the same one the held report will eventually give.
+        }.getOrDefault(true)
+        // Said to the caller as well as to the log, because the log is the
+        // one place this line may never reach: recording is off by the time
+        // this runs, so the report is held until it comes back and may be
+        // held for the life of the process.
+        publishStorageOutcomes(optOutPurgeFailed = kept)
     }
 
     /**
@@ -1807,11 +1827,12 @@ class DebugFileSink internal constructor(
         runCatching {
             worker.submit {
                 runCatching {
-                    crashedFiles()?.forEach { file ->
+                    scanForCrashes()?.crashed?.forEach { file ->
                         if (file == current) {
                             // The retained run carries no crash suffix to rename
                             // off; what marks it is the marker, so consuming that
                             // is the dismissal. Its log stays, still shareable.
+                            // It says so itself when it cannot.
                             consumeCrashMarker()
                             return@forEach
                         }
@@ -1861,8 +1882,228 @@ class DebugFileSink internal constructor(
                 // did not happen leaves the banner up, which is the direction an
                 // unknown check has to fail in.
                 recomputeUnacknowledgedCrash()
+                // Derived from what that published, and only after it. The
+                // outcome is the question the user is actually asking -- I
+                // tapped Dismiss, is the banner still there? -- so reading it
+                // off the renames instead misses every other way the banner
+                // survives: an entry that would not say whether it crashed, and
+                // a recompute that could not list the directory at all, both of
+                // which leave the value exactly where it was while every rename
+                // reported success (Codex, PR #20).
+                publishStorageOutcomes(crashDismissalFailed = unacknowledgedCrashValue)
             }
-        }.onFailure { log.failure(it, "A crash-banner dismissal could not be scheduled") }
+        }.onFailure {
+            // The task never ran, so the crash file and the banner both stay
+            // and nothing on the worker will say so (Codex, PR #20).
+            recordStorageFailureOffWorker(crashDismissalFailed = true)
+            log.failure(it, "A crash-banner dismissal could not be scheduled")
+        }
+    }
+
+    // ------------------------------------------------------- storage outcomes
+
+    /**
+     * What the last completed attempt at each maintenance operation the user
+     * can *ask for* actually did.
+     *
+     * Both of these already leave a line in the log. That is not enough on its
+     * own, and the reason is specific to each: the opt-out purge reports into a
+     * log the user has just turned off, so the line is held until recording
+     * comes back and may never land at all; and a refused dismissal leaves the
+     * user tapping a control with no visible effect, where the one place they
+     * would look for a reason is the screen, not a log they would have to go
+     * and read. A caller that cannot see the outcome can only show the
+     * operation as having worked.
+     *
+     * One value rather than two properties, so the change test and the delivery
+     * stay single — a third outcome later does not change the listener.
+     */
+    class StorageOutcomes internal constructor(
+        /**
+         * Whether the last opt-out left this run's saved log on disk.
+         *
+         * False when the purge had nothing to do: a prior run the rotation
+         * could not move is deliberately kept (see [onCleared]), which is the
+         * purge working as designed rather than failing.
+         */
+        val optOutPurgeFailed: Boolean,
+        /**
+         * Whether the last [acknowledgeCrashBanner] left the banner up.
+         *
+         * True when a rename was refused, when the directory could not be
+         * listed, and when an entry would not say whether it had crashed —
+         * all three end with the banner where it was and the tap with nothing
+         * to show for it.
+         */
+        val crashDismissalFailed: Boolean,
+    ) {
+        override fun equals(other: Any?): Boolean =
+            other is StorageOutcomes &&
+                other.optOutPurgeFailed == optOutPurgeFailed &&
+                other.crashDismissalFailed == crashDismissalFailed
+
+        override fun hashCode(): Int =
+            (if (optOutPurgeFailed) 2 else 0) + (if (crashDismissalFailed) 1 else 0)
+
+        override fun toString(): String =
+            "StorageOutcomes(optOutPurgeFailed=$optOutPurgeFailed, " +
+                "crashDismissalFailed=$crashDismissalFailed)"
+    }
+
+    /** Notified, on the worker, whenever [storageOutcomes] changes. */
+    fun interface StorageListener {
+        fun onStorageOutcomesChanged(outcomes: StorageOutcomes)
+    }
+
+    private val storageListeners = CopyOnWriteArrayList<Registration<StorageListener>>()
+
+    private val storageOutcomesRef =
+        AtomicReference(StorageOutcomes(optOutPurgeFailed = false, crashDismissalFailed = false))
+
+    /**
+     * Applies one operation's outcome, leaving the other exactly as it is, and
+     * answers whether anything changed.
+     *
+     * A compare-and-set loop rather than a read, build and assign. Both fields
+     * live in one value, so two operations completing at once each read the
+     * other's field before either wrote and then replaced the whole value —
+     * the later write clearing a failure the earlier one had genuinely
+     * recorded (Codex, PR #20). Two writers is not hypothetical here: the
+     * worker publishes one operation's outcome while a *rejected* operation
+     * records its own from the calling thread.
+     *
+     * The loop rather than `updateAndGet` because the caller needs to know
+     * whether the value actually moved, and that lambda can run more than once
+     * under contention, so a flag set inside it is not the answer for the
+     * application that won.
+     */
+    private fun applyStorageOutcome(
+        optOutPurgeFailed: Boolean? = null,
+        crashDismissalFailed: Boolean? = null,
+    ): Boolean {
+        while (true) {
+            val current = storageOutcomesRef.get()
+            val next = StorageOutcomes(
+                optOutPurgeFailed ?: current.optOutPurgeFailed,
+                crashDismissalFailed ?: current.crashDismissalFailed,
+            )
+            if (next == current) return false
+            if (storageOutcomesRef.compareAndSet(current, next)) return true
+        }
+    }
+
+    /**
+     * The last outcome of each operation in [StorageOutcomes], written by the
+     * worker that performs them — or, when the worker refused the work
+     * outright, by the caller recording that refusal — and only observed from
+     * outside. Each write touches one operation's field, under a
+     * compare-and-set, so neither can clear the other's.
+     *
+     * Latched rather than derived, unlike [unacknowledgedCrash], because there
+     * is nothing on disk to derive it from: "the file the opt-out meant to
+     * remove is still here" is indistinguishable from "there is a file" once
+     * the attempt is over. Each field is therefore set by its own operation
+     * completing, and cleared by that same operation next succeeding — so a
+     * retry that works retires the message the failure put on screen.
+     *
+     * **Deliberately not a `StateFlow`**, for [unacknowledgedCrash]'s reason:
+     * no third-party runtime dependency reaches four APKs to deliver two
+     * booleans, and a consumer wraps [addStorageListener] in its own flow.
+     *
+     * **Read this property, do not rely on the listener alone.** Every signal
+     * this sink publishes is delivered from its worker, and a worker that has
+     * refused an operation will usually refuse to announce it too — so a
+     * failure that is recorded here may never reach a registered listener.
+     * That is not particular to this outcome: on a refusing worker
+     * [unacknowledgedCrash] cannot be recomputed either, and a listener
+     * registering then never receives its first value. Reading this after
+     * whatever completion callback the caller already has closes the gap for
+     * the case the listener cannot.
+     */
+    val storageOutcomes: StorageOutcomes get() = storageOutcomesRef.get()
+
+    /**
+     * Observes [storageOutcomes]. Fires on the worker thread, only on a change,
+     * so it must not block; post to wherever it is being rendered. Registering
+     * delivers the current value once, so an observer never has to assume one.
+     */
+    fun addStorageListener(listener: StorageListener) {
+        addListener(
+            listeners = storageListeners,
+            listener = listener,
+            currentValue = { storageOutcomesRef.get() },
+            deliver = StorageListener::onStorageOutcomesChanged,
+            threwMessage = "A storage-outcome listener threw",
+        )
+    }
+
+    /** Stops [listener] being notified; see [removeCrashListener] for the window. */
+    fun removeStorageListener(listener: StorageListener) {
+        removeListener(storageListeners, listener)
+    }
+
+    /**
+     * Records a failed outcome from a thread that is **not** the worker.
+     *
+     * Only for a scheduling refusal, where the work never ran and the worker
+     * is by definition unavailable to publish from — so without this the file
+     * survives an opt-out, or a banner survives a dismissal, while the outcome
+     * still reads as its previous value, normally success. `DebugLog` holds
+     * the rejection, but recording has just been turned off in the opt-out's
+     * case, so that line may never be emitted at all: precisely the gap this
+     * outcome exists to close (Codex, PR #20).
+     *
+     * Two deliberate limits. It only ever sets a field to `true`, so a
+     * concurrent worker publication cannot be overwritten with a stale
+     * success — and there is no pending one for the refused operation anyway,
+     * since its task never ran. And it does **not** notify from here: calling
+     * listeners on a tap's own thread is the one invariant the derived design
+     * rests on, and an earlier eager lowering broke exactly that and raced a
+     * recompute. The notification is attempted on the worker, which may refuse
+     * it too; the value stands either way, and a caller re-reading
+     * [storageOutcomes] on its own completion callback sees the truth.
+     */
+    private fun recordStorageFailureOffWorker(
+        optOutPurgeFailed: Boolean? = null,
+        crashDismissalFailed: Boolean? = null,
+    ) {
+        val changed = applyStorageOutcome(optOutPurgeFailed, crashDismissalFailed)
+        runCatching {
+            worker.execute {
+                publish(
+                    listeners = storageListeners,
+                    changed = changed,
+                    value = storageOutcomesRef.get(),
+                    deliver = StorageListener::onStorageOutcomesChanged,
+                    threwMessage = "A storage-outcome listener threw",
+                )
+            }
+        }.onFailure {
+            // Usually the same refusal again, since the worker that rejected
+            // the operation is the one being asked to announce it. Said rather
+            // than dropped: an observer that stops updating without a word is
+            // what this whole signal exists to stop. [storageOutcomes] carries
+            // the answer either way -- see its own note on reading it.
+            log.failure(it, "A storage outcome could not be delivered to listeners")
+        }
+    }
+
+    /**
+     * Worker-only. Each argument defaults to what is already published, so an
+     * operation states its own outcome and leaves the other alone.
+     */
+    private fun publishStorageOutcomes(
+        optOutPurgeFailed: Boolean? = null,
+        crashDismissalFailed: Boolean? = null,
+    ) {
+        val changed = applyStorageOutcome(optOutPurgeFailed, crashDismissalFailed)
+        publish(
+            listeners = storageListeners,
+            changed = changed,
+            value = storageOutcomesRef.get(),
+            deliver = StorageListener::onStorageOutcomesChanged,
+            threwMessage = "A storage-outcome listener threw",
+        )
     }
 
     // ------------------------------------------------------------------ crash
