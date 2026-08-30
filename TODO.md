@@ -552,6 +552,41 @@ own `runCatching`, before the snapshot and after the crash marker.
 
 ## Not built yet
 
+- **Find a way to move AGP across the fleet in one step, or to stop needing
+  to.** A composite build cannot mix Android Gradle plugin versions —
+  `AgpVersionCompatibilityRule` refuses to compare 9.3.1 against 9.3.2 at all —
+  so this repository and the four apps have to agree on AGP exactly, and a
+  patch release breaks every consumer until they do. Joining the weekly
+  dependency batch (`gradle-update.yml`) shrinks the window from "until
+  somebody notices" to "until the batch PRs merge", but it does not close it:
+  the five batches open as five independent pull requests, and whichever
+  consumer merges first while this repository has not is broken meanwhile.
+  Google published AGP 9.3.2 on 2026-08-24; 9.3.1 was 2026-07-23, so this is a
+  roughly monthly event, and `9.4.0` is already at `rc02`.
+
+  Options seen so far, none obviously right:
+
+  - **Order the merges.** Land this repository's batch first, every time. Costs
+    nothing to build and everything to remember, which is what makes it the
+    option most likely to fail quietly.
+  - **One batch PR spanning all five repositories.** Closes the window
+    properly, but `gradle-update` opens one PR per repository by design, and
+    five repositories cannot merge atomically anyway.
+  - **Take AGP out of the included build.** `:logging-android` would become a
+    plain Kotlin module compiling `compileOnly` against `android.jar`, and the
+    version rule would never fire. It costs the three things AGP is here for:
+    `consumerProguardFiles` (the throwable keep rule all four apps inherit,
+    with `verifyConsumerRules` guarding it), `minSdk` enforcement, and Android
+    lint. Real capability for a build-plumbing convenience — the trade needs
+    thinking about rather than taking.
+  - **Let the consumer's version win.** Gradle resolves an included build's
+    plugins from that build's own `pluginManagement`, so this needs a seam —
+    a property the consumer passes down — and a seam has to be right in five
+    places rather than one.
+
+  Whatever lands, the test is that an AGP release cannot leave the fleet
+  half-moved without something red saying so.
+
 - **Decide whether this repository carries a `LICENSE`** (maintainer,
   2026-08-30: "to-do for later"). It has none today. That is consistent while
   it is one owner's code shared between one owner's apps — clothescast's

@@ -55,10 +55,14 @@ has stopped biting.
 - **`minSdk` is 31**, the floor across the consumer fleet (`clothescast`;
   simmo and typelauncher are 34, snoozemo 35). Raising it silently drops a
   consumer, so it is a migration note in that app, not a tidy-up here.
-- **AGP and Kotlin stay in step with the consumers.** A composite build puts
-  this build's toolchain alongside theirs in one Gradle invocation, so a major
-  divergence breaks four apps at once with no pin to hide behind. They are all
-  on AGP 9.3.x / Kotlin 2.4.10 today.
+- **AGP and Kotlin stay in step with the consumers**, and *any* difference
+  counts. A composite build puts this build's toolchain alongside theirs in one
+  Gradle invocation, and AGP's `AgpVersionCompatibilityRule` refuses to compare
+  two versions at all — 9.3.1 against 9.3.2 fails to configure, with no pin to
+  hide behind. What keeps them level is `gradle-update.yml`: this repository is
+  on the same weekly batch as the four apps, so an AGP release reaches all five
+  in the same window. Being off that batch is what let this repository fall a
+  patch behind and break every consumer at once (2026-08-30).
 - **App-specific report *content* does not belong here.** `DecisionSnapshot`,
   `ActiveSnooze`, an `Intent` summary — those are each app's domain. A call site
   summarizes its own type and passes the result through `safe(...)`, deciding
