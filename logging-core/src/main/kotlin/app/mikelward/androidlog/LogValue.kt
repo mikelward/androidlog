@@ -113,51 +113,103 @@ private fun mayLeaveDeviceUntagged(argument: Any?): Boolean = when (argument) {
     else -> false
 }
 
+/** How deep a nested composite is followed before it renders as its type. */
+private const val MAX_RENDER_DEPTH = 3
+
+/** How many elements of one composite are rendered before the rest are counted. */
+private const val MAX_RENDERED_ELEMENTS = 20
+
 /**
- * Renders one untagged value.
+ * Renders one value — the single rendering path, tagged or not.
  *
- * A [Throwable] renders as its **type alone**, never `toString()`, because
- * `toString()` appends `getMessage()` and a platform exception quotes what it
- * was given — the number that was dialed, the network that was joined. The
- * no-messages rule is absolute, so it cannot hold only on the paths that
- * happen to route a throwable through `DebugLog.failure`: an exception handed
- * in as a formatting argument to `event`, or as a surplus argument to
- * `failure`, reaches this function instead and would otherwise carry its
- * message into the on-device buffer, which is the copy the user shares
- * (Codex, PR #1).
+ * **The library renders only what it defines the rendering of, and never calls
+ * an unknown `toString()`.** That is the whole rule, and it is the one the
+ * no-messages floor needs: a `toString()` this code did not write can reach a
+ * throwable's message transitively, and four review rounds each found a new
+ * route by which it did (Codex, PR #1) — a bare throwable, `safe(throwable)`,
+ * `safe(safe(throwable))`, and a throwable inside a list. Special-casing each
+ * route left the mechanism standing; refusing the unknown `toString()` retires
+ * it (maintainer, 2026-08-30).
  *
- * `safe(throwable)` gets the same treatment. A call site can vouch for a value
- * being fixed vocabulary; it cannot vouch for what the platform put in an
- * exception message, so that opt-in does not reach this.
+ * So the branches below are not a list of things that leak. They are the types
+ * whose rendering is fixed by the language or decided here:
  *
- * The type alone rather than type-and-frames: this renders *inside* a line, and
- * a stack trace belongs under one. `DebugLog.failure` is how a throwable gets
- * its frames.
+ * - Numbers, `Boolean`, `Char` and `String` render as themselves. `String` is
+ *   on the list because it costs nothing to put there — it holds no other
+ *   object, so there is nothing for a recursive `toString()` to reach. A
+ *   *call site* that builds `"failed: " + e.message` itself is beyond any
+ *   mechanism here; the type rule withholds every `String` off device and the
+ *   rest is review.
+ * - An enum renders its **constant name**, not `toString()`, which is
+ *   overridable and could read live state at call time.
+ * - A throwable renders its **type alone**. Type rather than type-and-frames
+ *   because this renders *inside* a line; `DebugLog.failure` is how a throwable
+ *   gets its frames.
+ * - A collection, map or array renders its **elements as arguments in their
+ *   own right**, back through [renderArgument], which is what pays for the
+ *   rule above: `listOf("a", "b")` still reads `[a, b]`, while `listOf(e)`
+ *   reads `[java.lang.IllegalStateException]` and `listOf(sensitive(51.5))`
+ *   reads `[51.5]` on device.
+ * - Anything else renders as its class name. A domain object is exactly the
+ *   case where this code cannot know what is inside, so it does not guess —
+ *   [LogSummary] is how a call site renders one deliberately.
+ *
+ * [depth] bounds the recursion, so a self-referential collection renders its
+ * type instead of overflowing the stack — recording must not throw.
  */
-private fun renderPlain(value: Any?): String = when (value) {
-    is Throwable -> value.javaClass.name
-    // The **constant name**, not `toString()`. An enum passes the type rule
-    // above because its identity is fixed vocabulary — but `toString()` is
-    // overridable, so an enum could hand back whatever an override chose to
-    // read at call time and walk straight through a floor that let it past on
-    // the strength of being an enum at all (Codex, PR #1). `name` is the thing
-    // the rule actually vouched for, so `name` is what is rendered.
-    is Enum<*> -> value.name
-    else -> value.toString()
+private fun renderPlain(value: Any?, redactSensitive: Boolean, depth: Int): String = when {
+    value == null -> "null"
+    value is String -> value
+    value is Boolean || value is Char ||
+        value is Byte || value is Short || value is Int || value is Long ||
+        value is Float || value is Double -> value.toString()
+    value is Enum<*> -> value.name
+    value is Throwable -> value.javaClass.name
+    depth >= MAX_RENDER_DEPTH -> value.javaClass.name
+    value is Collection<*> -> renderElements(value.asSequence(), value.size) {
+        renderArgument(it, redactSensitive, depth + 1)
+    }
+    value is Array<*> -> renderElements(value.asSequence(), value.size) {
+        renderArgument(it, redactSensitive, depth + 1)
+    }
+    value is Map<*, *> -> renderElements(
+        value.entries.asSequence(),
+        value.size,
+        open = "{",
+        close = "}",
+    ) {
+        val entry = it as Map.Entry<*, *>
+        renderArgument(entry.key, redactSensitive, depth + 1) + "=" +
+            renderArgument(entry.value, redactSensitive, depth + 1)
+    }
+    else -> value.javaClass.name
 }
 
 /**
- * Renders a value whose call site vouched for it with [safe] or marked it with
- * [sensitive].
+ * Joins a bounded prefix of [values], noting how many were left out.
  *
- * `toString()` is honored here, enums included: the call site asked for this
- * value specifically, which is exactly what the tags are for. The one thing a
- * tag cannot buy is a throwable's message — a call site can vouch for a value
- * being fixed vocabulary, but not for what the platform put in an exception.
+ * Bounded because this runs on the recording path: an entry over
+ * `maxEntryChars` is truncated afterward either way, but building a million
+ * elements first is work nobody asked for.
+ *
+ * A [Sequence] and a [render] *parameter*, so the bound is applied before an
+ * element is rendered rather than after. Mapping a map's entry set eagerly
+ * rendered a million-entry map in full and then threw all but twenty away —
+ * the bound was there, and the cost it exists to avoid was paid in full, on
+ * the one path that cannot afford it (Codex, PR #3). The types now make that
+ * shape unavailable: nothing is rendered until [take] has already cut the
+ * sequence down.
  */
-private fun renderTagged(value: Any?): String = when (value) {
-    is Throwable -> value.javaClass.name
-    else -> value.toString()
+private fun renderElements(
+    values: Sequence<Any?>,
+    size: Int,
+    open: String = "[",
+    close: String = "]",
+    render: (Any?) -> String,
+): String {
+    val rendered = values.take(MAX_RENDERED_ELEMENTS).joinToString(", ", transform = render)
+    val omitted = size - MAX_RENDERED_ELEMENTS
+    return if (omitted > 0) "$open$rendered, …$omitted more$close" else "$open$rendered$close"
 }
 
 /**
@@ -212,17 +264,43 @@ private fun untag(argument: Any?): Untagged {
  */
 internal fun untaggedLogValue(argument: Any?): Any? = untag(argument).value
 
-/** Unwraps any tags and renders the value the way the on-device log shows it. */
-private fun renderLogArgument(argument: Any?, redactSensitive: Boolean): String {
+/**
+ * Renders one argument, or one element of a composite — they are the same
+ * thing, and that is the point: **an element renders exactly as it would if it
+ * were the argument itself.** Anything less was how a tag or a [LogSummary]
+ * inside a list came out as the wrapper's class name, losing the value the
+ * call site had gone out of its way to mark (Codex, PR #3).
+ *
+ * The floor is applied per *argument*, and a composite is one argument: an
+ * untagged one is withheld off device whole, so its elements are never reached
+ * there, and a [safe] one is the call site asserting the composite. What still
+ * withholds inside it is an explicit [sensitive], because sensitive dominates
+ * wherever it appears. Re-applying the whole floor to each element instead
+ * would withhold the ordinary strings in a composite the call site had already
+ * vouched for -- over-strict, and paid for in diagnostics.
+ *
+ * At [depth] 0 this is called from [formatLogMessage], which has already put
+ * every withheld argument behind [REDACTED_PLACEHOLDER]; the sensitive check
+ * below is then a no-op, since nothing sensitive is permitted to reach it.
+ */
+private fun renderArgument(argument: Any?, redactSensitive: Boolean, depth: Int = 0): String {
     val untagged = untag(argument)
+    if (redactSensitive && untagged.sensitive) return REDACTED_PLACEHOLDER
     val value = untagged.value
     return when {
         // Ahead of the tag branch: a summary carries both renderings and picks
         // between them itself, and a tag wrapped around one must not take that
         // choice away from it.
         value is LogSummary -> if (redactSensitive) value.mirrored else value.full
-        untagged.tagged -> renderTagged(value)
-        else -> renderPlain(value)
+        // Tagged or not, one rendering path. A tag answers "may this leave the
+        // device?", which is [logArgumentMayLeaveDevice]'s question, and
+        // nothing about how the value is written down (maintainer,
+        // 2026-08-30). Letting `safe` also mean "print it via `toString()`"
+        // made it a way around the no-messages rule -- `safe(x)` where `x`
+        // holds a throwable rendered the message -- for no benefit the call
+        // sites were using: `safe` carries fixed-vocabulary strings and state
+        // names, and `String` rendering is the same on both paths.
+        else -> renderPlain(value, redactSensitive, depth)
     }
 }
 
@@ -253,7 +331,7 @@ fun formatLogMessage(
         if (redactSensitive && !logArgumentMayLeaveDevice(argument)) {
             REDACTED_PLACEHOLDER
         } else {
-            renderLogArgument(argument, redactSensitive)
+            renderArgument(argument, redactSensitive)
         }
 
     if (args.isEmpty() && '%' !in format) return format

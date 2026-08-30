@@ -814,4 +814,99 @@ class DebugLogTest {
             assertFalse(line, "+15550100" in line)
         }
     }
+
+    @Test
+    fun `a sink that records from inside log has that entry dropped`() {
+        // Both the gate and the buffer monitor are reentrant, so the nested
+        // entry used to append and fan out completely before the outer one
+        // reached the next sink -- a later sink saw them in the opposite order
+        // to snapshot().
+        val log = log()
+        val once = AtomicBoolean(false)
+        log.addSink {
+            if (once.compareAndSet(false, true)) log.event("from inside the sink")
+        }
+        log.event("outer")
+        assertEquals(listOf("01-01 00:00:00.000 D outer"), log.events())
+    }
+
+    @Test
+    fun `a dropped nested entry is reported on the next entry, once`() {
+        // The entries are gone; that they existed is not.
+        val log = log()
+        val once = AtomicBoolean(false)
+        log.addSink {
+            if (once.compareAndSet(false, true)) {
+                log.event("first nested")
+                log.event("second nested")
+            }
+        }
+        log.event("outer")
+        log.event("later")
+
+        val lines = log.events()
+        val notice = lines.single { "dropped" in it }
+        assertTrue(notice, notice.contains(" W 2 entries dropped"))
+        assertTrue(notice, notice.contains("recorded from inside log()"))
+        assertTrue(
+            lines.toString(),
+            lines.indexOf(notice) < lines.indexOfFirst { it.endsWith(" D later") },
+        )
+
+        log.event("later still")
+        assertEquals(1, log.events().count { "dropped" in it })
+    }
+
+    @Test
+    fun `a disable discards a pending drop report along with the buffer`() {
+        // A drop counted but not yet reported belongs to the session being
+        // discarded, and *records afresh* means the next session opens on its
+        // own state rather than on a warning about the last one.
+        val log = log()
+        val once = AtomicBoolean(false)
+        log.addSink { if (once.compareAndSet(false, true)) log.event("nested") }
+        log.event("outer")
+
+        log.setRecording(false)
+        log.setRecording(true)
+        log.event("fresh")
+
+        assertEquals(listOf("01-01 00:00:00.000 D fresh"), log.events())
+    }
+
+    @Test
+    fun `a single-slot buffer still reports a drop to its sinks`() {
+        // The ring can only ever hold the newest line at this bound, so a
+        // notice put there is evicted by the entry behind it before anyone
+        // reads it. A sink is append-only, so that is where the report keeps.
+        val log = log(maxEntries = 1)
+        val seen = mutableListOf<String>()
+        val once = AtomicBoolean(false)
+        log.addSink {
+            seen += it
+            if (once.compareAndSet(false, true)) log.event("nested")
+        }
+        log.event("outer")
+        log.event("later")
+
+        assertTrue(seen.toString(), seen.any { it.contains(" W 1 entry dropped") })
+        // The ring holds what a one-slot ring holds: the newest line.
+        assertEquals(listOf("01-01 00:00:00.000 D later"), log.events())
+    }
+
+    @Test
+    fun `a sink recording from inside log still receives later entries`() {
+        // The delivering-thread marker has to be cleared, or every later entry
+        // on that thread would be dropped as if it were nested too.
+        val log = log()
+        val seen = mutableListOf<String>()
+        val once = AtomicBoolean(false)
+        log.addSink {
+            seen += it
+            if (once.compareAndSet(false, true)) log.event("nested")
+        }
+        log.event("outer")
+        log.event("after")
+        assertTrue(seen.toString(), seen.any { it.endsWith(" D after") })
+    }
 }

@@ -1,72 +1,41 @@
 # TODO
 
-## Decisions needing the maintainer
+## Decided
 
-Two findings from PR #1's review are real, verified, and deliberately unfixed.
-Each is the fourth of its shape, and in both cases patching the third produced
-the fourth — so the answer is a change of mechanism, and which mechanism is the
-maintainer's call rather than a review round's. Both threads on PR #1 were
-resolved pointing here; this file, not the thread, is where they live now.
+Both of PR #1's deferred findings were answered by the maintainer on 2026-08-30
+and are closed. Kept as a record of what was decided and why, since each was the
+fourth finding of its shape and the reasoning is the expensive part to
+reconstruct.
 
-### 1. A sink that records from inside its own `log()`
+### 1. A sink that records from inside its own `log()` — **prohibited**
 
-`record()` holds `gate.read { synchronized(buffer) { append; deliver } }`, and
-both are reentrant. A sink calling `event()` from its own callback therefore
-appends and fans out **completely** before the outer fan-out reaches its next
-sink: a later sink sees the nested entry first, while `snapshot()` has them the
-other way round. A sink that logs on every entry recurses to
-`StackOverflowError` — contained by `runCatching`, but the log fills with
-nothing useful.
+Dropped, counted, and reported on the next ordinary entry. Not queued: `Sink`
+already contracts that sinks *enqueue* rather than write inline, so a sink
+honoring that fails later on its own thread, where recording is not reentrant
+and works normally. A queue would only serve a sink that was already writing
+inline, and would need a cap of its own — which is this same drop, later.
 
-- **Prohibit and drop.** A reentrancy flag set while delivering; a nested
-  `record()` returns at once. About five lines. Keeps *never fail silently* by
-  counting the drops and emitting `N entries dropped from inside a sink` on the
-  next ordinary entry.
-- **Queue.** Same detector, but the nested entry waits on a per-thread list and
-  drains once the outer fan-out finishes. Ordering comes out right everywhere
-  and a sink can record its own failures. About fifteen lines — and a sink that
-  logs on every entry is then an infinite producer, so it needs a cap, and at
-  the cap it is dropping anyway.
+### 2. The renderer — **only defined types, and recurse into composites**
 
-Leaning: **prohibit.** [Sink] already contracts that sinks *enqueue* rather than
-write inline, and a sink honoring that also fails later, on its own thread,
-where `event()` is not reentrant and works normally. The prohibition costs a
-correct sink nothing; the queue exists only to make an incorrect one work.
+The library now renders only the types whose rendering it defines, and never
+calls a `toString()` it did not write. That closes the category rather than one
+more member of it: four rounds each found a new route by which an unknown
+`toString()` reached a throwable's message.
 
-### 2. The renderer is a denylist where the floor is an allowlist
+Composites are recursed into rather than refused, which is what pays for the
+rule — `listOf("a", "b")` still reads `[a, b]` while `listOf(e)` reads
+`[java.lang.IllegalStateException]`. Only a domain type with its own
+`toString()` degrades, to its class name, and that is exactly the case where
+this code cannot know what is inside; `LogSummary` is how a call site renders
+one deliberately.
 
-`logArgumentMayLeaveDevice` names the types it will carry and refuses the rest.
-`renderPlain` names two types it treats specially and calls `toString()` on the
-rest — and any `toString()` can transitively reach a throwable's message, which
-`AGENTS.md` bans outright. Four rounds have each closed one path and left the
-mechanism: a bare throwable, `safe(throwable)`, `safe(safe(throwable))`, and now
-`event("failure %s", listOf(e))`, which renders
-`D failure [java.lang.IllegalStateException: <message>]`.
-
-- **Allowlist the renderer.** Numbers, `Boolean`, `Char`, `String`, `Enum` (by
-  `name`) and `Throwable` (by type) render as they do now; everything else
-  renders as its class name and never through `toString()`. Closes the category
-  — no `Map`, array, data class, or type added later can reach a message. Costs
-  the on-device readability of an untagged composite, which `LogSummary` already
-  exists to carry.
-  - Sub-choice: `safe(...)` currently means both "carry this off device" and
-    "print it via `toString()`", so `safe(listOf(e))` would still leak. Cleaner
-    is to narrow the tags to the floor decision alone and route **all**
-    rendering through the allowlist, which makes the two concerns orthogonal and
-    the no-messages rule genuinely absolute. That changes one shipped behavior:
-    `safe(enumWithOverriddenToString)` prints the override today, and a test
-    asserts it.
-- **Recurse into composites.** Render `Collection`, `Map` and `Array` elements
-  through `renderPlain`. Cheap, keeps readability, answers this finding — and
-  leaves a data class holding an exception, and any custom `toString()`. Narrows
-  the hole rather than closing it.
-- **Accept it.** The type rule already withholds every one of these off device,
-  so the leak is on-device only, into the log the user reads before sharing.
-  Needs `AGENTS.md`'s "no `getMessage()` from a throwable, ever" amended to say
-  what it actually means, since the code does not match the rule as written.
-
-Leaning: **allowlist, with the tags narrowed to the floor decision.** It is the
-only one of the three where a fifth finding of this shape cannot exist.
+`safe(...)` and `sensitive(...)` were narrowed to the floor decision alone —
+may this leave the device — and no longer decide how a value is written.
+Meaning both was a way around the no-messages rule for no benefit the call
+sites were using, since `safe` carries fixed-vocabulary strings and state
+names and `String` rendering is identical on either path. One shipped behavior
+changed with it: `safe(enumWithOverriddenToString)` renders the constant name
+rather than the override.
 
 ## Not built yet
 
