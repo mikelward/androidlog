@@ -59,7 +59,7 @@ private const val PREVIOUS_CRASH_SUFFIX = ".crash.log"
  */
 private const val CRASH_MARKER_FILE = "$CURRENT_FILE.crash"
 
-/** How many unshared prior runs to keep — older ones are dropped at startup. */
+/** Default for `DebugFileSink(maxPreviousRuns)` — how many unshared prior runs to keep. */
 private const val MAX_PREVIOUS_RUNS = 5
 
 /**
@@ -199,6 +199,24 @@ class DebugFileSink internal constructor(
             Thread(runnable, "androidlog-file-sink").apply { isDaemon = true }
         }.apply { prestartCoreThread() }
     },
+    /**
+     * How many unshared prior runs to keep; older ones are dropped at startup.
+     * Defaults to [MAX_PREVIOUS_RUNS].
+     *
+     * A parameter rather than a constant because for at least one consumer this
+     * is a **privacy bound, stated in its spec**, not a capacity tuning knob:
+     * snoozemo documents "the two-run bound is the privacy bound" — the run in
+     * progress and exactly one before it — and a crash pin holds that one slot
+     * rather than adding a third. Inheriting this library's default would have
+     * tripled how much of a user's history sits on disk as a silent side effect
+     * of adopting the sink, which is not a thing a refactor may decide.
+     *
+     * Which number is right is the consuming app's call, so the library takes
+     * it rather than choosing for everyone. Values below 1 are treated as 1: a
+     * sink that keeps no prior run at all would drop a crash report at the very
+     * next start, and the crash record is the reason the prior-run set exists.
+     */
+    private val maxPreviousRuns: Int = MAX_PREVIOUS_RUNS,
 ) : DebugLog.Sink {
 
     /**
@@ -211,17 +229,20 @@ class DebugFileSink internal constructor(
         log: DebugLog,
         context: Context,
         onCrash: () -> Unit = {},
+        maxPreviousRuns: Int = MAX_PREVIOUS_RUNS,
     ) : this(
         log,
         { context.applicationContext.cacheDir },
         WRITE_DEBOUNCE_MS,
         onCrash,
         { System.nanoTime().toString() },
+        maxPreviousRuns = maxPreviousRuns,
     )
 
     /** Tests and direct use: an already-resolved directory, writes un-debounced. */
-    constructor(log: DebugLog, dir: File) :
-        this(log, { dir }, 0L, {}, { System.nanoTime().toString() })
+    @JvmOverloads
+    constructor(log: DebugLog, dir: File, maxPreviousRuns: Int = MAX_PREVIOUS_RUNS) :
+        this(log, { dir }, 0L, {}, { System.nanoTime().toString() }, maxPreviousRuns = maxPreviousRuns)
 
     // Resolved on first access, which is always inside a worker task (every file
     // operation runs there), so cacheDir resolution never touches the caller's
@@ -613,9 +634,13 @@ class DebugFileSink internal constructor(
                         val runs = byKind[PriorEntry.RUN].orEmpty()
                         val candidates = runs.filter { it.file != rotated }
                         val ordered = runs.all { it.modifiedAt != null }
+                        // Floored at 1: a bound of zero would drop a crash
+                        // report at the very next start, and keeping that
+                        // record is why the prior-run set exists at all.
+                        val keep = maxPreviousRuns.coerceAtLeast(1)
                         val excess =
-                            if (ordered) (runs.size - MAX_PREVIOUS_RUNS).coerceAtLeast(0) else 0
-                        if (!ordered && runs.size > MAX_PREVIOUS_RUNS) {
+                            if (ordered) (runs.size - keep).coerceAtLeast(0) else 0
+                        if (!ordered && runs.size > keep) {
                             log.warning("Old runs could not be ordered, so none was pruned")
                         }
                         val kept = (byKind[PriorEntry.REMOVABLE].orEmpty() + candidates.take(excess))
@@ -1130,7 +1155,7 @@ class DebugFileSink internal constructor(
      * Runs on the worker, so it is ordered *after* the startup rotation [start]
      * queued there — otherwise a share racing a slow rotation could scan before
      * `debug.log` is renamed and miss the just-ended run. Call it off the main
-     * thread: it blocks on the worker and reads up to [MAX_PREVIOUS_RUNS] files.
+     * thread: it blocks on the worker and reads up to [maxPreviousRuns] files.
      * A file that fails to read is skipped and left in place, never destroyed —
      * it is not added to the handle's set, so clearing this report leaves it for
      * the next one.

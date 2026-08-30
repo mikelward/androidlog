@@ -147,6 +147,18 @@ SnoozemoLog.addSink(files)
 write. Everything it does touches disk on its own daemon worker, so neither call
 blocks the cold-start path.
 
+**How many prior runs it keeps is yours to set**, because for some apps it is a
+privacy bound rather than a capacity knob — snoozemo's spec states a two-run
+bound (the run in progress and exactly one before it) and adopting the library's
+own default would have widened it silently:
+
+```kotlin
+DebugFileSink(SnoozemoLog, this, maxPreviousRuns = 1)
+```
+
+It defaults to 5 and floors at 1: keeping none would drop a crash report at the
+very next start, which is the opposite of what the prior-run set is for.
+
 The previous run is then `files.readPreviousRun()`, which hands back a handle —
 its `text` is the report, and `files.clearPreviousRun(handle)` consumes exactly
 the runs that report was built from once it has been sent. The pairing is the

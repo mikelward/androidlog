@@ -138,6 +138,38 @@ class DebugFileSinkTest {
     }
 
     @Test
+    fun `a tightened bound keeps only what the consumer asked for`() {
+        // snoozemo states "the two-run bound is the privacy bound" — the run in
+        // progress and exactly one before it — so adopting this sink must not
+        // silently widen its retention to the library's own default.
+        repeat(4) { index ->
+            File(dir, "androidlog-prev-$index.log").writeText("run $index\n")
+            File(dir, "androidlog-prev-$index.log").setLastModified(1_000L + index * 1_000L)
+        }
+        current().writeText("newest\n")
+        val sink = DebugFileSink(log(), dir, maxPreviousRuns = 1)
+        sink.start(installCrashHandler = false)
+        sink.awaitIdle()
+
+        val kept = previous().map { it.readText() }
+        assertEquals(kept.toString(), 1, kept.size)
+        assertTrue("the run just ended is the one kept", kept.single().contains("newest"))
+    }
+
+    @Test
+    fun `a bound below one still keeps a run, so a crash record survives`() {
+        // Zero would drop a crash report at the very next start, which is the
+        // opposite of what the prior-run set exists for.
+        current().writeText("the run that crashed\n")
+        val sink = DebugFileSink(log(), dir, maxPreviousRuns = 0)
+        sink.start(installCrashHandler = false)
+        sink.awaitIdle()
+
+        assertEquals(1, previous().size)
+        assertTrue(sink.readPreviousRun()!!.text.contains("the run that crashed"))
+    }
+
+    @Test
     fun `a share consumes the previous runs`() {
         current().writeText("the run before\n")
         val sink = sink()
