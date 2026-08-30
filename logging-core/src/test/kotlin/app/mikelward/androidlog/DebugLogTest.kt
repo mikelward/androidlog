@@ -1017,4 +1017,49 @@ class DebugLogTest {
         log.event("later")
         assertEquals("said once", 1, log.events().count { "failed to clear" in it })
     }
+
+    // -------------------------------------------------- did the entry land?
+
+    @Test
+    fun `a recorded entry says it landed and a discarded one says it did not`() {
+        // What a once-per-spell failure guard has to latch on. `isRecording`
+        // cannot answer it: the gate can close between the question and the
+        // entry, and it says nothing about the other two drops below.
+        val log = log()
+        assertTrue("recording, so it landed", log.event("landed"))
+
+        log.setRecording(false)
+        assertFalse("the gate is closed", log.event("discarded"))
+        assertFalse("and a warning is no different", log.warning("discarded"))
+        assertFalse(
+            "nor a failure",
+            log.failure(IllegalStateException("boom"), "discarded"),
+        )
+    }
+
+    @Test
+    fun `an entry recorded from inside a sink says it did not land`() {
+        // The second drop, and one no gate reading could have predicted: the
+        // log is recording, and this entry still goes nowhere.
+        val log = log()
+        val answers = mutableListOf<Boolean>()
+        val once = AtomicBoolean(false)
+        log.addSink {
+            if (once.compareAndSet(false, true)) answers += log.event("from inside the sink")
+        }
+        log.event("outer")
+
+        assertEquals(listOf(false), answers)
+    }
+
+    @Test
+    fun `a rerouted warning answers for the failure it became`() {
+        // `warning` with a throwable is passed on to `failure`, so its answer
+        // has to be that call's, not a fresh guess.
+        val log = log()
+        assertTrue(log.warning("boom %s", IllegalStateException("boom")))
+
+        log.setRecording(false)
+        assertFalse(log.warning("boom %s", IllegalStateException("boom")))
+    }
 }
