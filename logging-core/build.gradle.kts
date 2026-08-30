@@ -6,6 +6,14 @@ plugins {
     alias(libs.plugins.kotlin.jvm)
 }
 
+// Set here rather than only in the root build's `allprojects`, because
+// `logging-core/settings.gradle.kts` makes this module the root of a second,
+// Android-free entry point where that block does not run. The substitution a
+// consumer's composite build performs matches on these, so a missing group is
+// the difference between the offramp working and resolving `:0.0` remotely.
+group = "app.mikelward.androidlog"
+version = "0.0"
+
 // Deliberately a plain Kotlin JVM module, not an Android library. The privacy
 // floor lives here, and a floor that can only be tested on a device is a floor
 // nobody re-tests. Keeping the Android SDK off this classpath is also what
