@@ -28,8 +28,8 @@ arrives rather than being folded into `:logging-android`.
 
 **What is not here, and will not be: the report's *contents*.** A decision
 snapshot, a snooze summary, an `Intent` rendering — those are each app's own
-domain. `LogSummary` exists precisely so they can stay at the call site while
-still crossing the floor safely.
+domain. A call site summarizes its own type and passes the result through
+`safe(...)`, so it stays at the call site and still crosses the floor safely.
 
 ## Consuming it
 

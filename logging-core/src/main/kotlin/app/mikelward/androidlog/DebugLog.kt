@@ -35,8 +35,8 @@ import kotlin.concurrent.write
  * (see `LogValue.kt`): a hard-coded format string plus arguments, each argument
  * carried or withheld on its own by its type. The two places data-shaped values
  * could still slip through are closed structurally — a throwable renders as
- * **types and stack frames only, never messages**, and a composite is rendered
- * through [LogSummary], which carries its own reduced form.
+ * **types and stack frames only, never messages**, and a composite renders its
+ * elements as arguments in their own right, so each is judged by the same rule.
  */
 open class DebugLog(
     /** Bounds the buffer; old entries fall off the front. */

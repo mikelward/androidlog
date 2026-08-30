@@ -55,8 +55,9 @@ has stopped biting.
   divergence breaks four apps at once with no pin to hide behind. They are all
   on AGP 9.3.x / Kotlin 2.4.10 today.
 - **App-specific report *content* does not belong here.** `DecisionSnapshot`,
-  `ActiveSnooze`, an `Intent` summary — those are each app's domain, and
-  `LogSummary` exists precisely so they can stay at the call site.
+  `ActiveSnooze`, an `Intent` summary — those are each app's domain. A call site
+  summarizes its own type and passes the result through `safe(...)`, deciding
+  for itself what the summary may say.
 
 ## Testing
 
