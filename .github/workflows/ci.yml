@@ -35,6 +35,19 @@ jobs:
       # without it -- this runner has an Android SDK.
       - run: ./gradlew check --stacktrace
 
+      # The second entry point (`logging-core/settings.gradle.kts`), which the
+      # consumers' Google-Maven-unreachable offramp builds include instead of
+      # the root. It is only worth having if it stays Android-free, and nothing
+      # else here would notice it regressing: the root build resolves AGP
+      # happily on this runner, so `check` above passes either way.
+      #
+      # Running it from `logging-core/` is what proves the isolation -- this
+      # build has no `google()` in `pluginManagement`, so an Android plugin
+      # creeping onto the path fails here rather than silently resolving.
+      - name: Check the Android-free entry point
+        working-directory: logging-core
+        run: ../gradlew test --stacktrace
+
       # A guard against a *false pass* cannot be proven by a passing run. The
       # version this check replaced -- ported from snoozemo, where it had been
       # enforcing nothing -- went green with an androidx dependency present,

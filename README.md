@@ -75,6 +75,28 @@ git clone --depth 1 https://github.com/mikelward/androidlog .androidlog 2>/dev/n
   || git -C .androidlog pull --ff-only
 ```
 
+### An offramp build includes `logging-core/`, not the root
+
+Several consumers keep a second Gradle root scoped to their pure-Kotlin
+modules, for the sandbox where Google Maven is unreachable and AGP therefore
+cannot resolve at all (snoozemo's `core/settings.gradle.kts`, clothescast's).
+Where such a build needs `logging-core`, it includes **this repository's
+`logging-core/` directory** rather than its root:
+
+```kotlin
+includeBuild(androidlog.resolve("logging-core"))
+```
+
+`includeBuild` configures every project in the included build, not only the one
+dependency substitution selects — so including the root evaluates
+`:logging-android`, which applies the Android plugin, and the root build script,
+which resolves the AGP plugin marker even under `apply false`. An offramp that
+exists *because* AGP cannot resolve would then fail on exactly that. The
+directory carries its own settings file for this; the coordinate and the
+substitution are unchanged.
+
+An ordinary consumer build needs AGP anyway and keeps including the root.
+
 ### What the no-pin choice costs
 
 Two things, worth stating rather than discovering:
