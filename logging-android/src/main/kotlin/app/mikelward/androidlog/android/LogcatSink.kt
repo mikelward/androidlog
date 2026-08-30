@@ -9,11 +9,13 @@ private const val MAX_CHUNK_BYTES = 3_000
 /**
  * Mirrors each entry to logcat, for reading a running build over adb.
  *
- * Everything goes out at `DEBUG` rather than being mapped back to a logcat
- * level: the entry's own level character is already in the line, and recovering
- * it would mean parsing the rendered string back apart — a second, weaker copy
- * of a decision `DebugLog` has already made. `adb logcat` filters on the tag,
- * which is what anyone reading this is filtering on anyway.
+ * Each entry goes out at the logcat level it was recorded at, because the level
+ * is handed to the sink rather than left to be recovered from the rendered
+ * line. That distinction is the whole reason this maps at all: parsing the
+ * level back out of the text would be a second and weaker copy of a decision
+ * `DebugLog` has already made, which is why this used to write everything at
+ * `DEBUG` instead. An unrecognized level takes `DEBUG`, so a level added later
+ * degrades to the old behavior rather than disappearing.
  *
  * Long entries are split across calls because logcat drops a message past
  * roughly 4 KB, and a silently-truncated stack trace is worse than two lines.
@@ -25,10 +27,18 @@ private const val MAX_CHUNK_BYTES = 3_000
  */
 class LogcatSink(private val tag: String) : DebugLog.Sink {
 
-    override fun log(line: String) {
+    override fun log(line: String) = log(line, 'D')
+
+    override fun log(line: String, level: Char) {
         for (part in line.split('\n')) {
             for (chunk in part.chunkedByModifiedUtf8Bytes(MAX_CHUNK_BYTES)) {
-                Log.d(tag, chunk)
+                when (level) {
+                    'V' -> Log.v(tag, chunk)
+                    'I' -> Log.i(tag, chunk)
+                    'W' -> Log.w(tag, chunk)
+                    'E' -> Log.e(tag, chunk)
+                    else -> Log.d(tag, chunk)
+                }
             }
         }
     }
