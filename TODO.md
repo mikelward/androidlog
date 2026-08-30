@@ -78,7 +78,74 @@ list, keyed per handle instead. A handle whose caller never received it stays in
 that list; it costs an entry and a comparison, never a file, since nothing can
 ask for its contents to be deleted.
 
+### 5. Pinned start-up lines — **a second bounded buffer, shipped**
+
+`pinnedEvent(...)` records a line and keeps a second reference to it, so it
+outlives the ring evicting it, and `boundedSnapshot(pinnedBudgetChars,
+recentBudgetChars)` holds a slice of the persisted file's budget back for those
+lines. Without the reserve they are the first thing a tail trims, which is the
+opposite of what pinning is for (Codex on typelauncher #689).
+
+Three things the port decided rather than copied:
+
+- **One monitor, and the same `Line` instance in both buffers.** typelauncher
+  reached the first of these after a review round; sharing the instance is new,
+  and it is what lets the read decide by *identity* which pinned lines the kept
+  tail still carries. Deciding by rendered text drops a line the tail merely
+  looks like it has — two entries a second apart can render identically.
+- **Trim, then compose, then anchor — as one call, not three.** This library
+  synthesizes offset anchors rather than storing them, so trimming an
+  already-anchored list takes the anchor off the front and orphans every
+  timestamp under it. Each step is silent in the wrong order, so the order is
+  not left to a caller: `boundedSnapshot` takes the budgets and does all three.
+- **The opt-out empties the pinned buffer too.** Nothing else ever removes a
+  pinned line, so missing it would have kept recorded content in memory past a
+  user turning recording off.
+
+`boundedLogTail` moved to `:logging-core` with a generic inner form rather than
+growing a second copy for the buffers.
+
 ## Decisions needing review
+
+### PR #7 is held for the maintainer, not merged under autopilot
+
+Seven Codex findings across four rounds, **five of them on one seam**: the clamp
+in `anchoredTail`, which shortens a line rather than dropping it when nothing
+else fits. Each finding was real and each fix was correct, and each opened the
+next case:
+
+1. Anchors synthesized after the trim were charged to nobody, so the file could
+   exceed its own ceiling.
+2. A clamp allocates a new `Line`, so the identity set missed the pinned
+   original and the event was written twice.
+3. Fixing that wrote it *truncated* instead, with the reserve unspent.
+4. Refusing a budget too small for the clamp's metadata then made the yield a
+   **deletion** — the event in neither section.
+5. The clamp cut UTF-16 units while the entry-length clamp cut code points, so a
+   cut could split a surrogate pair.
+
+The last two were consequences of my own fixes one round earlier. The code is in
+a state I believe is correct — every case above is closed and mutation-checked —
+but I said twice that a further finding on this seam would stop the iteration,
+and continued twice, on the merits of the individual finding each time. That is
+the point at which my judgment of "done" stops being worth much.
+
+- **Alternative:** merge it, as autopilot otherwise would; CI is green, every
+  thread is resolved, and nothing outside this repository consumes the library
+  yet, so a revert PR would be the whole undo.
+- **Why this way:** the question is not whether any single fix was right, it is
+  whether a design that needs five corrections in one place is the design to
+  ship. That is a judgment about the shape of the thing, and it is the
+  maintainer's.
+- **What would settle it:** either a look at `boundedSnapshot` and the clamp, or
+  simply "merge it" — the branch is ready either way.
+- **Worth considering when it is looked at:** all five arose from budgets far
+  smaller than anything the sink passes (20k/130k against a 2,000-char entry
+  bound). Requiring a floor on `boundedSnapshot`'s budgets would delete the
+  whole class rather than handling each case, at the cost of a `require` on a
+  public API.
+
+
 
 Taken under autopilot, so each says what the alternative was and what undoing it
 would cost.
@@ -240,14 +307,17 @@ own `runCatching`, before the snapshot and after the crash marker.
 
 ## Not built yet
 
-- **Pinned start-up lines, and the persist budget that reserves room for them.**
-  typelauncher pins the entries from its start-up sequence and reserves
-  `PINNED_PERSIST_BUDGET_CHARS` of the persisted file for them, because the file
-  is a *tail* and would otherwise trim exactly what pinning exists to keep
-  (Codex on typelauncher #689). `DebugLog` has one ring and no pinned buffer, so
-  the reserve has nothing to reserve *for* and was left out rather than ported as
-  dead code. **This blocks typelauncher's migration** — it would silently lose
-  the pinning it has today. The core needs the second buffer first.
+- **A prior-run file's own anchor can be trimmed when several are read back.**
+  `readPreviousRun` concatenates up to five run files and trims the result to
+  the persist budget, and that trim runs over text already read off disk — so
+  where it cuts into the middle of an older run, it takes that run's offset
+  anchor with it and leaves the lines beneath it as bare local timestamps. The
+  live buffers no longer have this shape (see *Pinned start-up lines* under
+  *Decided*: they are trimmed as structured lines and anchored afterwards, so
+  the orphaning is unrepresentable there), but a file is opaque text by the
+  time it is read. The fix is to re-emit the last anchor above the cut, which
+  means recognizing an anchor line by its rendered form — worth doing, and
+  worth doing deliberately rather than folded into another change.
 - `:logging-report` — share sheet, clipboard fallback, FileProvider. The one
   module that needs resources, which is why it is its own module. **It has to
   show the user the report before it is sent** — but not for the reason this
