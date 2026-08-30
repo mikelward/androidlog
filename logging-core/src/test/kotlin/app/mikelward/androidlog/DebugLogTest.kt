@@ -21,11 +21,13 @@ class DebugLogTest {
         maxEntryChars: Int = DebugLog.DEFAULT_MAX_ENTRY_CHARS,
         maxTraceFrames: Int = DebugLog.DEFAULT_MAX_TRACE_FRAMES,
         maxCauseLinks: Int = DebugLog.DEFAULT_MAX_CAUSE_LINKS,
+        maxPinnedEntries: Int = DebugLog.DEFAULT_MAX_PINNED_ENTRIES,
     ) = DebugLog(
         maxEntries = maxEntries,
         maxEntryChars = maxEntryChars,
         maxTraceFrames = maxTraceFrames,
         maxCauseLinks = maxCauseLinks,
+        maxPinnedEntries = maxPinnedEntries,
         readMillis = { 0L },
     )
 
@@ -1086,5 +1088,321 @@ class DebugLogTest {
 
         log.setRecording(false)
         assertFalse(log.warning("boom %s", IllegalStateException("boom")))
+    }
+
+    // --------------------------------------------------------------- pinning
+
+    @Test
+    fun `a pinned line outlives the ring evicting it`() {
+        // The whole reason pinning exists: the lines that say how this run began
+        // are written once, and a busy device evicts them long before anyone
+        // shares a report.
+        val log = log(maxEntries = 3)
+        log.pinnedEvent("started after %s", 7)
+        repeat(5) { log.event("ordinary %s", it) }
+
+        assertFalse(log.snapshot().any { "started after" in it })
+        assertTrue(log.pinnedSnapshot().any { "started after 7" in it })
+        assertTrue(log.boundedSnapshot(1_000, 1_000).any { "started after 7" in it })
+    }
+
+    @Test
+    fun `a pinned line the ring still holds is not written twice`() {
+        val log = log()
+        log.pinnedEvent("started after %s", 7)
+        log.event("ordinary")
+
+        val lines = log.boundedSnapshot(1_000, 1_000)
+        assertEquals(lines.toString(), 1, lines.count { "started after 7" in it })
+    }
+
+    @Test
+    fun `pinned lines the ring no longer holds come first, in order`() {
+        // They are older than everything in the tail by construction -- absent
+        // from it only because newer lines pushed them out -- so prepending is
+        // chronological rather than a guess.
+        val log = log(maxEntries = 2)
+        log.pinnedEvent("first")
+        log.pinnedEvent("second")
+        repeat(2) { log.event("ordinary %s", it) }
+
+        val events = log.boundedSnapshot(1_000, 1_000).filterNot { isMarker(it) }
+        assertEquals(4, events.size)
+        assertTrue(events.toString(), "first" in events[0])
+        assertTrue(events.toString(), "second" in events[1])
+        assertTrue(events.toString(), "ordinary 0" in events[2])
+        assertTrue(events.toString(), "ordinary 1" in events[3])
+    }
+
+    @Test
+    fun `turning recording off empties the pinned buffer too`() {
+        // Nothing else in this class ever removes a pinned line -- outliving
+        // eviction is the point -- so an opt-out that missed them would keep
+        // recorded content in memory and hand it to the next persisted file.
+        val log = log()
+        log.pinnedEvent("started after %s", 7)
+
+        log.setRecording(false)
+
+        assertEquals(emptyList<String>(), log.pinnedSnapshot())
+        assertEquals(emptyList<String>(), log.boundedSnapshot(1_000, 1_000))
+    }
+
+    @Test
+    fun `the pinned reserve survives a recent log that fills its whole budget`() {
+        // The persisted file is a tail, so without a reserve the start-up lines
+        // are the first thing trimmed -- exactly what pinning exists to keep.
+        val log = log()
+        log.pinnedEvent("started after %s", 7)
+        repeat(200) { log.event("ordinary %s", it) }
+
+        val lines = log.boundedSnapshot(pinnedBudgetChars = 1_000, recentBudgetChars = 200)
+        assertTrue(lines.toString(), lines.any { "started after 7" in it })
+        // And the reserve is not simply extra room for everything: the recent
+        // budget still bit.
+        assertTrue(lines.toString(), lines.none { "ordinary 0 " in it })
+    }
+
+    @Test
+    fun `one shared budget is not enough, which is what the reserve answers`() {
+        // The same log with nothing held back: the pinned line is trimmed away.
+        val log = log()
+        log.pinnedEvent("started after %s", 7)
+        repeat(200) { log.event("ordinary %s", it) }
+
+        val lines = log.boundedSnapshot(pinnedBudgetChars = 0, recentBudgetChars = 200)
+        assertTrue(lines.toString(), lines.none { "started after 7" in it })
+        // Absent because the section was not written, not because it was
+        // clamped down to a stub: a budget of zero that answers with a
+        // truncation marker and an anchor passes the line above while
+        // overrunning by thirty characters (Codex, PR #7).
+        assertTrue(lines.toString(), lines.none { "…(truncated)" in it })
+    }
+
+    @Test
+    fun `the pinned buffer is bounded and evicts its oldest`() {
+        val log = log(maxPinnedEntries = 2)
+        log.pinnedEvent("first")
+        log.pinnedEvent("second")
+        log.pinnedEvent("third")
+
+        val pinned = log.pinnedSnapshot().filterNot { isMarker(it) }
+        assertEquals(2, pinned.size)
+        assertTrue(pinned.toString(), "second" in pinned[0])
+        assertTrue(pinned.toString(), "third" in pinned[1])
+    }
+
+    @Test
+    fun `a non-positive pinned bound is rejected at construction`() {
+        // Same failure as the ring's: the first pinned append would call
+        // removeFirst() on an empty deque, outside the runCatching that keeps
+        // recording from throwing.
+        assertThrows(IllegalArgumentException::class.java) { log(maxPinnedEntries = 0) }
+    }
+
+    @Test
+    fun `the floor applies to a pinned line like any other`() {
+        val log = log()
+        log.pinnedEvent("started as %s", "unvouched")
+
+        assertTrue(log.pinnedSnapshot().toString(), log.pinnedSnapshot().any { "started as \u2022\u2022\u2022" in it })
+    }
+
+    @Test
+    fun `a prepended pinned line is anchored rather than left bare`() {
+        // It sits ahead of the ring's own oldest line, so the anchor the ring
+        // would have carried is no longer the first thing in the sequence.
+        val log = log(maxEntries = 1)
+        log.pinnedEvent("started after %s", 7)
+        log.event("ordinary")
+
+        val lines = log.boundedSnapshot(1_000, 1_000)
+        assertTrue(lines.toString(), isMarker(lines.first()))
+        assertTrue(lines.toString(), "started after 7" in lines[1])
+    }
+
+    @Test
+    fun `a pinned line the tail can only clamp is kept whole by the reserve`() {
+        // Once, and in full. Both halves matter and each was got wrong in turn
+        // (Codex, PR #7): an identity set built from the clamped tail rather
+        // than from the originals writes the line in both sections, and
+        // filtering it out on the strength of the clamp leaves the log holding
+        // a truncated start-up line while the reserve meant to protect exactly
+        // that line goes unspent.
+        val log = log()
+        log.pinnedEvent("started after %s", 7)
+
+        // A recent budget too small for that single line, so the tail can only
+        // clamp it -- and a pinned budget with ample room to carry it whole.
+        val lines = log.boundedSnapshot(pinnedBudgetChars = 1_000, recentBudgetChars = 40)
+        val events = lines.filterNot { isMarker(it) }
+        assertEquals(events.toString(), 1, events.size)
+        assertTrue(events.single(), "started after 7" in events.single())
+        assertFalse(events.single(), events.single().endsWith("…(truncated)"))
+    }
+
+    @Test
+    fun `an unpinned line the tail can only clamp is still kept clamped`() {
+        // The yield above is for pinned lines only. An ordinary one has no
+        // other section to go to, so clamping it stays right -- dropping it
+        // would lose the freshest context entirely.
+        val log = log()
+        log.event("ordinary %s", 7)
+
+        val lines = log.boundedSnapshot(pinnedBudgetChars = 1_000, recentBudgetChars = 40)
+        val events = lines.filterNot { isMarker(it) }
+        assertEquals(events.toString(), 1, events.size)
+        assertTrue(events.single(), events.single().endsWith("…(truncated)"))
+    }
+
+    @Test
+    fun `the anchors a trim will add are charged to the budget`() {
+        // They are synthesized after the trim, so counted any other way they are
+        // lines nobody budgeted for and the persisted file overruns the ceiling
+        // it documents (Codex, PR #7).
+        val log = log()
+        repeat(50) { log.event("ordinary %s", it) }
+
+        val budget = 300
+        val rendered = log.boundedSnapshot(pinnedBudgetChars = 0, recentBudgetChars = budget)
+        assertTrue(rendered.toString(), rendered.any { isMarker(it) })
+        assertTrue(
+            "rendered ${rendered.sumOf { it.length + 1 }} chars against $budget",
+            rendered.sumOf { it.length + 1 } <= budget,
+        )
+    }
+
+    @Test
+    fun `each section's anchors are charged to its own budget`() {
+        val log = log(maxEntries = 4)
+        log.pinnedEvent("started after %s", 7)
+        repeat(6) { log.event("ordinary %s", it) }
+
+        val pinnedBudget = 120
+        val recentBudget = 200
+        val rendered = log.boundedSnapshot(pinnedBudget, recentBudget)
+        assertTrue(rendered.toString(), rendered.any { "started after 7" in it })
+        assertTrue(
+            "rendered ${rendered.sumOf { it.length + 1 }} chars",
+            rendered.sumOf { it.length + 1 } <= pinnedBudget + recentBudget,
+        )
+    }
+
+    @Test
+    fun `the existing bounds keep their positional meaning`() {
+        // Consumers compile this source from `@main` with nothing pinned, so a
+        // parameter inserted among the existing ones rebinds every positional
+        // argument after it — still compiling, now meaning something else
+        // (Codex, PR #7). `maxPinnedEntries` therefore goes last, and this
+        // pins that: read positionally, the second argument is still the entry
+        // bound. Inserted second instead, it would bind 40 to the pinned bound
+        // and 6 to the entry bound, truncating every line to six characters.
+        val log = DebugLog(300, 40, 6, 5)
+        log.event("a message comfortably longer than the entry bound allows")
+
+        val entry = log.snapshot().single { !isMarker(it) }
+        assertEquals(entry, 40, entry.removeSuffix("…(truncated)").length)
+    }
+
+    @Test
+    fun `a pinned line is never dropped by a reserve too small to keep it`() {
+        // The yield hands the tail's only line to the pinned section, so it
+        // must first be true that the section will keep something. With a
+        // reserve too small to hold anything the yield became a deletion --
+        // the freshest event in neither section (Codex, PR #7).
+        val log = log()
+        log.pinnedEvent("started after %s", 7)
+
+        val lines = log.boundedSnapshot(pinnedBudgetChars = 0, recentBudgetChars = 40)
+        val events = lines.filterNot { isMarker(it) }
+        assertEquals(events.toString(), 1, events.size)
+        // Clamped, because the recent budget is all there was -- but present.
+        assertTrue(events.single(), events.single().endsWith("…(truncated)"))
+    }
+
+    @Test
+    fun `a clamped line never strands half a code point`() {
+        // The same rule the entry-length clamp already follows. A cut between
+        // the surrogates of a non-BMP character corrupts it in the persisted
+        // snapshot.
+        val log = log()
+        log.event("%s", safe("😀".repeat(20)))
+
+        // Sweep the budgets around the pair boundaries rather than guessing one.
+        for (budget in 30..80) {
+            val text = log.boundedSnapshot(0, budget).joinToString("\n")
+            text.forEachIndexed { i, c ->
+                if (c.isHighSurrogate()) {
+                    assertTrue(
+                        "budget $budget: high surrogate at $i has no low surrogate after it",
+                        i + 1 < text.length && text[i + 1].isLowSurrogate(),
+                    )
+                }
+                if (c.isLowSurrogate()) {
+                    assertTrue(
+                        "budget $budget: low surrogate at $i has no high surrogate before it",
+                        i > 0 && text[i - 1].isHighSurrogate(),
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `a budget too small for the clamp's own marker keeps nothing`() {
+        // The marker and the anchor are fixed costs, so there is no clamped
+        // form at this size that fits -- and emitting one anyway overruns the
+        // ceiling the budget is.
+        val log = log()
+        log.pinnedEvent("started after %s", 7)
+        log.event("ordinary")
+
+        for (budget in 0..12) {
+            val lines = log.boundedSnapshot(pinnedBudgetChars = budget, recentBudgetChars = budget)
+            assertEquals("budget $budget rendered $lines", emptyList<String>(), lines)
+        }
+    }
+
+    @Test
+    fun `a budget that fits only the marker keeps just that`() {
+        // The boundary of the rule above: enough for the marker, its newline
+        // and the anchor, and the clamped stub is written.
+        val log = log()
+        log.event("ordinary")
+        val anchor = "${DebugLog.MARKER_LEVEL} timezone offset Z".length + 1
+
+        val lines = log.boundedSnapshot(0, recentBudgetChars = anchor + "…(truncated)".length + 1)
+        assertEquals(lines.toString(), listOf("…(truncated)"), lines.filterNot { isMarker(it) })
+    }
+
+    @Test
+    fun `a trim that bites still leaves every timestamp anchored`() {
+        // The ordering the design turns on. Anchor first and then trim, and the
+        // trim takes the anchor off the front with the oldest lines -- leaving
+        // a file of local timestamps with nothing saying which offset reads
+        // them, which is the orphaning synthesized anchors exist to prevent.
+        val log = log()
+        repeat(50) { log.event("ordinary %s", it) }
+
+        val lines = log.boundedSnapshot(pinnedBudgetChars = 0, recentBudgetChars = 200)
+        assertTrue(lines.toString(), lines.isNotEmpty())
+        assertTrue(lines.toString(), isMarker(lines.first()))
+        // The trim really did bite, so the assertion above is not vacuous.
+        assertTrue(lines.toString(), lines.none { "ordinary 0 " in it })
+    }
+
+    @Test
+    fun `a pinned line is kept by identity, not by matching the tail's text`() {
+        // Two entries a second apart can render identically. Deciding by text
+        // would read the tail's copy as this one and drop a line that is in
+        // fact gone from the tail.
+        val log = log(maxEntries = 2)
+        log.pinnedEvent("same")
+        log.event("same")
+        log.event("filler")
+
+        val events = log.boundedSnapshot(1_000, 1_000).filterNot { isMarker(it) }
+        assertEquals(events.toString(), 3, events.size)
+        assertEquals(events.toString(), 2, events.count { it.endsWith("same") })
     }
 }
