@@ -71,6 +71,17 @@ has stopped biting.
 ## Testing
 
 - `./gradlew test` and `./gradlew check` (which runs `verifyNoAndroid`).
+- **CI carries the fleet's standard checks: `lanes`, `codex`, and `zizmor`.**
+  The lane engine is `mikelward/lanes`, tracked `@main` — this repository
+  carries only its policy (`.github/lanes.conf`) and the thin `classify` /
+  `lanes` jobs in `ci.yml`, so an engine fix goes there, not here. Codex's
+  verdict machinery is `mikelward/codex-review`, also `@main`: the three
+  workflows it installs are pinned **byte for byte** against that
+  repository's `templates/`, so editing one of them here fails
+  `codex-review-check` until it is re-approved centrally. `zizmor.yml` scans
+  the workflows themselves, with the policy exceptions in
+  `.github/zizmor.yml`. `TODO.md` tracks the remaining ruleset step for all
+  three.
 - **Add or update tests with any change, and assert both directions** — that a
   value is withheld off device *and* that the diagnostic ones are kept. A floor
   that quietly widened to withhold everything passes a one-sided test while
@@ -145,6 +156,12 @@ has stopped biting.
   consumer could notice the difference in its next build. There is no `feat:`
   or `fix:`, on purpose — they would prefix nearly everything and leave the log
   as flat as it started.
+- **Only `docs:` rides the docs lane.** `.github/lanes.conf` sends everything
+  that is not markdown-outside-the-modules down the code lane, so a commit
+  that really was `test:`, `build:`, or `refactor:` work carries a file the
+  docs lane never accepts and runs the full suite anyway. Prefix it by the
+  table above regardless — the prefix says what the commit is, and the lane
+  decides separately what CI it needs.
 
 ## Talking to the user
 
