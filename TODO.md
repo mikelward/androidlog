@@ -208,6 +208,15 @@ own `runCatching`, before the snapshot and after the crash marker.
   argument in full by design, and the share is the moment that leaves the
   device, so the review the design assumes has to actually exist somewhere. See
   *Decisions needing review* above.
+- **Each migration deletes its own app's legacy log files.** This library writes
+  `androidlog.log` / `androidlog-prev-*`; simmo and typelauncher's own sinks
+  write `debug.log` / `debug-prev-*`, snoozemo and clothescast others again.
+  The namespaces are separate so the new reader can never surface a file the
+  *old* full-rendering implementation left behind (Codex, PR #4) — but that
+  leaves those files in the app's cache holding un-reduced content until the
+  app removes them. The names are per-app, so the library cannot: it is one
+  delete in each migration, alongside marking that app's already-reduced values
+  `safe(...)`.
 - The consumer migrations, one at a time, starting with snoozemo: its `:core`
   split already matches this shape. Then simmo, typelauncher, clothescast.
   Held until simmo's in-flight PRs land (maintainer, 2026-08-30).
