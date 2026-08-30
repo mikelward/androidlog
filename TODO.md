@@ -107,6 +107,61 @@ growing a second copy for the buffers.
 
 ## Decisions needing review
 
+### OPEN, for the maintainer: Type Launcher renders twice, in production
+
+Raised 2026-08-30 by surveying the third consumer. **Not decided, and not
+autopilot's to decide** — it reverses or confirms a decision the maintainer
+made, and the losing side of it is a privacy regression either way.
+
+*The floor is applied at ingestion, so there is one rendering* (under
+**Decided**) rests on a factual claim, stated there as: *"only `mirrored` was
+ever asked for and `full` reached nothing — making `LogSummary(full, mirrored)`
+exactly `safe(mirrored)`."* That claim is why `LogSummary` was deleted.
+
+**It holds for two consumers and not for the third.** clothescast and snoozemo
+render `redactSensitive = true` only in tests, so their second rendering was
+dormant and deleting it cost nothing — clothescast's migration confirmed that.
+Type Launcher renders **both, on every logged line**, and ships it:
+
+```kotlin
+// LauncherDebugLog.event(), and pinnedEvent() identically
+val message = formatLogMessage(format, args, redactSensitive = false)
+record('D', message, throwable = null)          // on-device log + bug report
+Log.d(LAUNCHER_DEBUG_TAG, message)
+LauncherTelemetry.log(formatLogMessage(format, args, redactSensitive = true))
+```
+
+The on-device log gets `package=com.example.mail`; the Crashlytics breadcrumb
+gets `package=<redacted>`. Both renderings are asked for, and `full` reaches
+something.
+
+**So migrating Type Launcher as this library stands means picking a loss:**
+
+- **Reduce at ingestion** — the on-device log and the bug report lose package
+  names. Type Launcher is a launcher; packages are its diagnostic, and this
+  guts the log it exists to write.
+- **Render full** — the single rendering is what `LauncherTelemetry` sends, so
+  the installed-app list goes to Crashlytics. That app's own privacy rules name
+  the installed-app list as user data and forbid it outright.
+
+**The shape a fix would take**, offered as a starting point rather than a
+recommendation: the *sink* declares whether it leaves the device, and the log
+keeps enough to render reduced for those and full for the rest. That is a real
+reversal of the ingestion decision, not a tweak — it reintroduces "a withheld
+value exists in full somewhere in the process", which is precisely what the
+decision was made to eliminate. It also has to answer what the *persisted file*
+is, since it is on-device storage that a report later carries off device, and
+that ambiguity is what Codex found twice on PR #4.
+
+**This blocks two migrations, not one.** snoozemo's `ActiveSnooze.logSummary()`
+is the mild version of the same question — its halves differ by the snooze's
+start and cap timestamps, one production call site — and whatever answers Type
+Launcher answers it too. snoozemo's build wiring landed separately
+(mikelward/snoozemo#148) so that neither logger swap blocks the plumbing.
+
+clothescast is fully migrated and unaffected: it had no live mirror, and its
+migration *narrowed* what leaves the device.
+
 ### Should the privacy floor extend over report *bodies*?
 
 Codex raised it as a P1 on PR #8 and I declined it there, because
