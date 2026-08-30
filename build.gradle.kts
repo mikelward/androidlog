@@ -9,6 +9,6 @@ plugins {
 // ever looks it up remotely, and there is deliberately nothing to bump. See
 // README.md "Consuming it".
 allprojects {
-    group = "app.mikelward.androidlog"
+    group = "com.mikelward.androidlog"
     version = "0.0"
 }

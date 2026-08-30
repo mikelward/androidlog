@@ -51,7 +51,7 @@ includeBuild(androidlog)
 `app/build.gradle.kts`:
 
 ```kotlin
-implementation("app.mikelward.androidlog:logging-android:0.0")
+implementation("com.mikelward.androidlog:logging-android:0.0")
 ```
 
 The version there is inert — composite substitution matches on group and name

@@ -1,4 +1,4 @@
-package app.mikelward.androidlog
+package com.mikelward.androidlog
 
 
 /** Marks a log line cut short, so a reader can tell it was clamped, not written that way. */

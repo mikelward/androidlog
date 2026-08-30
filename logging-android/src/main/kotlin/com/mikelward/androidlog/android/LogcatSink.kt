@@ -1,7 +1,7 @@
-package app.mikelward.androidlog.android
+package com.mikelward.androidlog.android
 
 import android.util.Log
-import app.mikelward.androidlog.DebugLog
+import com.mikelward.androidlog.DebugLog
 
 /** Comfortably inside logcat's ~4 KB per-message ceiling, measured in modified UTF-8 bytes. */
 private const val MAX_CHUNK_BYTES = 3_000

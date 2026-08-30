@@ -1,4 +1,4 @@
-package app.mikelward.androidlog
+package com.mikelward.androidlog
 
 import java.time.Instant
 import java.time.ZoneId

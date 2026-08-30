@@ -13,7 +13,7 @@ plugins {
 // copy anyway (they name the app). See AGENTS.md.
 
 android {
-    namespace = "app.mikelward.androidlog.android"
+    namespace = "com.mikelward.androidlog.android"
     compileSdk = 37
 
     defaultConfig {

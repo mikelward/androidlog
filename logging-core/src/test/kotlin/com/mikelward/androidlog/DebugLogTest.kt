@@ -1,4 +1,4 @@
-package app.mikelward.androidlog
+package com.mikelward.androidlog
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
