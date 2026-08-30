@@ -43,6 +43,11 @@ has stopped biting.
   form. Rendering full and reducing at a boundary is what let the durable file
   carry everything. A consumer that already reduces its own values keeps them by
   saying `safe(...)`.
+  **Decided but not built:** the reduction becomes a per-app *setting* rather
+  than a constant — default reduced, unredacted behind a hidden gesture — which
+  keeps one rendering applied at ingestion and still forbids a rendering chosen
+  per sink. Deliberately deferred; `TODO.md` carries the design and the
+  reasoning. Until it lands the rule above is the rule, unqualified.
 - **No `getMessage()` from a throwable, ever.** A platform exception quotes
   what it was given, and on the paths this log exists for that is exactly what
   the floor bans. Types and stack frames only. There is no scrubber to catch a

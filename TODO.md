@@ -107,60 +107,210 @@ growing a second copy for the buffers.
 
 ## Decisions needing review
 
-### OPEN, for the maintainer: Type Launcher renders twice, in production
+### ANSWERED: a per-app redaction setting, default reduced
 
-Raised 2026-08-30 by surveying the third consumer. **Not decided, and not
-autopilot's to decide** — it reverses or confirms a decision the maintainer
-made, and the losing side of it is a privacy regression either way.
+Raised 2026-08-30 by surveying the third consumer, answered by the maintainer
+the same day. The question was whether this library should keep a second,
+reduced rendering for sinks that leave the device — reversing *the floor is
+applied at ingestion, so there is one rendering* — or whether Type Launcher
+should give up its full on-device log.
 
-*The floor is applied at ingestion, so there is one rendering* (under
-**Decided**) rests on a factual claim, stated there as: *"only `mirrored` was
-ever asked for and `full` reached nothing — making `LogSummary(full, mirrored)`
-exactly `safe(mirrored)`."* That claim is why `LogSummary` was deleted.
+**Neither.** Each app gets its own log-redaction setting, defaulting to
+reduced, with the unredacted mode behind a hidden gesture (five taps on the
+version row — all four apps have one) and still defaulting to off. What was
+read as a fixed choice is a **parameter**.
 
-**It holds for two consumers and not for the third.** clothescast and snoozemo
-render `redactSensitive = true` only in tests, so their second rendering was
-dormant and deleting it cost nothing — clothescast's migration confirmed that.
-Type Launcher renders **both, on every logged line**, and ships it:
+#### What decided it
+
+Not the argument this section previously made. That argument was that the
+fleet's guides sanction a fuller on-device log than anything that leaves —
+simmo's *"the on-device debug log is the one sanctioned exception"*, snoozemo's
+matching carve-out — so full-on-device was the established position. **simmo
+disproves it in practice.** `SimmoDebugLog.renderEntry` scrubs at ingestion,
+and its comment gives the reason outright: *"every entry is now exported
+automatically — to the persisted file and Crashlytics breadcrumbs — not only
+the user-reviewed share."* The app with the most sensitive data already works
+the way the setting defaults.
+
+Where the four actually stand, which is why the default is cheap:
+
+| App | Off-device mirror | On-device log | Cost of defaulting to reduced |
+|---|---|---|---|
+| simmo | Crashlytics breadcrumbs, opt-in | already reduced (`scrubPii` at ingestion) | none |
+| clothescast | none in the logger | already reduced (migrated) | none |
+| snoozemo | none; every sink on-device | full | none (see below) |
+| typelauncher | Crashlytics breadcrumbs, live | full, second rendering for the mirror | component and package names — its central diagnostic |
+
+**snoozemo's timestamps are not tier-two data** (maintainer, 2026-08-30),
+which is what makes its column read `none`. `ActiveSnooze.logSummary()` had
+split its halves on the snooze's `startedAt` and `capExpiresAt`, on the
+reasoning — in that code's own comment — that off device they say when someone
+was asleep or in a cinema. The maintainer's ruling is that they are not
+sensitive and that they are *necessary for debugging*: a snooze that ended early
+or never ended cannot be diagnosed from `mode=` and the anchor's shape alone,
+and snoozemo has no off-device mirror at all, so the only way they ever leave is
+inside a report the user consented to share. So `logSummary()` returns one
+`safe(...)` string with the times in it, that code comment is retired with the
+split it justified, and snoozemo's migration costs nothing rather than one call
+site.
+
+On whether a package name is sensitive at all: individually no, but the *set*
+is a strong fingerprint and implies health, finance, dating, religion. The
+platform agrees — `QUERY_ALL_PACKAGES` is restricted and Play's Data Safety
+counts the installed-app list as personal data. Hence default off, with the
+hidden mode carving out the on-device-only case rather than widening anything.
+
+#### The shape
+
+**Only the library reads the flag.** App-side reducers do not branch on it;
+they hand the log *both* forms and the single rendering picks:
 
 ```kotlin
-// LauncherDebugLog.event(), and pinnedEvent() identically
-val message = formatLogMessage(format, args, redactSensitive = false)
-record('D', message, throwable = null)          // on-device log + bug report
-Log.d(LAUNCHER_DEBUG_TAG, message)
-LauncherTelemetry.log(formatLogMessage(format, args, redactSensitive = true))
+fun Intent?.debugSummary(): LogValue =
+    either(full = "…component=$c package=$p…", reduced = "…component=••• package=•••…")
 ```
 
-The on-device log gets `package=com.example.mail`; the Crashlytics breadcrumb
-gets `package=<redacted>`. Both renderings are asked for, and `full` reaches
-something.
+`either(...)` joins `safe(...)` and `sensitive(...)` as a third input tag.
+That is `LogSummary` returning — but as an **input**, not a dual output, and
+the distinction is the whole point:
 
-**So migrating Type Launcher as this library stands means picking a loss:**
+- What the ingestion decision forbade: two renderings chosen **per sink**, so
+  a value existed in full in the process while a reduced copy went elsewhere.
+  Still forbidden.
+- What this is: **one** rendering, with a composite value's contribution
+  chosen from one process-wide flag. One string; buffer, file and every sink
+  carry it identically. The floor is still applied at ingestion — it is
+  parameterized rather than constant.
 
-- **Reduce at ingestion** — the on-device log and the bug report lose package
-  names. Type Launcher is a launcher; packages are its diagnostic, and this
-  guts the log it exists to write.
-- **Render full** — the single rendering is what `LauncherTelemetry` sends, so
-  the installed-app list goes to Crashlytics. That app's own privacy rules name
-  the installed-app list as user data and forbid it outright.
+**Automatic telemetry is a separate channel, not a sink.** Type Launcher's
+`LauncherTelemetry.log(...)` already is exactly that: its own call with its own
+reduced text. Left that way, this library needs no per-sink logic and no second
+output — the app decides what it also mirrors, and a breadcrumb can never widen
+with the flag.
 
-**The shape a fix would take**, offered as a starting point rather than a
-recommendation: the *sink* declares whether it leaves the device, and the log
-keeps enough to render reduced for those and full for the rest. That is a real
-reversal of the ingestion decision, not a tweak — it reintroduces "a withheld
-value exists in full somewhere in the process", which is precisely what the
-decision was made to eliminate. It also has to answer what the *persisted file*
-is, since it is on-device storage that a report later carries off device, and
-that ambiguity is what Codex found twice on PR #4.
+**Two tiers, and only one is the setting's business.** A full dialed number, an
+ICCID, a raw coordinate, a full SSID must not be in the log in *any* mode; those
+stay enforced before the log sees them (simmo's `redactNumber`, its `scrubPii`
+sink wrapper), which is also what *no scrubber in the core* requires. The
+setting governs only tier two — packages, row IDs, place names. If
+tier one moved with the flag, the hidden mode would become a way to put
+someone's phone number in a file.
 
-**This blocks two migrations, not one.** snoozemo's `ActiveSnooze.logSummary()`
-is the mild version of the same question — its halves differ by the snooze's
-start and cap timestamps, one production call site — and whatever answers Type
-Launcher answers it too. snoozemo's build wiring landed separately
-(mikelward/snoozemo#148) so that neither logger swap blocks the plumbing.
+**A share follows the setting** (maintainer). So the consent copy must be
+*derived*, not fixed text — otherwise a share in unredacted mode is the one
+place the user is not told what is leaving. Derived from the report rather than
+from the flag, for the reason in the next paragraph. clothescast already has
+the machinery (`BugReportConsentDialog`, `BugReport.share` gating the clear on
+the clipboard copy landing); what it needs is one line reading the report's own
+mode metadata — **not** the flag, which is the whole point of the next
+paragraph and was left saying the opposite here (Codex, PR #13).
 
-clothescast is fully migrated and unaffected: it had no live mirror, and its
-migration *narrowed* what leaves the device.
+**A report says what it actually contains, not what the flag currently says.**
+The first draft of this rule was *turning redaction back on clears the buffer
+and the file*, and that is necessary but nowhere near sufficient (Codex, PR
+#13). Prior runs deliberately survive an opt-out — `DebugFileSink.onCleared`
+skips `current` while a retained previous run is there and never touches the
+rotated `androidlog-prev-*` set, because a crash the user has not seen yet is
+exactly what that set exists to keep. So: record unredacted, restart so the run
+rotates, turn redaction back on, and `readPreviousRun()` still offers a full
+run to a share whose consent line, derived from today's flag, calls it
+redacted.
+
+Purging the prior-run set on the transition is the wrong repair — it destroys
+an unshared crash report to protect data the user themselves chose to record.
+The right one is to **carry the mode with the run** and derive the consent copy
+from the union of what the report includes: any unredacted run in it makes the
+report unredacted, whatever the setting reads now.
+
+**The mark has to be durable before the content it describes, not applied at
+rotation** (Codex, PR #13, against the first version of this paragraph, which
+proposed the prior-run filename suffix). Rotation is too late, for a reason
+already written down further below: `onCleared` enqueues its purge on the
+worker, so a process death inside that window leaves the unredacted
+`androidlog.log` on disk while the setting already reads reduced — see *The
+opt-out purge is not durable across a process death* — and the next start would
+then rotate that file and stamp it with today's mode, which is the wrong one. A
+name assigned at rotation cannot describe what a file already contains.
+
+So the mark is **sticky, and written ahead of the line that makes it true**: the
+first unredacted entry a run records sets it, and rotation only carries it
+along. Sticky rather than one mode per run because the setting can be flipped
+mid-run, which would otherwise leave a file holding both kinds under a single
+label. Where it lives — a sidecar beside the log, a header line, the name at
+open — is an implementation choice; that it is set before the content is not.
+
+**It clears on proof, and only on proof** (Codex, PR #13). The mark describes
+what a file *contains*, so once that file is actually empty, leaving the mark
+set would report later reduced-only content as unredacted — over-reporting,
+which teaches a user to disregard the line and so protects nobody when it
+matters. It therefore resets on evidence the content is gone, and never on the
+strength of the setting having changed.
+
+**A skipped purge is not a successful one**, and this is where naming a
+mechanism went wrong (Codex, PR #13, against the previous version of this
+paragraph, which claimed `onCleared`'s `purgeFailed` already supplied the
+signal). It does not: that method reads
+`if (retainedPreviousRun() == null && !discardContents(current))`, so when a
+failed rotation has left a prior run in place the discard is **skipped** and
+`purgeFailed` is never set — the file survives, unredacted, while the flag
+reads clean. `!purgeFailed` means "nothing went wrong", which is not the same
+claim as "the content is gone", and only the second licenses the reset.
+
+So the requirement, deliberately without an implementation: the reset is gated
+on a signal that tells **purged** apart from **skipped** and from **failed** —
+an explicit attempt-and-result, or a check that the file is empty. Anything
+that cannot distinguish those three is disqualified. Which of them to build
+belongs with the code that will actually run; naming an existing flag here was
+over-specifying work nobody is doing yet, and that is what drew the last two
+rounds rather than any disagreement about the rule.
+
+Clearing the buffer and the current file on the transition still stands; it is
+just the smaller half, and it is now also what licenses the reset.
+
+**Read the flag synchronously and early** — plain `SharedPreferences` in
+`Application.onCreate`, not DataStore. The first line can be very early
+(simmo's decision path, snoozemo's tile tap). Since the default is reduced, a
+read that is late or fails resolves to the safe side by construction.
+
+#### Until it is built: keep one model, reduce Type Launcher
+
+Deliberately deferred (maintainer). The library does not change now; the
+migrations proceed against it as it stands, reducing at ingestion:
+
+- `ActiveSnooze.logSummary()` → `safe(full)`, keeping the timestamps.
+- `Intent.debugSummary()` → `safe(mirrored)`, losing component and package.
+
+The loss is a window, not a decision — the setting reverses it whenever it
+lands, and the deferred work is additive, so nothing built now has to be
+unbuilt.
+
+**The tier split is itself an argument for deferring** (maintainer). Because
+tier one is permanently outside the setting's reach, the setting buys less than
+it first appears: simmo's most sensitive data is unreachable by it either way,
+simmo and clothescast already reduce, and snoozemo loses one call site. Almost
+all of its value is Type Launcher's. A fleet-wide mechanism serving essentially
+one app is better built once that app is migrated and the loss is concrete than
+built speculatively ahead of it. What it costs meanwhile is Type Launcher's own diagnostic: a
+wrong-app-launched or failed-launch report stops naming an app, and the eleven
+`sensitive(...)` sites (contact and calendar row IDs, key codes) go too.
+
+Note for whoever implements the setting: `Intent.debugSummary()` must be
+refactored to hand the log its **pieces** — component and package as untagged
+`String`s the floor withholds, action and scheme through `safe(...)` — or
+`either(...)`. Passing a pre-reduced string means the toggle changes nothing
+there, because the call site threw the package name away before the log saw it.
+
+#### Still open, for the maintainer
+
+`LauncherDebugLog.event` also does `Log.d(LAUNCHER_DEBUG_TAG, message)` with
+the full text. Logcat is genuinely device-local — third-party apps cannot read
+it, it needs adb — so keeping that line full would make the interim window
+nearly free for a developer on their own release build, which is the case that
+started this. But it is the same shape as the thing being deferred: a second
+rendering, app-side. It never enters this library, never persists and never
+leaves the device, which is the argument that it sits outside what the
+ingestion rule was written to prevent. Whether that holds is the maintainer's
+call, not one to settle by assuming it.
 
 ### Should the privacy floor extend over report *bodies*?
 
@@ -334,6 +484,15 @@ than the window it removes.
   startup rotation. Nothing else depends on the purge being asynchronous.
 
 ### The floor is applied at ingestion, so there is one rendering
+
+**Amended, not reversed (2026-08-30).** The maintainer's per-app redaction
+setting — recorded under *Decisions needing review* — keeps exactly one
+rendering and keeps it at ingestion; it makes the choice a process-wide
+parameter instead of a constant, so the buffer, the file and every sink still
+carry identical text. What stays forbidden is what this section was written
+against: a rendering chosen *per sink*. Not built yet, and deliberately
+deferred until Type Launcher is migrated.
+
 
 Codex raised this twice on PR #4, as a P1 both times: the persisted file carried
 `DebugLog.snapshot()`, which was the full on-device rendering, so a value the
