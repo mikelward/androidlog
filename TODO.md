@@ -216,6 +216,35 @@ own `runCatching`, before the snapshot and after the crash marker.
   on typelauncher #689).
 - **Reversible:** a default of `{}`, so no consumer is forced to have one.
 
+### The read/clear contract is a single shared slot, and needs a per-read handle
+
+`readPreviousRun()` records what it surfaced in one field and `clearPreviousRun()`
+deletes whatever is in it. With two report flows overlapping that is wrong in a
+way no amount of ticketing fixes: read 1 surfaces {A}, read 2 surfaces {A, B}
+because B became readable, and report 1 finishing first then deletes B — which
+was never in report 1, and whose own report may still fail (Codex, PR #4).
+
+**This is the class the last several rounds were instances of.** The tickets
+(`readTickets`, `surfacedTicket`, `abandonedTicket`) exist only to answer "is
+the single shared slot still meaningful?", and each round found another case
+they could not answer: a refused enqueue, a non-monotonic write, and now two
+reads that both *succeeded*. The fix retires the question rather than answering
+it again — `readPreviousRun` hands back a handle carrying its own file set, and
+`clearPreviousRun(handle)` consumes exactly that. All three fields go with it.
+
+- **Why not in PR #4:** it is a public API change (`readPreviousRun` stops
+  returning a bare `String?`) and it has a genuinely hard part — the crash-banner
+  dismissal renames a file while a report may be in flight, and remapping that
+  across *several* outstanding handles is a different problem from remapping one
+  shared list. That deserves its own review rather than a fixup at the end of a
+  seven-commit branch.
+- **What holds the line meanwhile:** the KDoc states the single-flow contract, so
+  a caller running two concurrent reports is doing something the API says not to.
+  The follow-up makes it impossible rather than merely contracted.
+- **Still free to do:** no consumer has migrated, so the API shape costs nothing
+  to change — and this must land before the first migration, when it stops being
+  free.
+
 ## Not built yet
 
 - **Pinned start-up lines, and the persist budget that reserves room for them.**
@@ -228,10 +257,14 @@ own `runCatching`, before the snapshot and after the crash marker.
   the pinning it has today. The core needs the second buffer first.
 - `:logging-report` — share sheet, clipboard fallback, FileProvider. The one
   module that needs resources, which is why it is its own module. **It has to
-  show the user the report before it is sent**: the on-device log renders every
-  argument in full by design, and the share is the moment that leaves the
-  device, so the review the design assumes has to actually exist somewhere. See
-  *Decisions needing review* above.
+  show the user the report before it is sent** — but not for the reason this
+  entry used to give (Codex, PR #4). The old rationale was that the on-device
+  log rendered everything in full and the share was where reduction happened;
+  the floor moved to ingestion, so there is one rendering and the file already
+  holds the reduced text. The preview stands on its own: a report names the
+  user's own device state, and sending it is irreversible, so they should see
+  what they are sending before it goes. **Do not build a second, fuller
+  rendering to preview** — that is the two-form design this PR removed.
 - **Each migration deletes its own app's legacy log files.** This library writes
   `androidlog.log` / `androidlog-prev-*`; simmo and typelauncher's own sinks
   write `debug.log` / `debug-prev-*`, snoozemo and clothescast others again.
