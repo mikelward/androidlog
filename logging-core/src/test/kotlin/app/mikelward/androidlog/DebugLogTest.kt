@@ -158,6 +158,66 @@ class DebugLogTest {
         assertFalse(line, "+15550100" in line)
     }
 
+    // A close failure -- `use { }`, try-with-resources -- is neither the thrown
+    // exception nor anywhere on its cause chain, so a renderer that walks only
+    // causes drops it silently. These three are that gap.
+    @Test
+    fun `a suppressed exception is named by type`() {
+        val log = log()
+        val failure = IllegalStateException("write failed")
+        failure.addSuppressed(java.io.IOException("close failed"))
+
+        log.failure(failure, "save failed")
+
+        val line = log.events().single()
+        assertTrue(line, "Suppressed: java.io.IOException" in line)
+    }
+
+    @Test
+    fun `a suppressed exception's message never reaches the log`() {
+        val log = log()
+        val failure = IllegalStateException("write failed")
+        failure.addSuppressed(java.io.IOException("could not close ExampleWifi"))
+
+        log.failure(failure, "save failed")
+
+        val line = log.events().single()
+        // The whole reason a type is safe to carry: the floor reads no
+        // throwable's message, and a suppressed one is no exception to that.
+        assertFalse(line, "ExampleWifi" in line)
+        assertFalse(line, "could not close" in line)
+    }
+
+    @Test
+    fun `suppressed exceptions are bounded like the cause chain`() {
+        val log = log(maxCauseLinks = 2)
+        val failure = IllegalStateException("write failed")
+        repeat(5) { failure.addSuppressed(java.io.IOException("close $it failed")) }
+
+        log.failure(failure, "save failed")
+
+        val line = log.events().single()
+        assertEquals(line, 2, line.lines().count { it.startsWith("\tSuppressed: ") })
+        assertTrue(line, "... 3 more suppressed" in line)
+    }
+
+    // Named on the link that suppressed it, not hoisted to the top: a close
+    // failure belongs to the operation that closed, and a chain can carry one
+    // at more than one level.
+    @Test
+    fun `a suppressed exception on a cause link is named there`() {
+        val log = log()
+        val cause = IllegalArgumentException("inner")
+        cause.addSuppressed(java.io.IOException("inner close failed"))
+
+        log.failure(RuntimeException("wrapper", cause), "lookup failed")
+
+        val line = log.events().single()
+        val suppressedAt = line.lines().indexOfFirst { it.startsWith("\tSuppressed: ") }
+        val causeAt = line.lines().indexOfFirst { it.startsWith("Caused by: ") }
+        assertTrue(line, causeAt >= 0 && suppressedAt > causeAt)
+    }
+
     @Test
     fun `a cause chain renders every link without any message`() {
         val log = log()

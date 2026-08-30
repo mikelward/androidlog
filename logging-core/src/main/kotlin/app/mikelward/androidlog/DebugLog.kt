@@ -1072,6 +1072,10 @@ open class DebugLog(
      * read at all. The type names the failure and the frames locate it, which is
      * what a bug report needs.
      *
+     * Walks the cause chain and names what each link suppressed (see
+     * [appendSuppressed]) -- a close failure is on neither, and is lost by a
+     * renderer that reads only causes.
+     *
      * Guarded against a cyclic cause chain, and bounded per link and per chain
      * so one throw can't consume the whole entry budget.
      */
@@ -1092,8 +1096,40 @@ open class DebugLog(
             val keep = minOf(maxTraceFrames, frames.size)
             for (i in 0 until keep) appendLine("\tat ${frames[i]}")
             if (frames.size > keep) appendLine("\t... ${frames.size - keep} more")
+            appendSuppressed(throwable)
             current = runCatching { throwable.cause }.getOrNull()
             prefix = "Caused by: "
+        }
+    }
+
+    /**
+     * Names each exception suppressed by [throwable] — type only, no frames.
+     *
+     * A `use { }` or try-with-resources close failure arrives here and nowhere
+     * else: it is not the thrown exception and it is not on the cause chain, so
+     * a renderer that walks only causes drops it entirely. That was the case
+     * before this: a write that failed *and* whose close then failed logged the
+     * write and said nothing about the close. clothescast's own logger kept a
+     * one-line summary for exactly that reason, and the migration onto this
+     * library would have lost it.
+     *
+     * Type only, deliberately. A suppressed exception is secondary by
+     * definition -- the reader wants to know a close failed and what kind, not
+     * to spend the entry budget on its stack -- and the floor is unchanged
+     * either way, since a type names a failure and never the user.
+     *
+     * Bounded by [maxCauseLinks], the same budget the cause chain gets, because
+     * it answers the same question: how many linked throwables may one entry
+     * name. Costs nothing on the common path, where nothing is suppressed.
+     */
+    private fun StringBuilder.appendSuppressed(throwable: Throwable) {
+        // `suppressed` allocates a copy on each call and is overridable, so it
+        // is read once and guarded like `cause` is.
+        val suppressed = runCatching { throwable.suppressed }.getOrNull() ?: return
+        val keep = minOf(maxCauseLinks, suppressed.size)
+        for (i in 0 until keep) appendLine("\tSuppressed: ${suppressed[i].javaClass.name}")
+        if (suppressed.size > keep) {
+            appendLine("\t... ${suppressed.size - keep} more suppressed")
         }
     }
 }
