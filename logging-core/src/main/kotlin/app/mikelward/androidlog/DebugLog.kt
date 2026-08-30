@@ -365,8 +365,19 @@ open class DebugLog(
      *
      * Interpolating into [format] defeats it. The type system cannot enforce
      * that, so it is a rule: pass values as arguments.
+     *
+     * **Answers whether the entry actually landed**, which is false when
+     * recording is off, when the call came from inside a sink's own delivery,
+     * and when rendering it failed. Almost every call site ignores it. The ones
+     * that do not are failure reports that must not count themselves said when
+     * nobody received them: a sink that reports a repeating failure once per
+     * spell has to latch that spell on a line that landed, and asking
+     * [isRecording] first cannot answer it — the gate can close between the
+     * question and the entry, and it says nothing about the other two drops
+     * (Codex, PR #4).
      */
-    fun event(format: String, vararg args: Any?) = record('D', format, args, throwable = null)
+    fun event(format: String, vararg args: Any?): Boolean =
+        record('D', format, args, throwable = null)
 
     /**
      * A warning with no exception behind it. Same contract as [event].
@@ -378,7 +389,7 @@ open class DebugLog(
      * the exception message this class exists to exclude — and be findable only
      * in production. One passed here is rerouted rather than rendered.
      */
-    fun warning(format: String, vararg args: Any?) {
+    fun warning(format: String, vararg args: Any?): Boolean {
         // Looked for *under* any tag: `warning("...", safe(e))` is the same
         // misuse as `warning("...", e)`, and matching on the wrapper's own type
         // missed it -- the line then carried the exception's type with neither
@@ -393,18 +404,17 @@ open class DebugLog(
             // occurrence of the same instance too (Codex, PR #1). Left in
             // place it renders as its type, which is what an argument-position
             // throwable renders as anyway; `failure` adds the frames below.
-            failure(
+            return failure(
                 throwable,
                 "$format [throwable passed to warning(); use failure()]",
                 *args,
             )
-            return
         }
-        record('W', format, args, throwable = null)
+        return record('W', format, args, throwable = null)
     }
 
     /** A warning carrying the exception behind it. Same contract as [event]. */
-    fun failure(throwable: Throwable, format: String, vararg args: Any?) =
+    fun failure(throwable: Throwable, format: String, vararg args: Any?): Boolean =
         record('W', format, args, throwable)
 
     /**
@@ -436,7 +446,12 @@ open class DebugLog(
         out
     }
 
-    private fun record(level: Char, format: String, args: Array<out Any?>, throwable: Throwable?) {
+    private fun record(
+        level: Char,
+        format: String,
+        args: Array<out Any?>,
+        throwable: Throwable?,
+    ): Boolean {
         // Before anything else, including the enabled read: a sink recording
         // from inside its own `log()` is not supported, and the entry is
         // dropped rather than allowed to overtake the one being delivered. The
@@ -445,13 +460,13 @@ open class DebugLog(
         if (deliveringThread === Thread.currentThread()) {
             // Reentrant: this thread is inside `deliver`, which holds it.
             synchronized(buffer) { droppedFromSink++ }
-            return
+            return false
         }
         // One read, so the enabled flag and the period it belongs to cannot
         // disagree. A disabled log costs exactly this volatile read on a
         // latency-critical path.
         val started = session
-        if (!started.recording) return
+        if (!started.recording) return false
         // One clock reading for the whole entry, taken here and used for both
         // the line and any marker that precedes it. Read twice, the two could
         // straddle a transition and the marker would announce the new offset
@@ -466,12 +481,12 @@ open class DebugLog(
         // taken, so rendering never holds it.
         val entry = runCatching {
             render(now, level, formatLogMessage(format, args, redactSensitive = false), throwable)
-        }.getOrElse { return }
+        }.getOrElse { return false }
         gate.read {
             // Still the same session? Anything else — a disable, a re-enable,
             // or both while this entry was rendering — means it began in a
             // period that is over, and it does not belong in this one.
-            if (session !== started) return
+            if (session !== started) return false
             // Append and fan-out under the *same* monitor, so a sink sees lines
             // in the order the buffer took them. Released between the two, the
             // shared read lock let a second recorder append and deliver while
@@ -493,6 +508,7 @@ open class DebugLog(
                 append(entry, now)
             }
         }
+        return true
     }
 
     /**
