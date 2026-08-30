@@ -59,7 +59,29 @@ in-memory buffer. One meaning now.
 ## Decisions needing review
 
 Taken under autopilot, so each says what the alternative was and what undoing it
-would cost. All of them are from the file-sink port.
+would cost.
+
+### Merged without piloting a consumer first
+
+`AGENTS.md` says *pilot a consumer before merging, not after*, because consumers
+track `@main` and merging here is the rollout. PRs #5 and #4 were merged under
+autopilot without one.
+
+- **Alternative:** point one app's `settings.gradle.kts` at the branch and take
+  that app's PR green before merging here.
+- **Why this way:** the rule's premise does not hold yet. **No consumer has
+  migrated**, so nothing resolves this library and a merge reaches no app's next
+  build — the rollout the rule protects has not started. Piloting would also mean
+  opening a PR in a consumer repo, and consumer work is held until simmo's
+  in-flight PRs land, so the rule and the hold point opposite ways.
+- **What is actually owed:** the pilot is still the right check, just later. The
+  *first* migration is the pilot — it is the first time the composite build is
+  exercised from a consumer, and if the wiring is wrong that is where it shows.
+  Nothing about merging first makes that harder.
+- **Reversible:** entirely, and cheaply, for exactly as long as no consumer has
+  migrated: a revert PR here is the whole undo, with nothing downstream to
+  unpick. That window closes at the first migration, which is the point to stop
+  relying on this. All of them are from the file-sink port.
 
 ### A listener can see one delivery already in flight when removal returns
 
