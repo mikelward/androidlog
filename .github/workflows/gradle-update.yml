@@ -1,0 +1,45 @@
+name: gradle-update
+
+# One batched Gradle dependency PR per week, produced by the shared
+# mikelward/gradle-update workflow: every gradle/libs.versions.toml entry
+# moves to the newest stable release within its current major, the checks
+# below validate the batch, and a passing batch lands by auto-merge.
+#
+# This repository needs the batch more than its consumers do, and for a
+# reason none of them has: a composite build cannot mix Android Gradle
+# plugin versions, so the moment a consumer's weekly batch moves AGP and
+# this one does not, every app consuming `:logging-android` fails to
+# configure with `Using multiple versions of the Android Gradle plugin`.
+# Being the only repository in the fleet off the batch is what produced
+# exactly that (AGP 9.3.1 here against 9.3.2 in snoozemo, 2026-08-30).
+#
+# The @main reference is deliberate, matching how consumers track this
+# repository: a fix in the shared workflow reaches the next run with no
+# bump PR, which is the drift those bumps reintroduce.
+on:
+  schedule:
+    - cron: '17 6 * * 6'   # Saturdays, off the congested top of the hour
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: gradle-update
+  cancel-in-progress: false
+jobs:
+  update:
+    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    secrets:
+      token: ${{ secrets.GRADLE_UPDATE_PAT }}
+      app-id: ${{ secrets.GRADLE_UPDATE_APP_ID }}
+      app-private-key: ${{ secrets.GRADLE_UPDATE_APP_PRIVATE_KEY }}
+    with:
+      # `check` rather than `lint`: it runs lint *and* `verifyNoAndroid` and
+      # `verifyConsumerRules`, the two checks that catch a dependency bump
+      # pulling Android onto the pure-JVM core or dropping the keep rule the
+      # consuming apps inherit.
+      checks: |
+        ./gradlew test
+        ./gradlew check

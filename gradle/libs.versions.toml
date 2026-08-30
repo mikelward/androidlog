@@ -4,7 +4,7 @@
 # divergence here breaks four apps at once with no pin to hide behind. See
 # AGENTS.md, "What this repository must not grow".
 [versions]
-agp = "9.3.1"
+agp = "9.3.2"
 junit = "4.13.2"
 kotlin = "2.4.10"
 
