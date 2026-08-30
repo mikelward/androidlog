@@ -103,6 +103,15 @@ SnoozemoLog.event("departed anchor, distance %sm accuracy %sm", 180, 12)
 SnoozemoLog.failure(e, "departure test failed for %s", safe("wifi"))
 ```
 
+Five levels, lowest first: `verbose`, `event`, `info`, `warning` and `error`.
+Two of them also take a throwable ahead of the format — `failure(t, …)`, which
+is `warning`'s throwable form under a distinct name so the compiler catches a
+throwable passed as a trailing argument, and `error(t, …)`.
+
+The level is handed to each sink rather than left in the rendered line for
+someone to parse back out, so `LogcatSink` maps it to the matching logcat
+severity — which is what anyone reading `adb logcat` filters on.
+
 To keep the log across the process ending — a crash *or* a silent kill — add
 the file sink, early in `Application.onCreate`:
 

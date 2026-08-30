@@ -338,6 +338,16 @@ own `runCatching`, before the snapshot and after the crash marker.
 
 ## Not built yet
 
+- **Decide whether this repository carries a `LICENSE`** (maintainer,
+  2026-08-30: "to-do for later"). It has none today. That is consistent while
+  it is one owner's code shared between one owner's apps — clothescast's
+  Licenses screen omits it for exactly the reason it omits `:core:domain`, and
+  a self-attribution row there would be the odd one out (Codex raised the
+  omission on clothescast#1176; declined there as the wrong place to settle
+  it). But four apps now compile this into shipped APKs, so the absence should
+  be a decision rather than an oversight. Not to be added unilaterally: which
+  license, and whether one is wanted at all, is the maintainer's call.
+
 - **A prior-run file's own anchor can be trimmed when several are read back.**
   `readPreviousRun` concatenates up to five run files and trims the result to
   the persist budget, and that trim runs over text already read off disk — so
@@ -403,6 +413,15 @@ own `runCatching`, before the snapshot and after the crash marker.
   They are also the first exercise of two things no JVM test can reach: the
   composite build resolving from a consumer, and the chooser and clipboard
   actually working.
+
+  **What the first migration has already turned up**, which is the point of
+  doing it before simmo's CI pays for anything: clothescast records at five
+  levels and the library had three, and the level is not decoration — it drives
+  `Log.v/i/e`, so it is what a developer filters logcat on. Fixed in the
+  library rather than dropped in the app, since clothescast has it today.
+  Its tags turned out not to need library support: all 278 call sites pass a
+  constant, so the app's own facade can fold them into the format literal
+  without touching the floor.
 
   Availability at the time of writing: clothescast is clear (its open PRs are
   two dependency batches and two CI changes, none touching logging), is at the
