@@ -63,10 +63,28 @@ open class DebugLog(
      * that changes twice a year.
      */
     private val readMillis: () -> Long = System::currentTimeMillis,
+    /**
+     * Bounds the pinned buffer — the lines [pinnedEvent] keeps past the ring's
+     * eviction. Bounded anyway, and oldest-evicted like the ring: a device
+     * where the pinned condition genuinely flaps writes one line per flip, and
+     * the newest are the ones worth keeping.
+     *
+     * **Last, rather than beside the other bounds it belongs with.** Consumers
+     * compile this source directly from `@main` with nothing pinned, so a
+     * parameter inserted among the existing ones rebinds every positional
+     * argument after it — `DebugLog(300, 100, 6)` would keep compiling while
+     * silently truncating every entry to six characters (Codex, PR #7). A
+     * signature that changes what a call *means* without changing whether it
+     * compiles is the one shape this repository's no-pin model cannot absorb,
+     * so new parameters go on the end and this comment says why the grouping
+     * is broken.
+     */
+    private val maxPinnedEntries: Int = DEFAULT_MAX_PINNED_ENTRIES,
 ) {
 
     companion object {
         const val DEFAULT_MAX_ENTRIES = 300
+        const val DEFAULT_MAX_PINNED_ENTRIES = 32
         const val DEFAULT_MAX_ENTRY_CHARS = 2_000
         const val DEFAULT_MAX_TRACE_FRAMES = 6
         const val DEFAULT_MAX_CAUSE_LINKS = 5
@@ -87,6 +105,12 @@ open class DebugLog(
         // condition: a log that cannot hold a line is not a log, and failing
         // where the mistake is beats failing on a call site's first event.
         require(maxEntries > 0) { "maxEntries must be positive, was $maxEntries" }
+        // Same reasoning as [maxEntries], and the same failure: a non-positive
+        // bound sends the first pinned append into `removeFirst()` on an empty
+        // deque, outside the `runCatching` around rendering.
+        require(maxPinnedEntries > 0) {
+            "maxPinnedEntries must be positive, was $maxPinnedEntries"
+        }
         // Guarded for the same reason and found the same way. A negative bound
         // sends every entry into `take(-1)`, which throws inside the
         // `runCatching` around rendering -- so `record` returns quietly and the
@@ -125,6 +149,26 @@ open class DebugLog(
     private class Line(val text: String, val offset: ZoneOffset?)
 
     private val buffer = ArrayDeque<Line>(maxEntries)
+
+    /**
+     * The subset of [buffer]'s lines that must outlive its eviction; see
+     * [pinnedEvent].
+     *
+     * Holds the **same [Line] instances**, so a pinned line still appears in
+     * the ring for as long as the ring keeps it and this copy is what remains
+     * afterwards. Sharing the instance is also what lets [boundedSnapshot]
+     * decide by identity which pinned lines the ring's kept tail still carries,
+     * rather than comparing rendered text — two entries a second apart can
+     * render identically, and equality would then drop a line that is genuinely
+     * missing from the tail.
+     *
+     * Guarded by the same monitor as [buffer], not one of its own, so a line
+     * lands in both as a single step. With a lock each, two recorders could
+     * interleave between the two appends and leave the pinned copy in a
+     * different order from the ring's — a report whose start-up section reads
+     * out of sequence (Codex on typelauncher #689).
+     */
+    private val pinnedBuffer = ArrayDeque<Line>(maxPinnedEntries)
 
     /**
      * Every registered sink, mapped to the offset it has actually been anchored
@@ -305,6 +349,12 @@ open class DebugLog(
             session = Session(enabled)
             if (!enabled) synchronized(buffer) {
                 buffer.clear()
+                // The whole point of the pinned copy is that it outlives
+                // eviction, so nothing else in this class would ever remove
+                // these lines. Left behind, "off" would keep recorded content
+                // in memory and hand it to the next persisted file — the exact
+                // leak the opt-out exists to close.
+                pinnedBuffer.clear()
                 // The pending drop report belongs to the session being
                 // discarded. Left standing, the first entry of the next one
                 // would open with a warning about entries lost before the user
@@ -386,6 +436,28 @@ open class DebugLog(
         record('D', format, args, throwable = null)
 
     /**
+     * Records one line and keeps a second reference to it, so it survives the
+     * ring evicting it. Same contract as [event] in every other respect —
+     * including the privacy floor, which is the same rule applied at the same
+     * point.
+     *
+     * For the handful of lines that say how *this run* began: what ended the
+     * previous process, when the package was last updated, which permissions
+     * were held at start. They are written once each, and the ring holds a few
+     * hundred entries of a log a busy device fills in well under two hours — so
+     * by the time a user notices something and shares a report, the lines
+     * explaining how the run started are routinely gone, which is exactly what
+     * they were added to answer (Codex on typelauncher #689).
+     *
+     * **Reserve it.** Anything written more than a few times a run belongs in
+     * [event], where eviction is the correct behavior: the pinned buffer is
+     * bounded too ([maxPinnedEntries]), so a chatty caller evicts the start-up
+     * lines from the one place that was keeping them.
+     */
+    fun pinnedEvent(format: String, vararg args: Any?): Boolean =
+        record('D', format, args, throwable = null, pinned = true)
+
+    /**
      * A warning with no exception behind it. Same contract as [event].
      *
      * A warning that *does* have an exception goes to [failure]. The throwable
@@ -427,29 +499,185 @@ open class DebugLog(
      * The captured lines, oldest first, with an offset anchor before the oldest
      * retained run and before every offset change inside the window.
      *
-     * Synthesized here rather than stored, so no amount of eviction can leave a
-     * run of local timestamps without the offset that reads them. The anchors
-     * carry **no timestamp**: each describes the run that follows it, and a
-     * stored marker's own time would be either older than the window it now
-     * heads or newer than the line beneath it.
+     * Synthesized rather than stored ([anchored]), so no amount of eviction can
+     * leave a run of local timestamps without the offset that reads them. The
+     * anchors carry **no timestamp**: each describes the run that follows it,
+     * and a stored marker's own time would be either older than the window it
+     * now heads or newer than the line beneath it.
+     *
+     * The ring only. A pinned line still in the ring appears here like any
+     * other; one the ring has evicted does not — [pinnedSnapshot] and
+     * [boundedSnapshot] are what still carry it.
      *
      * The sink stream is anchored differently, and deliberately -- see
      * [markerFor]. A sink is append-only, nothing is evicted from it, and a
      * marker written there at the moment the offset changed is both correct and
      * better carrying the time it happened.
      */
-    fun snapshot(): List<String> = synchronized(buffer) {
-        val out = ArrayList<String>(buffer.size + 2)
-        var anchored: ZoneOffset? = null
-        for (line in buffer) {
+    fun snapshot(): List<String> = synchronized(buffer) { anchored(buffer) }
+
+    /**
+     * The pinned lines ([pinnedEvent]), oldest first, anchored as [snapshot] is.
+     *
+     * Anchored over its own run rather than sharing the ring's: the two are
+     * rendered as separate sections, so an anchor emitted for one says nothing
+     * about the other.
+     */
+    fun pinnedSnapshot(): List<String> = synchronized(buffer) { anchored(pinnedBuffer) }
+
+    /**
+     * Both buffers as one chronological, anchored sequence, each trimmed to its
+     * own character budget — the pinned lines the ring's kept tail no longer
+     * carries, then that tail.
+     *
+     * **The reserve is the point.** A persisted log is a *tail*: it keeps the
+     * newest and drops the oldest, which is the opposite of what the start-up
+     * lines need. Given one shared budget they are the first thing to go, and
+     * the report loses exactly the evidence pinning exists to keep (Codex on
+     * typelauncher #689). [pinnedBudgetChars] is held back for them, so the two
+     * sections cannot compete.
+     *
+     * **One call rather than three, because the three steps do not commute.**
+     * Which pinned lines to prepend can only be decided once the ring's tail
+     * has been trimmed — a line the ring still holds may be outside the kept
+     * tail — and the anchors can only be synthesized once both trims are done,
+     * since trimming from the front of an already-anchored list takes the
+     * anchor with it and leaves every local timestamp beneath it unreadable.
+     * Doing them in the wrong order is silent, so the order is not left to a
+     * caller to remember.
+     *
+     * Prepending is chronological, not a guess: a pinned line is missing from
+     * the kept tail only because newer lines pushed it out — of the ring, or of
+     * the budget — and both drop oldest-first, so every such line is older than
+     * everything in the tail. Both buffers are read under one monitor, so
+     * nothing can land between the two reads and be classified as older than a
+     * line it is in fact newer than.
+     */
+    fun boundedSnapshot(pinnedBudgetChars: Int, recentBudgetChars: Int): List<String> =
+        synchronized(buffer) {
+            val lines = buffer.toList()
+            val trimmed = anchoredTail(lines, recentBudgetChars)
+            // The originals the trim *stands for*, not the trim itself: its
+            // oldest line may have been clamped, and a clamp is a new [Line]
+            // that an identity set would fail to match against the pinned
+            // buffer's copy (Codex, PR #7). [anchoredTail] returns a suffix and
+            // only ever replaces this one element, so the last `trimmed.size`
+            // originals are exactly what it kept.
+            val originals = lines.takeLast(trimmed.size)
+            // A clamped line that is *also* pinned is handed to the pinned
+            // section rather than kept here cut short. Retaining it both ways
+            // writes it twice; retaining only the clamp leaves the persisted
+            // log holding a truncated start-up line while the reserve that
+            // exists to protect exactly that line sits unspent (Codex, PR #7).
+            // The clamp fires only when nothing else fit, so `trimmed` is a
+            // single element and giving it up empties the tail — the recent
+            // budget had one line to spend it on and that line has a better
+            // home.
+            val clamped = trimmed.isNotEmpty() && trimmed.first() !== originals.first()
+            // And only when the reserve will actually keep it. A pinned budget
+            // too small to hold anything makes the yield a deletion: the tail
+            // empties and the pinned trim then returns nothing, so the freshest
+            // event is in neither section (Codex, PR #7). Asking the trim
+            // itself, rather than comparing budgets here, keeps the two from
+            // disagreeing about what fits.
+            val yielded = clamped &&
+                pinnedBuffer.any { it === originals.first() } &&
+                anchoredTail(listOf(originals.first()), pinnedBudgetChars).isNotEmpty()
+            val tail = if (yielded) emptyList() else trimmed
+            // Identity, not equality: two entries a second apart can render to
+            // the same text, and dropping a pinned line because the tail holds
+            // an equal-looking one would lose a line that is genuinely gone
+            // from it. The same instance is in both buffers by construction.
+            val alreadyKept = Collections.newSetFromMap(IdentityHashMap<Line, Boolean>())
+            if (!yielded) alreadyKept += originals
+            val pinned =
+                anchoredTail(pinnedBuffer.filterNot { it in alreadyKept }, pinnedBudgetChars)
+            anchored(pinned + tail)
+        }
+
+    /**
+     * The newest of [lines] whose *rendering* fits [budgetChars] — the lines
+     * themselves and the offset anchors [anchored] will synthesize for them.
+     *
+     * Anchor-aware because the anchors are added last. Counted any other way
+     * they are lines nobody budgeted for, and the persisted file overruns the
+     * ceiling it documents by one marker per offset run — unbounded in
+     * principle, since a device that keeps changing offset writes one per
+     * change (Codex, PR #7). Counting them here is what lets the synthesis stay
+     * after the trim, which is what stops a trim orphaning the timestamps
+     * beneath it.
+     *
+     * Returns a **suffix** of [lines] with only its first element ever
+     * replaced, by [clamp]; [boundedSnapshot] relies on that to recover which
+     * originals the result stands for.
+     *
+     * Conservative across two calls: each assumes it opens an anchor run of its
+     * own, so composing two results can only over-reserve. The alternative —
+     * letting the second know what the first ended on — would trade a few
+     * characters for a coupling between the sections.
+     */
+    private fun anchoredTail(lines: List<Line>, budgetChars: Int): List<Line> {
+        val kept = ArrayDeque<Line>()
+        var used = 0
+        // The offset of the earliest anchor in `kept` so far. Prepending a line
+        // carrying that same offset moves the anchor rather than adding one, so
+        // it costs nothing; any other non-null offset opens a new run.
+        var earliest: ZoneOffset? = null
+        for (line in lines.asReversed()) {
             val offset = line.offset
-            if (offset != null && offset != anchored) {
-                out += "$MARKER_LEVEL timezone offset $offset"
-                anchored = offset
+            val anchor = if (offset != null && offset != earliest) anchorCost(offset) else 0
+            val cost = line.text.length + 1 + anchor
+            if (used + cost > budgetChars) {
+                if (kept.isNotEmpty()) break
+                // The newest line alone overruns: kept clamped rather than
+                // dropped, for [boundedLogTail]'s reason, and with room left for
+                // the anchor it still needs.
+                val room = budgetChars - anchor - TRUNCATION_MARKER.length - 1
+                // Unless the budget cannot hold even that. The marker and the
+                // anchor are fixed costs, so clamping to a negative payload
+                // still emits them and overruns the ceiling the budget *is* —
+                // a section asked for zero characters answering with thirty
+                // (Codex, PR #7). Nothing is the honest answer: there is no
+                // truthful clamped form at this size.
+                if (room < 0) break
+                kept.addFirst(clamp(line, room))
+                break
+            }
+            kept.addFirst(line)
+            used += cost
+            if (offset != null) earliest = offset
+        }
+        return kept.toList()
+    }
+
+    /** What one synthesized anchor costs the budget, newline included. */
+    private fun anchorCost(offset: ZoneOffset): Int = marker(offset).length + 1
+
+    private fun marker(offset: ZoneOffset): String = "$MARKER_LEVEL timezone offset $offset"
+
+    /** Cuts one line down to [room] characters, marking that it was cut. */
+    private fun clamp(line: Line, room: Int): Line =
+        Line(line.text.take(codePointCut(line.text, room)) + TRUNCATION_MARKER, line.offset)
+
+    /**
+     * [lines] rendered oldest-first, with an offset anchor before the oldest
+     * line and before every offset change within them.
+     *
+     * Synthesized here rather than stored, so no amount of eviction or trimming
+     * can leave a run of local timestamps without the offset that reads them.
+     */
+    private fun anchored(lines: Collection<Line>): List<String> {
+        val out = ArrayList<String>(lines.size + 2)
+        var anchor: ZoneOffset? = null
+        for (line in lines) {
+            val offset = line.offset
+            if (offset != null && offset != anchor) {
+                out += marker(offset)
+                anchor = offset
             }
             out += line.text
         }
-        out
+        return out
     }
 
     private fun record(
@@ -457,6 +685,7 @@ open class DebugLog(
         format: String,
         args: Array<out Any?>,
         throwable: Throwable?,
+        pinned: Boolean = false,
     ): Boolean {
         // Before anything else, including the enabled read: a sink recording
         // from inside its own `log()` is not supported, and the entry is
@@ -520,7 +749,7 @@ open class DebugLog(
                 // before this session opened.
                 reportClearFailures(now)
                 reportDroppedFromSink(now)
-                append(entry, now)
+                append(entry, now, pinned)
             }
         }
         return true
@@ -534,9 +763,16 @@ open class DebugLog(
      * lines in the order the buffer took them, and so a retried anchor still
      * precedes the first entry that sink sees.
      */
-    private fun append(entry: String, at: ZonedDateTime?) {
+    private fun append(entry: String, at: ZonedDateTime?, pinned: Boolean = false) {
+        val line = Line(entry, at?.offset)
         if (buffer.size >= maxEntries) buffer.removeFirst()
-        buffer.addLast(Line(entry, at?.offset))
+        buffer.addLast(line)
+        // The same instance, in the same step under the same monitor — see
+        // [pinnedBuffer] for why both of those matter.
+        if (pinned) {
+            if (pinnedBuffer.size >= maxPinnedEntries) pinnedBuffer.removeFirst()
+            pinnedBuffer.addLast(line)
+        }
         deliver(entry, at)
     }
 
@@ -714,8 +950,7 @@ open class DebugLog(
         // strands half a code point at the end of the line (Codex, PR #1). The
         // sibling cut in `LogcatSink` already respects code points; this one was
         // still counting UTF-16 units.
-        val cut = if (entry[maxEntryChars - 1].isHighSurrogate()) maxEntryChars - 1 else maxEntryChars
-        return entry.take(cut) + "…(truncated)"
+        return entry.take(codePointCut(entry, maxEntryChars)) + TRUNCATION_MARKER
     }
 
     /**

@@ -2,6 +2,7 @@ package app.mikelward.androidlog.android
 
 import android.content.Context
 import app.mikelward.androidlog.DebugLog
+import app.mikelward.androidlog.boundedLogTail
 import java.io.File
 import java.lang.ref.WeakReference
 import java.nio.file.Files
@@ -68,6 +69,18 @@ private const val MAX_PREVIOUS_RUNS = 5
 private const val PERSIST_BUDGET_CHARS = 150_000
 
 /**
+ * The slice of [PERSIST_BUDGET_CHARS] held back for the pinned start-up lines,
+ * so they are never the part that gets trimmed.
+ *
+ * The persisted file is a *tail* — newest kept, oldest dropped — which is the
+ * opposite of what those lines need; see [DebugLog.boundedSnapshot], which is
+ * where the reserve is actually applied. Sized for a few dozen short lines and
+ * nothing more: every character here is one the recent log does not get, and
+ * the recent log is what a report is usually read for.
+ */
+private const val PINNED_PERSIST_BUDGET_CHARS = 20_000
+
+/**
  * How long the crash handler waits for the final flush (queued behind any
  * in-flight write) before chaining on. Long enough to land the crash snapshot on
  * healthy storage, short enough that a stalled disk never delays the next
@@ -85,9 +98,6 @@ private const val CRASH_WRITE_TIMEOUT_MS = 250L
  * cannot, because the crash handler flushes explicitly.
  */
 private const val WRITE_DEBOUNCE_MS = 500L
-
-/** Marks a log line cut short, so a reader can tell it was clamped, not written that way. */
-private const val TRUNCATION_MARKER = "…(truncated)"
 
 /**
  * Persists a [DebugLog] to app-private files so it survives the process ending —
@@ -1037,7 +1047,12 @@ class DebugFileSink internal constructor(
         if (mirroringStoodDown && !standDownStillNeeded()) resumeMirroring()
         if (mirroringStoodDown) return
         runCatching {
-            val text = boundedLogTail(log.snapshot(), PERSIST_BUDGET_CHARS).joinToString("\n")
+            // Trimmed, composed and anchored in one call, because those three
+            // steps do not commute — see [DebugLog.boundedSnapshot].
+            val text = log.boundedSnapshot(
+                pinnedBudgetChars = PINNED_PERSIST_BUDGET_CHARS,
+                recentBudgetChars = PERSIST_BUDGET_CHARS - PINNED_PERSIST_BUDGET_CHARS,
+            ).joinToString("\n")
             // Atomic replace: write a temp file, then rename it over the current
             // one. A kill mid-write then leaves the prior *complete* snapshot
             // intact rather than a truncated or empty file — surviving exactly
@@ -1773,32 +1788,3 @@ class DebugFileSink internal constructor(
     }
 }
 
-/**
- * The newest lines of [lines] (oldest-first) whose combined length fits
- * [budgetChars], returned oldest-first — so a report keeps the freshest context
- * inside the Binder limit a share has to fit through.
- *
- * A single newest line that alone exceeds the budget is kept **clamped to it**
- * rather than whole: returning nothing would drop the freshest context entirely,
- * but returning it whole would blow the very ceiling this exists to enforce.
- * Live entries are capped by `DebugLog`'s own per-entry bound so they cannot
- * reach that size, but a cache directory survives app upgrades — a prior-run
- * file written by a build from before that cap can hold an arbitrarily long
- * line, and it is read back unchanged.
- */
-internal fun boundedLogTail(lines: List<String>, budgetChars: Int): List<String> {
-    val kept = ArrayDeque<String>()
-    var used = 0
-    for (line in lines.asReversed()) {
-        val cost = line.length + 1 // + the newline the join adds
-        if (used + cost > budgetChars) {
-            if (kept.isNotEmpty()) break
-            val room = (budgetChars - TRUNCATION_MARKER.length).coerceAtLeast(0)
-            kept.addFirst(line.take(room) + TRUNCATION_MARKER)
-            break
-        }
-        kept.addFirst(line)
-        used += cost
-    }
-    return kept
-}

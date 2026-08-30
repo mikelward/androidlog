@@ -383,29 +383,6 @@ class DebugFileSinkTest {
         assertEquals(2, log.snapshot().count { it.contains("could not list") })
     }
 
-    // ------------------------------------------------------------------ tail
-
-    @Test
-    fun `the tail keeps the newest lines that fit`() {
-        val kept = boundedLogTail(listOf("aaaa", "bbbb", "cccc"), budgetChars = 10)
-        assertEquals(listOf("bbbb", "cccc"), kept)
-    }
-
-    @Test
-    fun `a single line over the budget is clamped rather than dropped`() {
-        // Dropping it would lose the freshest context entirely; keeping it whole
-        // would blow the ceiling this exists to enforce.
-        val kept = boundedLogTail(listOf("x".repeat(100)), budgetChars = 20)
-        assertEquals(1, kept.size)
-        assertTrue(kept.single(), kept.single().endsWith("…(truncated)"))
-        assertTrue(kept.single().length <= 20)
-    }
-
-    @Test
-    fun `an empty log has an empty tail`() {
-        assertEquals(emptyList<String>(), boundedLogTail(emptyList(), budgetChars = 100))
-    }
-
     // ------------------------------------------------- a rotation that fails
 
     @Test
