@@ -107,6 +107,51 @@ growing a second copy for the buffers.
 
 ## Decisions needing review
 
+### Should the apps without a logging preference have one?
+
+**Raised by the maintainer, 2026-08-31**, while deciding that the opt-out
+deletes every saved run (below). Open.
+
+**Snoozemo is the only consumer with an on/off switch** — Settings → *Debug
+log*, "Save snooze details to help fix issues", persisted in `DebugLogStore`
+and the only thing that calls `DebugLog.setRecording`. The other three keep an
+on-device log the user cannot turn off:
+
+- **clothescast** consumes this library and never calls `setRecording` at all;
+  `DiagLog` just calls `start()`. `onCleared` therefore never fires there, and
+  the widened opt-out is inert.
+- **Type Launcher** and **Simmo** are not migrated yet and each construct their
+  own `DebugFileSink` with no switch either.
+
+So the whole opt-out path — the purge, its failure reporting, the startup-off
+route — exists today for one app. That is not itself a problem; it is the
+question of whether the other three *should* be able to reach it.
+
+**What makes it a real decision rather than a copy-paste:**
+
+- **Not the analytics preference, in any of them.** Type Launcher's *Analytics*
+  toggle governs Crashlytics and Performance Monitoring — data that leaves the
+  device without the user doing anything. The on-device log is a separate flow
+  that leaves only when the user shares it. Wiring the purge to Analytics would
+  delete the local evidence a user needs in order to *file* a bug report by
+  hand, triggered by a control that is not about local storage. Two flows, two
+  switches, if there are to be two.
+- **Type Launcher's log feeds a Crashlytics breadcrumb mirror**, gated on that
+  Analytics preference, so its off-device half is already governed. Only the
+  file is not.
+- **A switch is not free.** It is a settings row, a persisted value, a
+  migration, and copy in every locale — against a log that is already bounded
+  by the retention count and never leaves the device unshared.
+- **If a switch is added, it takes Snoozemo's framing**, not "Analytics":
+  it genuinely is only about fixing bugs and it genuinely stays on-device, so
+  the honest label says so. "Help fix bugs" would be advocacy on a consent
+  control for a toggle that also sends usage data; it is the right words for
+  this one.
+
+**Reversible:** adding a switch later costs a settings row and a default; the
+default (on) preserves today's behavior exactly, so nothing an existing install
+has recorded changes.
+
 ### ANSWERED: a per-app redaction setting, default reduced
 
 Raised 2026-08-30 by surveying the third consumer, answered by the maintainer
