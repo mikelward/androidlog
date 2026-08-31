@@ -10,6 +10,23 @@
 # remote environment.
 set -euo pipefail
 
+checkout=$(cd "$(dirname "$0")/../.." && pwd)
+
+# Deepen the clone before anything reads history -- see scripts/unshallow.sh.
+#
+# Above the remote-only guard on purpose, unlike everything below it. The
+# published version's patch level is `git rev-list --count`, and a shallow clone
+# answers that with a confident wrong number and no warning -- so the hazard is
+# a property of the clone, not of the sandbox that made it, and there is nothing
+# to gain by asking where it came from first. On a complete clone it is a no-op
+# that says so.
+#
+# Run directly rather than through `sh` so it needs nothing on PATH, and
+# best-effort: it reports its own failures, and a clone it could not deepen is
+# never a reason to refuse to start the session. The build refuses to publish
+# from a shallow clone regardless, which is where that failure has teeth.
+(cd "$checkout" && "$checkout/scripts/unshallow.sh") || true
+
 # Only provision in the remote (Claude Code on the web) environment.
 if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
   exit 0
