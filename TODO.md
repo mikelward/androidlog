@@ -928,15 +928,19 @@ own `runCatching`, before the snapshot and after the crash marker.
   ever opens the app. A launcher restarts far less often. One number has to
   serve the noisiest consumer, which is what rules out the small end.
 
-- **Decide whether this repository carries a `LICENSE`** (maintainer,
-  2026-08-30: "to-do for later"). It has none today. That is consistent while
-  it is one owner's code shared between one owner's apps — clothescast's
-  Licenses screen omits it for exactly the reason it omits `:core:domain`, and
-  a self-attribution row there would be the odd one out (Codex raised the
-  omission on clothescast#1176; declined there as the wrong place to settle
-  it). But four apps now compile this into shipped APKs, so the absence should
-  be a decision rather than an oversight. Not to be added unilaterally: which
-  license, and whether one is wanted at all, is the maintainer's call.
+- **Done: this repository is Apache-2.0** (maintainer, 2026-08-31). `LICENSE`
+  carries the verbatim text, and the root build declares it into both POMs, so
+  a consumer's attribution screen renders a real row rather than a blank one.
+  Apache-2.0 over MIT for the express patent grant, and over anything copyleft
+  because consumers bundle this into closed-source APKs; it also matches ~92%
+  of what those apps already ship. The maintainer's own apps are not their own
+  licensees, so §4 attribution does not strictly bind them today — the row is
+  there for the first third-party consumer, and for consistency now.
+
+  What remains open is a style question, not a defect: both POMs declare
+  `<name>androidlog logging-core</name>` and the screen honors it, so the rows
+  read as group-and-artifact beside neighbors like `AboutLibraries Core
+  Library`. Renaming is a one-line POM change whenever it is wanted.
 
 - **A prior-run file's own anchor can be trimmed when several are read back.**
   `readPreviousRun` concatenates up to five run files and trims the result to
