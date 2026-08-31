@@ -39,16 +39,20 @@ import kotlin.concurrent.write
  * holds in both directions, because it rests on never calling an unknown
  * `toString()` rather than on where a line is going.
  *
- * **The floor is a boundary, not an ingestion filter, and everything this class
- * returns is on the device's side of it.** [snapshot], [pinnedSnapshot],
- * [boundedSnapshot], every [Sink] and anything persisted from them carry the
- * full rendering: untagged strings as they were passed, and each throwable's
- * message with its type and frames. That is deliberate — this log exists to be
- * read by the person whose device it is — but it makes one thing the caller's
- * job: **nothing here may be forwarded off the device as it stands.** A
- * consumer building a crash-reporter breadcrumb, an automatic report, anything
- * that leaves without the user in the loop, renders it from
- * [formatLogMessage] with `leavingDevice = true` and [offDeviceTrace] instead.
+ * **The floor is a boundary, not an ingestion filter, and this class renders
+ * both sides of it.** [snapshot], [pinnedSnapshot], [boundedSnapshot] and every
+ * sink registered for [Destination.DEVICE] carry the full rendering: untagged
+ * strings as they were passed, and each throwable's message with its type and
+ * frames. That is deliberate — this log exists to be read by the person whose
+ * device it is.
+ *
+ * A sink registered for [Destination.OFF_DEVICE] is handed the reduced
+ * rendering instead, so a crash reporter's breadcrumbs or an automatic report
+ * can be a sink rather than something the consumer assembles itself. What is
+ * still the caller's job is everything **returned** from here: a snapshot is
+ * the device's own text, and forwarding one as it stands is the mistake this
+ * boundary exists to prevent. Build what leaves from a sink, or from
+ * [formatLogMessage] with `leavingDevice = true` and [offDeviceTrace].
  */
 open class DebugLog(
     /** Bounds the buffer; old entries fall off the front. */
@@ -111,6 +115,15 @@ open class DebugLog(
          * would push out are the part nothing else can recover.
          */
         private const val MAX_MESSAGE_CHARS = 300
+
+        /**
+         * Stands in for an entry whose off-device rendering threw.
+         *
+         * Carries no argument of the app's, by construction — that is the
+         * point, since the alternative on this path is the full rendering,
+         * which may not cross the boundary.
+         */
+        private const val OFF_DEVICE_RENDER_FAILED = "(this entry could not be rendered for off-device use)"
 
         private val TIMESTAMP: DateTimeFormatter =
             DateTimeFormatter.ofPattern("MM-dd HH:mm:ss.SSS", Locale.US)
@@ -259,7 +272,24 @@ open class DebugLog(
      * timestamps with no offset to read them against (Codex, PR #9). So a
      * later entry that outranks the anchor gets one of its own.
      */
-    private class Registration {
+    /**
+     * How many registrations are [Destination.OFF_DEVICE], as a volatile read
+     * for [record] to consult **before** it takes the buffer's monitor.
+     *
+     * Written only under that monitor, by [addSink] / [removeSink] /
+     * [clearSinks], so it never disagrees with [sinkAnchors] for a reader that
+     * holds it. Read without it, which is the whole point: the reduced
+     * rendering walks the app's own arguments, and doing that under the
+     * monitor is a lock inversion — a recorder would hold the monitor while
+     * waiting on a collection's lock, and a thread holding that collection
+     * while calling [event] would wait on the monitor (Codex, PR #26). The
+     * device's rendering has always happened outside; this keeps the other one
+     * there too.
+     */
+    @Volatile
+    private var offDeviceSinks: Int = 0
+
+    private class Registration(val destination: Destination) {
         var offset: ZoneOffset? = null
 
         /** Rank of the level the current [offset]'s anchor was last sent at. */
@@ -267,25 +297,75 @@ open class DebugLog(
     }
 
     /**
+     * Which of the two renderings a sink is given.
+     *
+     * The library's floor is a **boundary**: the device's own copy of a log is
+     * whole, and the reduction applies to what leaves. There are exactly two
+     * sides to that boundary, so there are exactly two values here, and a sink
+     * declares which side it is on rather than deciding for itself what its
+     * text should say.
+     *
+     * That the set is closed is the point, not an incidental detail. A sink
+     * that could describe its destination freely would be choosing its own
+     * rendering, which is what the floor forbids; a sink that picks one of two
+     * fixed classes is answering a question this class then acts on.
+     */
+    enum class Destination {
+        /**
+         * Stays on this device: the persisted file, logcat, a screen, a
+         * report the user opens and reads before choosing where to send it.
+         *
+         * Gets the full rendering — every argument as written and each
+         * throwable's message with it — because that is what makes a log worth
+         * reading, and because nothing here reaches anyone without the user
+         * putting it there.
+         */
+        DEVICE,
+
+        /**
+         * Leaves without the user in the loop for each item: a crash
+         * reporter's breadcrumbs, an analytics event, an automatic report.
+         *
+         * Gets the reduced rendering, in which an untagged `String` and a
+         * [sensitive] value both render as the placeholder and a throwable
+         * keeps its types and frames but no message from any link. Widening a
+         * single value for this destination is [safe]'s job, at the call site,
+         * where the person who knows what the value is can say so.
+         *
+         * **This is not consent, and it is not a gate.** Whether the app may
+         * send anything at all is the app's decision — a settings toggle, a
+         * Play Data Safety declaration — and it belongs in the sink, which can
+         * simply do nothing when the answer is no. This enum only decides what
+         * the text says if it goes.
+         */
+        OFF_DEVICE,
+    }
+
+    /**
      * Where each entry is mirrored once it is safely in the buffer — the
      * persisted file, logcat, anything the app adds. Each call is isolated, so
      * one sink's failure can't reach another or the caller.
      *
-     * **A sink is an on-device destination, and that is a contract rather than
-     * a convention** (Codex, PR #24). What arrives here is the rendering this
-     * device keeps: every argument in full and each throwable's message with
-     * it. So a sink may write to disk, to logcat, to a screen, to anything the
-     * user can reach — and may not forward to a crash reporter, an analytics
-     * service, or any other automatic channel, because the text it is handed
-     * is not the form that may leave.
+     * **A sink says which kind of destination it is, and this class decides
+     * what that gets** — see [Destination] and [addSink]. A
+     * [Destination.DEVICE] sink is handed the rendering this device keeps:
+     * every argument in full and each throwable's message with it. A
+     * [Destination.OFF_DEVICE] sink is handed the reduced rendering, the same
+     * one [formatLogMessage] produces with `leavingDevice = true`.
      *
-     * Nothing here can enforce that, and nothing here should try: an app
-     * building something that leaves renders it itself, from
-     * [formatLogMessage] with `leavingDevice = true` and [offDeviceTrace], as
-     * its own call rather than as a sink. Handing a sink structured data so it
-     * could re-render for its own destination is the per-sink rendering the
-     * floor forbids — it puts a value in the process in two forms and makes
-     * the reduction depend on each sink remembering to ask.
+     * An earlier version of this contract said the on-device form was all a
+     * sink ever got, that forwarding it to a crash reporter was forbidden, and
+     * that nothing here could enforce that (Codex, PR #24). The first two were
+     * right and the third was the problem: a rule a class states and cannot
+     * check is one a call site breaks silently. Declaring the destination is
+     * what turns it into something the library applies rather than warns about.
+     *
+     * **This is not the per-sink rendering the floor forbids.** That rule was
+     * against a sink *choosing* how a value is written, which puts the
+     * reduction at the mercy of each one remembering to ask. Here a sink says
+     * what it **is**, not how to render; there are exactly two destination
+     * classes and a sink cannot invent a third; and which rendering each gets
+     * is decided once, here.
      *
      * **A sink enqueues; it does not write inline.** Delivery happens under the
      * buffer's monitor, so a sink that blocks here blocks every other recorder,
@@ -477,21 +557,67 @@ open class DebugLog(
         get() = session.recording
 
     /**
-     * Registers a sink. It carries no anchor yet, so the next entry announces
-     * the offset to it before that entry — no special case, and nothing to
-     * retry separately if that announcement fails.
+     * Registers a sink for [destination], which decides which of the two
+     * renderings it is given — see [Destination]. Defaulted to
+     * [Destination.DEVICE], so every existing registration is unchanged and a
+     * sink only reaches the reduced form by asking for it.
+     *
+     * It carries no anchor yet, so the next entry announces the offset to it
+     * before that entry — no special case, and nothing to retry separately if
+     * that announcement fails.
+     *
+     * Registering the same sink twice keeps the first registration, its
+     * destination included: `putIfAbsent` is what makes a re-`addSink` from
+     * inside a callback harmless, and silently re-pointing a live sink at the
+     * other destination would be the more surprising of the two behaviors.
+     * [removeSink] then [addSink] moves one deliberately.
+     */
+    fun addSink(sink: Sink, destination: Destination) {
+        synchronized(buffer) {
+            sinkAnchors.putIfAbsent(sink, Registration(destination))
+            recountOffDeviceSinks()
+        }
+    }
+
+    /**
+     * Registers an on-device sink — [addSink] with [Destination.DEVICE].
+     *
+     * A separate overload rather than a default argument, and that is forced
+     * rather than stylistic: a defaulted second parameter makes `destination`
+     * the last one, so Kotlin binds a trailing lambda to *it* and every
+     * `addSink { ... }` in every consumer stops compiling. Reordering to put
+     * the sink last breaks the other form, `addSink(sink)` with a named
+     * variable, since a positional argument cannot skip a defaulted parameter.
+     * Two overloads keep both, which is what "every existing call site is
+     * unchanged" has to mean.
      */
     fun addSink(sink: Sink) {
-        synchronized(buffer) { sinkAnchors.putIfAbsent(sink, Registration()) }
+        addSink(sink, Destination.DEVICE)
     }
 
     fun removeSink(sink: Sink) {
-        synchronized(buffer) { sinkAnchors.remove(sink) }
+        synchronized(buffer) {
+            sinkAnchors.remove(sink)
+            recountOffDeviceSinks()
+        }
     }
 
     /** Detaches every sink. For a test tearing down, and for nothing else. */
     fun clearSinks() {
-        synchronized(buffer) { sinkAnchors.clear() }
+        synchronized(buffer) {
+            sinkAnchors.clear()
+            recountOffDeviceSinks()
+        }
+    }
+
+    /**
+     * Recomputes [offDeviceSinks] from the registry. Counted rather than
+     * incremented, because `putIfAbsent` may or may not have inserted and
+     * `remove` may or may not have found anything — a delta would drift.
+     * Called only under the buffer's monitor.
+     */
+    private fun recountOffDeviceSinks() {
+        offDeviceSinks = sinkAnchors.values.count { it.destination == Destination.OFF_DEVICE }
     }
 
     /**
@@ -505,11 +631,13 @@ open class DebugLog(
      *
      * **What is recorded here is the device's own copy, and it is whole.**
      * Every argument renders as it was passed, so the buffer, the log screen,
-     * every sink and anything persisted from them read the same full text. The
-     * floor applies at the boundary instead: an argument
-     * [logArgumentMayLeaveDevice] withholds renders as [REDACTED_PLACEHOLDER]
-     * in [formatLogMessage] with `leavingDevice = true`, which is what a
-     * caller building something that *leaves* renders from.
+     * every [Destination.DEVICE] sink and anything persisted from them read
+     * the same full text. The floor applies at the boundary instead: an
+     * argument [logArgumentMayLeaveDevice] withholds renders as
+     * [REDACTED_PLACEHOLDER] on the far side of it — in a
+     * [Destination.OFF_DEVICE] sink's copy, and in [formatLogMessage] with
+     * `leavingDevice = true`, which is what a caller building something that
+     * *leaves* renders from itself.
      *
      * So `safe(...)` is not what keeps a value here — nothing withholds it
      * here. It is what carries a value off the device as well, for a call site
@@ -853,11 +981,13 @@ open class DebugLog(
         // taken, so rendering never holds it.
         //
         // **Rendered for this device, which is where this log lives.** The
-        // buffer, `snapshot()`, every sink and the persisted file are all on
-        // the device, and nothing among them leaves it without the user
-        // opening a report and consenting. So they carry the full rendering:
-        // the strings that make a log worth reading -- a component, a label,
-        // a package -- and a throwable's message with it.
+        // buffer, `snapshot()`, every on-device sink and the persisted file
+        // are all on this side, and nothing among them leaves without the
+        // user opening a report and consenting. So they carry the full
+        // rendering: the strings that make a log worth reading -- a component,
+        // a label, a package -- and a throwable's message with it. An
+        // off-device sink is delivered to from the same entry but gets the
+        // reduced form, rendered separately in `deliver`.
         //
         // This reverses *the floor is applied at ingestion, so there is one
         // rendering* (maintainer, 2026-08-31). That rule reduced the buffer
@@ -876,6 +1006,42 @@ open class DebugLog(
         val entry = runCatching {
             render(now, level, formatLogMessage(format, args, leavingDevice = false), throwable)
         }.getOrElse { return false }
+        // The other side of the boundary, rendered here or not at all.
+        //
+        // **Here, specifically: outside the buffer's monitor**, beside the
+        // device's own rendering, because this walks the app's arguments and
+        // doing that under the monitor inverts a lock order (Codex, PR #26) --
+        // a recorder would hold the monitor while waiting on a collection's
+        // lock, and a thread holding that collection while calling `event()`
+        // would wait on the monitor. It is also the same rule `Sink` states
+        // for a sink: work under this monitor blocks every other recorder.
+        //
+        // Rendered only when an off-device sink is actually registered. Most
+        // installs register none, and an entry nobody reads should not cost a
+        // second pass over its arguments on a latency-critical path.
+        //
+        // From the *original* arguments rather than anything derived from
+        // `entry`: text already rendered cannot be un-rendered, which is why
+        // this is built here rather than computed from what the buffer holds.
+        //
+        // `null` when no off-device sink was registered at this moment. A sink
+        // that registers between here and the fan-out gets the notice for this
+        // one entry rather than a rendering taken under the monitor -- the same
+        // shape as the anchor it is also still waiting for, and it fails toward
+        // saying less.
+        val offDevice: String? = if (offDeviceSinks == 0) {
+            null
+        } else {
+            runCatching {
+                render(
+                    now,
+                    level,
+                    formatLogMessage(format, args, leavingDevice = true),
+                    throwable,
+                    leavingDevice = true,
+                )
+            }.getOrNull()
+        }
         gate.read {
             // Still the same session? Anything else — a disable, a re-enable,
             // or both while this entry was rendering — means it began in a
@@ -899,7 +1065,7 @@ open class DebugLog(
                 // before this session opened.
                 reportClearFailures(now)
                 reportDroppedFromSink(now)
-                append(entry, now, level, pinned)
+                append(entry, now, level, pinned, offDevice)
             }
         }
         return true
@@ -913,7 +1079,27 @@ open class DebugLog(
      * lines in the order the buffer took them, and so a retried anchor still
      * precedes the first entry that sink sees.
      */
-    private fun append(entry: String, at: ZonedDateTime?, level: Char, pinned: Boolean = false) {
+    private fun append(
+        entry: String,
+        at: ZonedDateTime?,
+        level: Char,
+        pinned: Boolean = false,
+        // Defaulted to the entry itself, which is correct **only** for an
+        // entry that carries no throwable and no argument of the app's — the
+        // notices this class synthesizes over counts and offsets, where the
+        // two renderings really are the same string.
+        //
+        // A caller passing a throwable must pass this too. That is not advice:
+        // `render` writes each link's message on the device's side, and a
+        // message is third-party text. The clear-failure notice below was
+        // exactly this mistake — library-authored words wrapped around a
+        // sink's own exception (Codex, PR #26).
+        //
+        // Already rendered rather than a lambda, so nothing renders under the
+        // buffer's monitor — see the call in [record]. `null` means an
+        // off-device sink gets the notice instead.
+        offDevice: String? = entry,
+    ) {
         val line = Line(entry, at?.offset)
         if (buffer.size >= maxEntries) buffer.removeFirst()
         buffer.addLast(line)
@@ -923,8 +1109,9 @@ open class DebugLog(
             if (pinnedBuffer.size >= maxPinnedEntries) pinnedBuffer.removeFirst()
             pinnedBuffer.addLast(line)
         }
-        deliver(entry, at, level)
+        deliver(entry, at, level, offDevice)
     }
+
 
     /**
      * Writes one line for the entries dropped since the last report, if any.
@@ -1029,23 +1216,45 @@ open class DebugLog(
         val failures = clearFailures
         if (failures == 0) return
         val cause = clearFailure
-        val notice = runCatching {
-            val sinks = if (failures == 1) "sink" else "sinks"
-            render(
-                at,
-                'W',
-                "$failures $sinks failed to clear a saved copy when recording " +
-                    "was turned off",
-                cause,
-            )
-        }.getOrNull() ?: return
+        val sinks = if (failures == 1) "sink" else "sinks"
+        val message = "$failures $sinks failed to clear a saved copy when recording " +
+            "was turned off"
+        val notice = runCatching { render(at, 'W', message, cause) }.getOrNull() ?: return
         clearFailures = 0
         clearFailure = null
-        append(notice, at, 'W')
+        // The one notice this class writes that carries a throwable, and so the
+        // one that needs a reduced form of its own (Codex, PR #26). The message
+        // is this library's own words over a count, but [cause] is a *sink's*
+        // exception, and a third party's message can quote anything it was
+        // given. Left on the default, the full rendering — every link's
+        // message included — went to an off-device sink.
+        append(
+            notice,
+            at,
+            'W',
+            offDevice = runCatching {
+                render(at, 'W', message, cause, leavingDevice = true)
+            }.getOrNull(),
+        )
     }
 
-    private fun deliver(entry: String, at: ZonedDateTime?, level: Char) {
+    private fun deliver(
+        entry: String,
+        at: ZonedDateTime?,
+        level: Char,
+        offDevice: String? = entry,
+    ) {
         val offset = at?.offset
+        // Already rendered by the caller, outside this monitor. `null` covers
+        // both a rendering that threw and an off-device sink that registered
+        // after the caller decided none was listening.
+        //
+        // Never `entry` as a fallback: that is the full form, and substituting
+        // it here would put it on the far side of the boundary — the one
+        // mistake this whole mechanism exists to make unavailable. A fixed
+        // notice instead, so the sink sees that something happened at this
+        // point in the log and the loss is visible rather than silent.
+        val reduced = offDevice ?: "$level $OFF_DEVICE_RENDER_FAILED"
         // Cleared in a `finally`: a sink is isolated by `runCatching` below, so
         // nothing here should escape, but leaving this set would silently drop
         // every later entry on this thread.
@@ -1092,7 +1301,11 @@ open class DebugLog(
                         registration.anchoredRank = rank
                     }
                 }
-                runCatching { sink.log(entry, level) }
+                // The rendering this sink's destination may have. Decided
+                // here, from what it registered as, rather than by the sink
+                // itself.
+                val text = if (registration.destination == Destination.DEVICE) entry else reduced
+                runCatching { sink.log(text, level) }
             }
         } finally {
             deliveringThread = null
@@ -1104,13 +1317,20 @@ open class DebugLog(
         level: Char,
         message: String,
         throwable: Throwable?,
+        // Applies to the throwable only. [message] arrives already rendered
+        // for its side of the boundary, and the caller passes the two
+        // consistently — a full message with a full trace, or a reduced one
+        // with types and frames alone. Splitting them would produce a line
+        // that is reduced in one half and not the other, which is neither
+        // rendering.
+        leavingDevice: Boolean = false,
     ): String {
         val timestamp = at?.let { runCatching { TIMESTAMP.format(it) }.getOrNull() }
             ?: "(no timestamp)"
         val entry = if (throwable == null) {
             "$timestamp $level $message"
         } else {
-            "$timestamp $level $message\n${throwable.typesAndFrames(leavingDevice = false).trimEnd()}"
+            "$timestamp $level $message\n${throwable.typesAndFrames(leavingDevice).trimEnd()}"
         }
         if (entry.length <= maxEntryChars) return entry
         // Stepped back off a high surrogate, so the cut never splits a pair and

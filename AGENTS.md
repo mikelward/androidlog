@@ -58,13 +58,13 @@ has stopped biting.
   ICCID, a coordinate, a whole SSID is reduced by the app *before* this code
   sees it, so what is rendered in full is already the app's reduced form. This
   rule governs the tier below that. And the split is by destination alone — a
-  rendering is never chosen per sink. **A sink is therefore an on-device
-  destination by contract**: it is handed the device's own text, so forwarding
-  one to a crash reporter or any automatic channel leaks by construction, and
-  handing a sink structured data so it could re-render is the per-sink
-  rendering this forbids. What leaves is built by the app, from
-  `formatLogMessage(..., leavingDevice = true)` and `offDeviceTrace`, as its
-  own call.
+  rendering is never chosen per sink. **A sink declares which destination class
+  it is** — `Destination.DEVICE` or `OFF_DEVICE`, PR #26 — and is handed that
+  side's rendering. That *is* the split, applied; what it forbids is a sink
+  choosing **how** a value is written, or being handed structured data so it
+  can re-render for itself. There are two classes and a sink cannot invent a
+  third. An app may still build what leaves itself, from
+  `formatLogMessage(..., leavingDevice = true)` and `offDeviceTrace`.
 - **No `getMessage()` from a throwable in anything leaving the device.** A
   platform exception quotes what it was given, and on the paths this log exists
   for that is exactly what may not leave: the number that was dialed, the

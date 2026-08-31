@@ -152,7 +152,7 @@ class DebugLogTest {
     fun `a removed sink stops receiving entries`() {
         val log = log()
         val seen = mutableListOf<String>()
-        val sink = DebugLog.Sink { seen += it }
+        val sink = DebugLog.Sink { if (!isMarker(it)) seen += it }
         log.addSink(sink)
         log.event("first")
         log.removeSink(sink)
@@ -1418,6 +1418,258 @@ class DebugLogTest {
                 leavingDevice = true,
             ),
         )
+    }
+
+
+    /**
+     * A one-element list that counts how many times its element was read.
+     *
+     * A collection rather than a plain object with a counting `toString`,
+     * because the formatter never calls `toString` on an unknown type -- it
+     * renders the class name, which is the structural protection that keeps a
+     * `data class` from printing its fields. Element reads are a path the
+     * renderer really does walk, once per rendering, so they are what makes
+     * "was this rendered again?" observable at all.
+     */
+    private class CountingList(
+        private val value: String = "value",
+        /** Read number to throw from, 1-based. Zero never throws. */
+        private val throwFromRead: Int = 0,
+    ) : AbstractList<String>() {
+        var reads = 0
+            private set
+
+        override val size: Int get() = 1
+
+        override fun get(index: Int): String {
+            reads++
+            if (throwFromRead > 0 && reads >= throwFromRead) {
+                throw IllegalStateException(value)
+            }
+            return value
+        }
+    }
+
+    // ---------------------------------------------------- sink destinations
+
+    @Test
+    fun `a device sink gets the full rendering and an off-device sink the reduced one`() {
+        // The boundary, as a registration rather than a rule a call site has
+        // to remember. One entry, two sinks, two renderings -- and the sink
+        // chose neither of them, it only said which side it is on.
+        val log = log()
+        val onDevice = mutableListOf<String>()
+        val offDevice = mutableListOf<String>()
+        log.addSink { if (!isMarker(it)) onDevice += it }
+        log.addSink({ if (!isMarker(it)) offDevice += it }, DebugLog.Destination.OFF_DEVICE)
+
+        log.event("joined %s at %s", "ExampleWifi", 3)
+
+        assertTrue(onDevice.toString(), onDevice.single().endsWith(" D joined ExampleWifi at 3"))
+        assertTrue(offDevice.toString(), offDevice.single().endsWith(" D joined \u2022\u2022\u2022 at 3"))
+    }
+
+    @Test
+    fun `a safe value crosses to an off-device sink and a sensitive one does not`() {
+        // The two tags, read through the registration rather than through
+        // `formatLogMessage` directly -- the path a consumer actually uses.
+        val log = log()
+        val offDevice = mutableListOf<String>()
+        log.addSink({ if (!isMarker(it)) offDevice += it }, DebugLog.Destination.OFF_DEVICE)
+
+        log.event("%s and %s", safe("already-reduced"), sensitive("secret"))
+
+        val line = offDevice.single()
+        assertTrue(line, line.endsWith(" D already-reduced and \u2022\u2022\u2022"))
+    }
+
+    @Test
+    fun `an off-device sink gets a throwable's types and frames but no message`() {
+        // The half a crash reporter's breadcrumb is read for, without the half
+        // that can quote what it was given.
+        val log = log()
+        val offDevice = mutableListOf<String>()
+        val onDevice = mutableListOf<String>()
+        log.addSink { if (!isMarker(it)) onDevice += it }
+        log.addSink({ if (!isMarker(it)) offDevice += it }, DebugLog.Destination.OFF_DEVICE)
+
+        log.failure(IllegalStateException("ssid=ExampleWifi"), "lookup failed")
+
+        assertTrue(onDevice.toString(), onDevice.single().contains("ssid=ExampleWifi"))
+        val reduced = offDevice.single()
+        assertFalse(reduced, reduced.contains("ssid=ExampleWifi"))
+        assertTrue(reduced, reduced.contains("java.lang.IllegalStateException"))
+    }
+
+    @Test
+    fun `the reduced rendering is not produced when no off-device sink is registered`() {
+        // Laziness, asserted through the arguments rather than by timing: an
+        // argument's `toString` is called once for the device's rendering and
+        // not again for a reduction nobody asked for.
+        val log = log()
+        val counting = CountingList()
+        log.addSink { }
+
+        // Vouched, so the off-device rendering would actually walk it -- an
+        // unvouched value short-circuits to the placeholder without being
+        // rendered at all, which the test below pins separately and which
+        // would make this probe measure nothing.
+        log.event("saw %s", safe(counting))
+
+        assertEquals(1, counting.reads)
+    }
+
+    @Test
+    fun `the reduced rendering is produced once however many off-device sinks are registered`() {
+        // Two off-device sinks share one reduction. Without the memo each
+        // would pay for its own pass over the arguments, on the fan-out path,
+        // under the buffer's monitor.
+        val log = log()
+        val counting = CountingList()
+        log.addSink({ }, DebugLog.Destination.OFF_DEVICE)
+        log.addSink({ }, DebugLog.Destination.OFF_DEVICE)
+
+        log.event("saw %s", safe(counting))
+
+        // One for the device's rendering, one shared by both off-device sinks.
+        assertEquals(2, counting.reads)
+    }
+
+    @Test
+    fun `a sink registered without a destination stays on the device`() {
+        // The default is what keeps every existing registration -- and every
+        // existing consumer -- unchanged. A sink reaches the reduced form only
+        // by asking for it.
+        val log = log()
+        val seen = mutableListOf<String>()
+        log.addSink { if (!isMarker(it)) seen += it }
+
+        log.event("joined %s", "ExampleWifi")
+
+        assertTrue(seen.toString(), seen.single().endsWith(" D joined ExampleWifi"))
+    }
+
+    @Test
+    fun `re-registering a live sink keeps its original destination`() {
+        // `putIfAbsent` decides this, and it is the safer of the two: a
+        // re-`addSink` from inside a callback is harmless, and nothing
+        // silently re-points a live sink across the boundary.
+        val log = log()
+        val seen = mutableListOf<String>()
+        val sink = DebugLog.Sink { if (!isMarker(it)) seen += it }
+        log.addSink(sink, DebugLog.Destination.OFF_DEVICE)
+        log.addSink(sink, DebugLog.Destination.DEVICE)
+
+        log.event("joined %s", "ExampleWifi")
+
+        assertTrue(seen.toString(), seen.single().endsWith(" D joined \u2022\u2022\u2022"))
+    }
+
+    @Test
+    fun `removing and re-adding a sink moves it across the boundary`() {
+        // The deliberate way to change a destination, and the counterpart to
+        // the test above: the rule is "re-adding does not move it", not "a
+        // destination can never change".
+        val log = log()
+        val seen = mutableListOf<String>()
+        val sink = DebugLog.Sink { if (!isMarker(it)) seen += it }
+        log.addSink(sink, DebugLog.Destination.OFF_DEVICE)
+        log.removeSink(sink)
+        log.addSink(sink, DebugLog.Destination.DEVICE)
+
+        log.event("joined %s", "ExampleWifi")
+
+        assertTrue(seen.toString(), seen.single().endsWith(" D joined ExampleWifi"))
+    }
+
+    @Test
+    fun `an off-device sink gets a notice rather than the full line when the reduction throws`() {
+        // The one substitution that must never happen here is the device's own
+        // rendering: it is the full form, and this is the far side of the
+        // boundary. A fixed notice instead, so the loss is visible.
+        val log = log()
+        val offDevice = mutableListOf<String>()
+        log.addSink({ if (!isMarker(it)) offDevice += it }, DebugLog.Destination.OFF_DEVICE)
+        // Throws only on the second rendering -- the device's copy is built
+        // first and must still be intact.
+        val hostile = CountingList(value = "ExampleWifi", throwFromRead = 2)
+
+        // Vouched, so the reduction renders it rather than replacing it
+        // unread -- otherwise there is no second rendering to fail.
+        log.event("joined %s", safe(hostile))
+
+        val line = offDevice.single()
+        assertFalse(line, line.contains("ExampleWifi"))
+        assertTrue(line, line.contains("could not be rendered for off-device use"))
+        // The device kept its own copy regardless.
+        assertTrue(log.events().single().contains("ExampleWifi"))
+    }
+
+    @Test
+    fun `an unvouched value is not rendered at all for an off-device sink`() {
+        // The reduction is structural rather than a pass over rendered text:
+        // a value the type rule withholds becomes the placeholder without
+        // being rendered, so a hostile or expensive `toString` on a value that
+        // may not leave is never reached on the way out. Discovered while
+        // writing the laziness probes above, which is why it is pinned here.
+        val log = log()
+        val counting = CountingList()
+        log.addSink({ }, DebugLog.Destination.OFF_DEVICE)
+
+        log.event("saw %s", counting)
+
+        // Once, for the device's own copy, and not again for the reduction.
+        assertEquals(1, counting.reads)
+    }
+
+    @Test
+    fun `a clear-failure notice reaches an off-device sink without the cause's message`() {
+        // The one notice this class writes that carries a throwable, and the
+        // one place the "library-authored notices are the same on both sides"
+        // shortcut was wrong: the words are this library's, but the cause is a
+        // *sink's* exception, and a third party's message can quote anything
+        // (Codex, PR #26). Fails before the fix -- the full rendering went out
+        // verbatim.
+        val log = log()
+        val offDevice = mutableListOf<String>()
+        log.addSink(object : DebugLog.Sink {
+            override fun log(line: String) = Unit
+            override fun onCleared(): Unit = throw IllegalStateException("ssid=ExampleWifi")
+        })
+        log.addSink({ if (!isMarker(it)) offDevice += it }, DebugLog.Destination.OFF_DEVICE)
+
+        log.setRecording(false)
+        log.setRecording(true)
+        log.event("after")
+
+        val notice = offDevice.single { "failed to clear" in it }
+        assertFalse(notice, notice.contains("ssid=ExampleWifi"))
+        // Still worth reading: the count and the type survive, which is what
+        // the notice is for.
+        assertTrue(notice, notice.contains("1 sink failed to clear"))
+        assertTrue(notice, notice.contains("java.lang.IllegalStateException"))
+        // And the device's own copy keeps the message, as it should.
+        assertTrue(log.events().single { "failed to clear" in it }.contains("ssid=ExampleWifi"))
+    }
+
+    @Test
+    fun `removing the last off-device sink stops the reduction being rendered`() {
+        // The decision to render is a lock-free count read before the buffer's
+        // monitor is taken, so it has to be maintained on the way down as well
+        // as up -- a count that only ever grows would keep paying for a second
+        // pass over every entry's arguments forever.
+        val log = log()
+        val sink = DebugLog.Sink { }
+        log.addSink(sink, DebugLog.Destination.OFF_DEVICE)
+        val whileRegistered = CountingList()
+        log.event("saw %s", safe(whileRegistered))
+        assertEquals("device rendering plus the reduction", 2, whileRegistered.reads)
+
+        log.removeSink(sink)
+
+        val afterRemoval = CountingList()
+        log.event("saw %s", safe(afterRemoval))
+        assertEquals("device rendering only", 1, afterRemoval.reads)
     }
 
     // --------------------------------------------------------------- pinning
