@@ -544,8 +544,51 @@ class DebugFileSink internal constructor(
         // the cold-start path and must not block on disk. FIFO ordering means this
         // runs before this run's writes and the crash flush, so the prior run is
         // renamed aside before anything can clobber it.
+        // Read here as well as on the worker, and either answer being "off" is
+        // enough to purge. The task is enqueued, so recording can be turned back
+        // on before it runs -- and then a worker-only read sees the newer `true`
+        // and rotates the pre-opt-out files into the shareable set instead of
+        // deleting them. There is no `onCleared` to catch that afterwards: the
+        // sink is normally registered after `start()`, so the transition that
+        // would have purged them has already been and gone (Codex, PR #23).
+        // Purging on the call-site read costs nothing in the other direction --
+        // the files it deletes were opted out, and a run enabled in that window
+        // starts from empty, which is what a re-enable gets anyway.
+        val offWhenStarted = !log.isRecording
         runCatching {
             worker.execute {
+                // A start that finds recording off purges instead of rotating.
+                //
+                // `onCleared` *enqueues* its purge, so a process killed inside
+                // that window leaves `androidlog.log` on disk with the setting
+                // already reading off -- and the rotation below would then move
+                // that file into the shareable prior-run set, which is the exact
+                // leak the purge exists to close (`TODO.md`, *The opt-out purge
+                // is not durable across a process death*). That gap was left
+                // open because closing it seemed to need a durable record of the
+                // request, which is itself a write and so has the same gap one
+                // level down. It does not: the *setting* is already durable, so
+                // re-running the purge whenever a start finds it off closes the
+                // window with no second file to keep in step.
+                //
+                // Both reads, never one: the worker's is the freshest answer,
+                // and the call site's is the one an opt-out already made. Taken
+                // from `DebugLog` rather than as a parameter either way, so it
+                // costs no API change for the apps that never call
+                // `setRecording` at all, where both read on and the rotation is
+                // untouched.
+                //
+                // Nothing stands down from mirroring on this path when the
+                // purge succeeds, deliberately: it has just removed `current`,
+                // so a re-enable later in this process has no previous run to
+                // write over. A surviving crash marker is the exception, and
+                // `purgeOnWorker` stands down for it there.
+                if (offWhenStarted || !log.isRecording) {
+                    // Consumes the crash marker and recomputes the banner as
+                    // well as deleting the files; see `purgeOnWorker`.
+                    purgeOnWorker()
+                    return@execute
+                }
                 // Set only once `debug.log` is known safe to write over: either
                 // it was moved aside (or was not there) *and* the marker that
                 // would classify it is gone. Anything thrown before that leaves
@@ -705,10 +748,23 @@ class DebugFileSink internal constructor(
             // in `debug.log` (Codex, PR #4). Safe to latch from here because it
             // is one-way and toward the safe answer, and because the rotation
             // that would have cleared it never ran.
+            // Named for what the refused task was going to do. A start that
+            // found recording off was going to purge, and calling that a
+            // rotation would send a reader looking for the wrong thing.
+            val wasPurge = offWhenStarted || !log.isRecording
+            val what = if (wasPurge) "startup purge" else "startup rotation"
             standDownFromMirroring(
-                "The startup rotation could not be scheduled, so this run is not being saved",
+                "The $what could not be scheduled, so this run is not being saved",
             )
-            log.failure(it, "The startup rotation could not be scheduled")
+            // A refused purge is an opt-out that did not happen: the saved runs
+            // are still there while nothing else will ever say so. `log.failure`
+            // below cannot carry it -- recording is off, which is exactly the
+            // state that made this a purge -- so the caller is told directly,
+            // the way `onCleared` reports its own refused enqueue (Codex, PR
+            // #23). Without this the outcome read as a successful purge over
+            // files that had not moved.
+            if (wasPurge) recordStorageFailureOffWorker(optOutPurgeFailed = true)
+            log.failure(it, "The $what could not be scheduled")
         }
         if (installCrashHandler) installCrashHandler()
     }
@@ -973,21 +1029,23 @@ class DebugFileSink internal constructor(
      * the user opted out, kept by the one component that outlives the buffer
      * (Codex, PR #4).
      *
-     * **Only this run's file.** The prior-run files are not touched: they were
-     * kept across a rotation, one of them may be the crash the user is part way
-     * through sending, and turning recording off now is not an instruction to
-     * destroy a report already offered. This mirrors what the core itself does —
-     * it clears the buffer, not the log's whole history on disk.
+     * **Everything, not just this run's file.** `current`, `temp`, and every
+     * rotated prior run go, along with the crash marker and the banner derived
+     * from them. This used to keep the prior-run set — one of those files may be
+     * the crash the user is part way through sending, and destroying it was read
+     * as going beyond what "off" asked for. Reversed by the maintainer
+     * (2026-08-31): the consuming apps' own copy already promised deletion, so
+     * leaving the files made the control report success it had not achieved.
+     * Losing an unsent crash is the user's own call at the moment they make it.
      *
      * Enqueue-only, like [log], since this runs under the buffer's monitor — and
      * that leaves a window: a process killed between `setRecording(false)`
-     * returning and this task draining leaves the file, and the next start
-     * rotates it into the prior-run set where a report can still pick it up
-     * (Codex, PR #4). The window is one in-flight file operation wide, since the
-     * task is enqueued with no delay and so runs ahead of any debounced write.
-     * Closing it properly needs a durable record of the request, which has the
-     * same problem, or a synchronous write here, which would block every
-     * recorder under this monitor. It is written up in `TODO.md`.
+     * returning and this task draining leaves the file behind (Codex, PR #4).
+     * The window is one in-flight file operation wide, since the task is
+     * enqueued with no delay and so runs ahead of any debounced write, and it
+     * now closes at the next start rather than staying open: [start] purges
+     * instead of rotating when it finds recording off, so the persisted setting
+     * serves as the durable record that closing it was thought to require.
      */
     override fun onCleared() {
         // Deliberately uncontained. A refused enqueue means the purge never
@@ -1013,16 +1071,57 @@ class DebugFileSink internal constructor(
     /** Worker-only. The body of [onCleared]; see its documentation. */
     private fun purgeOnWorker() {
         val kept = runCatching {
-            // Not while a failed rotation left the previous run here.
-            // That file is a prior run, and the rule above is that prior
-            // runs survive an opt-out (Codex, PR #4).
-            val currentLeft = retainedPreviousRun() == null && !discardContents(current)
+            // Everything this run wrote, and every earlier run still held.
+            //
+            // Widened from `current` + `temp` (maintainer, 2026-08-31). The
+            // earlier rule kept the rotated set on the grounds that a crash
+            // the user has not sent yet is exactly what it exists to hold, so
+            // deleting it destroyed evidence the user themselves chose to
+            // record. What that reasoning did not have in view is the promise
+            // the apps' own copy already makes -- "turning the setting off
+            // deletes what was kept, immediately: the current run and every
+            // earlier one still held, pinned crashes included" (Snoozemo
+            // `SPEC.md` 4.6). A control that reports success while leaving
+            // the files is the worse failure of the two, and losing an
+            // unsent crash is the user's own call to make at the moment they
+            // turn the setting off. Off means gone.
+            //
+            // No carve-out now for a previous run a failed rotation left in
+            // `current`: that file is a prior run, which is precisely what
+            // this deletes.
+            val currentLeft = !discardContents(current)
             // The temp file counts the same. A residual snapshot there is
             // this run's own entries, so an opt-out that could not remove
             // it left exactly what it promised to delete -- and ignoring
             // its answer reported success for it (Codex, PR #20).
             val tempLeft = !discardContents(temp)
-            val left = currentLeft || tempLeft
+            val priorLeft = priorRunsLeftAfterPurge()
+            // The marker goes with the run it classifies. It is not a leak of
+            // the user's entries -- it holds none -- so it does not decide the
+            // warning; leaving it behind is a *correctness* problem, because
+            // `current` has just been deleted and the marker would then label
+            // whatever is written next. On the startup-off path that is a real
+            // sequence: mirroring is deliberately not stood down there, so a
+            // re-enable later in the process writes an ordinary run into
+            // `current` and the following start would rotate it as a crash
+            // (Codex, PR #23).
+            //
+            // A marker that will not go has to stop this process mirroring, for
+            // the same reason and by the same route the rotation uses: storage
+            // can recover, and then a re-enable writes an ordinary snapshot into
+            // `current` beside the surviving marker, which the following launch
+            // rotates wearing the crash suffix -- a crash banner over a run that
+            // never crashed (Codex, PR #23, on the first version of this call,
+            // which discarded the answer). `consumeCrashMarker`'s own warning is
+            // dropped here, since recording is off by the time a purge runs;
+            // `standDownFromMirroring` is what holds its reason until there is a
+            // log open to receive it.
+            if (!consumeCrashMarker()) {
+                standDownFromMirroring(
+                    "An earlier crash marker could not be cleared, so this run is not being saved",
+                )
+            }
+            val left = currentLeft || tempLeft || priorLeft
             if (left) purgeFailed = true
             left
         }.onFailure { failure ->
@@ -1043,11 +1142,71 @@ class DebugFileSink internal constructor(
         // this runs, so the report is held until it comes back and may be
         // held for the life of the process.
         publishStorageOutcomes(optOutPurgeFailed = kept)
+        // The banner is derived from the crash-suffixed prior runs this purge
+        // has just deleted, so it has to be recomputed or it goes on reporting
+        // a crash whose report is gone -- a banner pointing at nothing, and one
+        // that survives into a later re-enable (Codex, PR #23). It did not
+        // arise before this change because the purge left the prior-run set
+        // alone, which is exactly what the banner reads.
+        recomputeUnacknowledgedCrash()
     }
 
     /**
-     * Worker-only: the opt-out could not get rid of this run's file, and there
-     * was no working log to say so in.
+     * Worker-only. Deletes every rotated prior run, answering whether any of
+     * them is still there.
+     *
+     * A directory that will not list is a failure here, not an empty set: an
+     * opt-out cannot claim it removed files it never managed to see. That is
+     * the opposite of [previousFiles], which reads an unlistable directory as
+     * "no prior runs" because nothing is destroyed on the strength of that
+     * answer -- here something is *promised* on the strength of it, so the
+     * same conflation would report success for whatever the directory holds.
+     */
+    private fun priorRunsLeftAfterPurge(): Boolean {
+        val listed = dir.listFiles { file -> file.name.startsWith(PREVIOUS_PREFIX) } ?: return true
+        // Every entry, whatever [classify] would make of it. The retention
+        // bound leaves an unclassifiable entry alone because deleting what
+        // nobody could identify is the one irreversible answer to "could not
+        // tell" -- but an opt-out has already been told to delete it, so the
+        // caution runs the other way and an entry that will not go is reported
+        // rather than skipped.
+        //
+        // Not short-circuited: every file gets its attempt even after one
+        // refuses, since stopping at the first failure would leave the rest of
+        // an opted-out set on disk to satisfy a boolean that was already
+        // decided.
+        var left = false
+        for (file in listed) {
+            // Classified *before* the attempt, because that is the only moment
+            // the answer is about what the entry held: a discard that falls back
+            // to truncation empties the file, after which [classify] would call
+            // a run that was never removed [PriorEntry.REMOVABLE].
+            val held = classify(file)
+            if (discardContents(file)) continue
+            // An entry that will not go, but held nothing, is not a leak. The
+            // obstruction a failed rotation leaves under a prior-run name is a
+            // directory: it carries no entries, cannot be read into a report,
+            // and reporting it would light "some saved files couldn't be
+            // deleted" on every opt-out that followed a failed rotation --
+            // a warning about data that is, in fact, gone.
+            //
+            // [PriorEntry.UNKNOWN] counts as a leak, unlike in the retention
+            // bound, and for the mirror-image reason: there the irreversible
+            // answer to "could not tell" is deleting, so it declines; here it is
+            // claiming the file is gone, so it declines that instead.
+            if (held != PriorEntry.REMOVABLE) left = true
+        }
+        return left
+    }
+
+    /**
+     * Worker-only: the opt-out could not get rid of a saved log, and there was
+     * no working log to say so in.
+     *
+     * Any of them — this run's file, its temp, or an earlier run — since the
+     * purge takes them all. The message says "a saved log" for that reason:
+     * naming this run's would point an investigation at a file that was in fact
+     * deleted (Codex, PR #23).
      *
      * A purge that fails is exactly the leak the purge exists to close, so it
      * cannot go unsaid — but `setRecording(false)` has already taken effect by
@@ -1098,7 +1257,7 @@ class DebugFileSink internal constructor(
         // one is reached from the debounced write, which can fire after the
         // opt-out that set the flag, and clearing it alongside a dropped line
         // would lose the report for good.
-        val message = "An earlier opt-out could not remove this run's saved log"
+        val message = "An earlier opt-out could not remove a saved log"
         val cause = purgeFailure
         val said = if (cause != null) log.failure(cause, message) else log.warning(message)
         if (said) {
@@ -1920,11 +2079,16 @@ class DebugFileSink internal constructor(
      */
     class StorageOutcomes internal constructor(
         /**
-         * Whether the last opt-out left this run's saved log on disk.
+         * Whether the last opt-out left any saved log on disk — this run's or
+         * an earlier one's, since the purge now takes them all (see [onCleared]).
          *
-         * False when the purge had nothing to do: a prior run the rotation
-         * could not move is deliberately kept (see [onCleared]), which is the
-         * purge working as designed rather than failing.
+         * False when nothing the user recorded survived. An entry that refused
+         * to go but held no entries does not count: the obstruction a failed
+         * rotation leaves under a prior-run name is a directory, so raising this
+         * for it would warn about data that is in fact gone. Nor does a crash
+         * marker that would not go — it holds nothing of the user's, and its
+         * consequence is a mislabeled next run, answered by standing this
+         * process down from mirroring instead.
          */
         val optOutPurgeFailed: Boolean,
         /**

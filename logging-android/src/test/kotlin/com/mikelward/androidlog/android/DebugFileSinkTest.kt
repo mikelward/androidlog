@@ -590,20 +590,24 @@ class DebugFileSinkTest {
     }
 
     @Test
-    fun `the opt-out leaves a previous run alone`() {
-        // A prior run may be the crash the user is part way through sending, and
-        // turning recording off now is not an instruction to destroy a report
-        // already offered. The core clears its buffer, not the whole history.
+    fun `the opt-out deletes a previous run too`() {
+        // This used to assert the opposite, on the grounds that a prior run may
+        // be a crash the user is part way through sending, so turning recording
+        // off was not an instruction to destroy a report already offered.
+        // Reversed by the maintainer (2026-08-31): off is exactly that
+        // instruction, and losing an unsent crash is the user's own call at the
+        // moment they make it.
         current().writeText("an earlier run\n")
         val log = log()
         val sink = sink(log)
         sink.start(installCrashHandler = false)
         sink.awaitIdle()
         log.addSink(sink)
+        assertNotNull("the premise: a prior run is on offer", sink.readPreviousRun())
 
         log.setRecording(false)
         sink.awaitIdle()
-        assertTrue(sink.readPreviousRun()!!.text.contains("an earlier run"))
+        assertNull(sink.readPreviousRun())
     }
 
     // ----------------------- a retained run is a prior run in every sense
@@ -663,18 +667,20 @@ class DebugFileSinkTest {
     }
 
     @Test
-    fun `the opt-out leaves a preserved run alone`() {
-        // The rule is that prior runs survive an opt-out, and a preserved run is
-        // a prior run — deleting it here would contradict that on the one path
-        // where the file happens to be named `androidlog.log`.
+    fun `the opt-out deletes a preserved run too`() {
+        // Prior runs used to survive an opt-out, and a preserved run is a prior
+        // run, so this file was deliberately left alone. Reversed by the
+        // maintainer (2026-08-31): off means gone, on every path, including the
+        // one where the file happens to still be named `androidlog.log`.
         val log = log()
         val sink = sinkWithFailedRotation(log)
         log.addSink(sink)
+        assertTrue("the premise: a run was retained in place", current().exists())
 
         log.setRecording(false)
         sink.awaitIdle()
-        assertTrue(current().exists())
-        assertTrue(sink.readPreviousRun()!!.text.contains("the crash nobody has read yet"))
+        assertFalse("the retained run goes with the rest", current().exists())
+        assertNull("and nothing is left to share", sink.readPreviousRun())
     }
 
     // ------------------------------------------------------- the crash marker
@@ -791,7 +797,7 @@ class DebugFileSinkTest {
         sink.awaitIdle()
         assertTrue(
             log.snapshot().toString(),
-            log.snapshot().any { it.contains("could not remove this run's saved log") },
+            log.snapshot().any { it.contains("could not remove a saved log") },
         )
     }
 
@@ -1120,6 +1126,35 @@ class DebugFileSinkTest {
         override fun schedule(command: Runnable, delay: Long, unit: TimeUnit): ScheduledFuture<*> {
             command.run()
             return delegate.schedule({}, 0L, unit)
+        }
+    }
+
+    /**
+     * A worker that holds its first immediate task until the test releases it,
+     * so a state change can be interleaved between an enqueue and its run —
+     * the window a real worker leaves open for microseconds and no other seam
+     * here can reach.
+     */
+    private class HoldsFirstExecute(
+        private val delegate: ScheduledExecutorService,
+    ) : ScheduledExecutorService by delegate {
+        private var taken = false
+        private var held: Runnable? = null
+
+        override fun execute(command: Runnable) {
+            if (!taken) {
+                taken = true
+                held = command
+                return
+            }
+            delegate.execute(command)
+        }
+
+        /** Hands the held task to the real worker, where it would have run. */
+        fun release() {
+            val command = held ?: return
+            held = null
+            delegate.execute(command)
         }
     }
 
@@ -1661,7 +1696,7 @@ class DebugFileSinkTest {
         log.event("the log is working again")
         sink.awaitIdle()
 
-        val said = log.snapshot().single { it.contains("could not remove this run's saved log") }
+        val said = log.snapshot().single { it.contains("could not remove a saved log") }
         assertTrue("and it names what failed", said.contains("IllegalStateException"))
     }
 
@@ -1972,14 +2007,15 @@ class DebugFileSinkTest {
         // The flag latches whether or not a log was open to take the reason, so a
         // reason discarded by the gate leaves every snapshot suppressed for the
         // life of the process with nothing anywhere to explain it.
-        File(dir, "androidlog-prev-pinned.crash.log").mkdirs()
-        current().writeText("02-01 10:00:00.000 D the crash nobody has read yet\n")
-        File(dir, "androidlog.log.crash").writeText("1")
+        // Driven by the start-time purge rather than by a rotation stand-down:
+        // a start that finds recording off no longer rotates at all, so the
+        // rotation can never be the thing failing while the log is silent
+        // (maintainer, 2026-08-31). The purge that replaced it fails here, and
+        // it is the same holding machinery underneath.
         val log = log()
-        // Off before the sink is registered, so the opt-out's own purge never
-        // reaches it — this is about the rotation, not about `onCleared`.
+        // Off before the sink is registered, and off when the start runs.
         log.setRecording(false)
-        val sink = sinkRotatingTo("pinned", log)
+        val sink = sink(log, at = unlistable())
         log.addSink(sink)
 
         sink.start(installCrashHandler = false)
@@ -1992,7 +2028,7 @@ class DebugFileSinkTest {
 
         assertTrue(
             log.snapshot().toString(),
-            log.snapshot().any { it.contains("could not be rotated aside") },
+            log.snapshot().any { it.contains("could not remove") },
         )
     }
 
@@ -2411,6 +2447,229 @@ class DebugFileSinkTest {
         )
     }
 
+    // ------------------------------------------------- the opt-out deletes all
+
+    @Test
+    fun `the opt-out deletes every prior run, crashes included`() {
+        // The rule the maintainer set (2026-08-31): turning the setting off
+        // deletes what was kept, immediately -- the current run and every
+        // earlier one still held, unsent crashes included. Prior runs used to
+        // survive, on the grounds that an unsent crash is what the set exists
+        // to hold; the apps' own copy promises deletion, and a control that
+        // reports success while leaving the files is the worse failure.
+        val plain = File(dir, "androidlog-prev-1.log").apply { writeText("an earlier run\n") }
+        val crash = File(dir, "androidlog-prev-2.crash.log").apply { writeText("a crash nobody sent\n") }
+        val log = log()
+        val sink = sink(log)
+        log.addSink(sink)
+        log.event("this run")
+        sink.awaitIdle()
+        assertTrue("the premise: three files on disk", current().exists() && plain.exists() && crash.exists())
+
+        log.setRecording(false)
+        sink.awaitIdle()
+
+        assertFalse("this run's log", current().exists())
+        assertFalse("an earlier run", plain.exists())
+        assertFalse("an unsent crash", crash.exists())
+        assertFalse("and it says it worked", sink.storageOutcomes.optOutPurgeFailed)
+    }
+
+    @Test
+    fun `a directory that will not list fails the opt-out rather than reading as empty`() {
+        // An opt-out cannot claim it removed files it never managed to see.
+        // `previousFiles` reads an unlistable directory as "no prior runs"
+        // because nothing is destroyed on the strength of that answer; here
+        // something is promised on it, so the same conflation would report
+        // success for whatever the directory holds.
+        val log = log()
+        val sink = sink(log, at = unlistable())
+        log.addSink(sink)
+
+        log.setRecording(false)
+        sink.awaitIdle()
+        assertTrue(sink.storageOutcomes.optOutPurgeFailed)
+    }
+
+    @Test
+    fun `a start that finds recording off purges instead of rotating`() {
+        // The durability gap: `onCleared` enqueues its purge, so a process
+        // killed inside that window leaves `androidlog.log` behind with the
+        // setting already off -- and the startup rotation would then move it
+        // into the shareable prior-run set, which is the leak the purge exists
+        // to close. The persisted setting is the durable record that closes it.
+        current().writeText("recorded before the opt-out\n")
+        val stranded = File(dir, "androidlog-prev-1.crash.log").apply { writeText("an older crash\n") }
+        val log = log()
+        log.setRecording(false)
+        val sink = sink(log)
+
+        sink.start(installCrashHandler = false)
+        sink.awaitIdle()
+
+        assertFalse("nothing is rotated into the shareable set", current().exists())
+        assertFalse("and what was already there goes too", stranded.exists())
+        assertEquals(
+            "no prior-run file survives the start",
+            emptyList<String>(),
+            dir.listFiles().orEmpty().map { it.name }.filter { it.startsWith("androidlog-prev-") },
+        )
+        assertNull(sink.readPreviousRun())
+        assertFalse("and the banner cannot point at a run that is gone", sink.unacknowledgedCrash)
+    }
+
+    @Test
+    fun `a start with recording on rotates as before`() {
+        // The other direction, and the case every app that never calls
+        // `setRecording` at all is in: recording reads on by default, so the
+        // rotation is untouched for them.
+        current().writeText("the previous run\n")
+        val sink = sink()
+
+        sink.start(installCrashHandler = false)
+        sink.awaitIdle()
+
+        assertTrue(
+            "the previous run is still shareable",
+            sink.readPreviousRun()!!.text.contains("the previous run"),
+        )
+    }
+
+    @Test
+    fun `the opt-out lowers a banner whose crash it just deleted`() {
+        // The banner reads the crash-suffixed prior runs, which the widened
+        // purge now deletes -- so without a recompute it goes on reporting a
+        // crash whose report is gone, and carries that into a later re-enable
+        // (Codex, PR #23). It did not arise before, because the purge left the
+        // prior-run set alone.
+        File(dir, "androidlog-prev-1.crash.log").writeText("a crash nobody sent\n")
+        val log = log()
+        val sink = sink(log)
+        sink.start(installCrashHandler = false)
+        sink.awaitIdle()
+        log.addSink(sink)
+        assertTrue("the premise: the banner is up", sink.unacknowledgedCrash)
+
+        log.setRecording(false)
+        sink.awaitIdle()
+        assertFalse(sink.unacknowledgedCrash)
+    }
+
+    @Test
+    fun `a purge consumes the crash marker, so the next run is not mislabeled`() {
+        // Deleting `current` while leaving `androidlog.log.crash` lets the
+        // marker classify whatever is written next. The startup-off path makes
+        // that a real sequence: mirroring is deliberately not stood down there,
+        // so a re-enable in the same process writes an ordinary run and the
+        // following start would rotate it wearing the crash suffix (Codex, PR
+        // #23).
+        current().writeText("recorded before the opt-out\n")
+        File(dir, "androidlog.log.crash").writeText("1")
+        val log = log()
+        log.setRecording(false)
+        val sink = sink(log)
+        log.addSink(sink)
+
+        sink.start(installCrashHandler = false)
+        sink.awaitIdle()
+        assertFalse("the marker went with the run", File(dir, "androidlog.log.crash").exists())
+
+        // Re-enabled in the same process, then rotated by the next start.
+        log.setRecording(true)
+        log.event("an ordinary run")
+        sink.awaitIdle()
+        val next = sink(log())
+        next.start(installCrashHandler = false)
+        next.awaitIdle()
+
+        assertFalse("an ordinary run is not a crash", next.unacknowledgedCrash)
+        assertEquals(
+            "and it is not rotated wearing the crash suffix",
+            emptyList<String>(),
+            dir.listFiles().orEmpty().map { it.name }.filter { it.endsWith(".crash.log") },
+        )
+    }
+
+    @Test
+    fun `a marker the purge could not clear stands this process down`() {
+        // Storage can recover. If it does while the marker is still there, a
+        // re-enable writes an ordinary snapshot into `current` beside it, and
+        // the following launch rotates that wearing the crash suffix -- a crash
+        // banner over a run that never crashed (Codex, PR #23).
+        current().writeText("recorded before the opt-out\n")
+        // Neither deletable (not empty) nor truncatable, so consuming it fails.
+        File(dir, "androidlog.log.crash/wedged").mkdirs()
+        val log = log()
+        log.setRecording(false)
+        val sink = sink(log)
+        log.addSink(sink)
+
+        sink.start(installCrashHandler = false)
+        sink.awaitIdle()
+        assertTrue("the premise: the marker survived", File(dir, "androidlog.log.crash").exists())
+
+        log.setRecording(true)
+        log.event("an ordinary run")
+        sink.awaitIdle()
+
+        assertFalse("nothing is mirrored beside the surviving marker", current().exists())
+        assertTrue(
+            log.snapshot().toString(),
+            log.snapshot().any { it.contains("crash marker could not be cleared") },
+        )
+    }
+
+    @Test
+    fun `a start that saw recording off purges even if it is back on by the time it runs`() {
+        // The rotation task is enqueued, so recording can come back on before it
+        // runs. Reading only on the worker then sees the newer `true` and
+        // rotates the pre-opt-out files into the shareable set — and nothing
+        // catches it afterwards, because the sink is normally registered after
+        // `start()`, so the `onCleared` that would have purged them has already
+        // been and gone (Codex, PR #23).
+        current().writeText("recorded before the opt-out\n")
+        val stranded = File(dir, "androidlog-prev-1.log").apply { writeText("an earlier run\n") }
+        val log = log()
+        log.setRecording(false)
+        val worker = HoldsFirstExecute(ScheduledThreadPoolExecutor(1))
+        val sink = DebugFileSink(log, { dir }, 0L, {}, { "1" }, { worker })
+        log.addSink(sink)
+
+        sink.start(installCrashHandler = false)
+        // Between the enqueue and the run.
+        log.setRecording(true)
+        worker.release()
+        sink.awaitIdle()
+
+        assertFalse("this run's log is purged, not rotated", current().exists())
+        assertFalse("and the earlier one goes with it", stranded.exists())
+        assertEquals(
+            "nothing opted out is left in the shareable set",
+            emptyList<String>(),
+            dir.listFiles().orEmpty().map { it.name }.filter { it.startsWith("androidlog-prev-") },
+        )
+    }
+
+    @Test
+    fun `a startup purge the worker refuses says so to the caller`() {
+        // The refused task was going to purge, not rotate, so its refusal is an
+        // opt-out that did not happen: the saved runs are still there. Nothing
+        // on the worker will ever publish that -- the worker is what refused --
+        // and `log.failure` cannot carry it either, because recording is off,
+        // which is exactly the state that made this a purge. So it reads as a
+        // successful opt-out over files that had not moved (Codex, PR #23).
+        current().writeText("recorded before the opt-out\n")
+        val log = log()
+        log.setRecording(false)
+        val sink = DebugFileSink(log, { dir }, 0L, {}, { "1" }, { refusingWorker() })
+        log.addSink(sink)
+
+        sink.start(installCrashHandler = false)
+
+        assertTrue(sink.storageOutcomes.optOutPurgeFailed)
+        assertTrue("and the file really is still there", current().exists())
+    }
+
     // ------------------------------------------------------- storage outcomes
 
     @Test
@@ -2444,10 +2703,12 @@ class DebugFileSinkTest {
     }
 
     @Test
-    fun `a kept prior run is not reported as a failed opt-out`() {
-        // The purge deliberately leaves a run the rotation could not move: that
-        // is the design, not a failure, and reporting it would light a warning
-        // on every opt-out that followed a failed rotation.
+    fun `an obstruction holding no entries is not reported as a failed opt-out`() {
+        // The purge now takes the retained run as well, but the thing blocking
+        // the rotation is a *directory* wearing a prior-run name: it holds no
+        // entries and cannot be read into a report, so refusing to delete is
+        // not a leak. Reporting it would light the warning on every opt-out
+        // that followed a failed rotation, about data that is in fact gone.
         val log = log()
         // The rotation's destination is occupied, so `androidlog.log` stays put
         // and holds the previous run.
@@ -2457,7 +2718,7 @@ class DebugFileSinkTest {
 
         log.setRecording(false)
         sink.awaitIdle()
-        assertTrue("and it is still there, deliberately", current().exists())
+        assertFalse("the run itself is gone", current().exists())
         assertFalse(sink.storageOutcomes.optOutPurgeFailed)
     }
 
