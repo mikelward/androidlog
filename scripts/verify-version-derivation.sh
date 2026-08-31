@@ -186,6 +186,21 @@ else
     fail "the AAR's POM does not depend on logging-core at $expected"
 fi
 
+# Both POMs must DECLARE the license. It is configured once at the root rather
+# than per module, so the failure mode is silent and symmetric: a refactor that
+# stops the root block reaching publications drops it from both at once, the
+# publish still succeeds, and the only visible symptom is a blank row on every
+# consumer's attribution screen -- which is what the first two consumers
+# shipped, and what nobody noticed until the screenshots were read.
+for module in logging-android logging-core; do
+    pom="$staged/$module/$expected/$module-$expected.pom"
+    if grep -q '<name>The Apache License, Version 2.0</name>' "$pom"; then
+        ok "$module's POM declares the Apache-2.0 license"
+    else
+        fail "$module's POM declares no license"
+    fi
+done
+
 # --- 1b. A divergent branch: the count is real but not unique --------------
 #
 # Clean, complete, and genuinely this repository -- it passes every other guard.
