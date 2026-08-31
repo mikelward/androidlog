@@ -34,61 +34,86 @@ domain. A call site summarizes its own type and passes the result through
 
 ## Consuming it
 
-No version, no tag, no SHA. A consumer clones this repository and includes it
-as a composite build, so a merge here is in every app's next build with nothing
-to bump.
+By coordinate, like any other dependency. This repository publishes a real
+Maven repository into its own `maven` branch, which raw.githubusercontent.com
+serves — a Maven repository is a static directory tree over HTTP, so there is
+no third party in the trust path.
 
-`settings.gradle.kts`:
-
-```kotlin
-// mikelward/androidlog, tracked @main. Nothing to bump.
-// CI checks it out into .androidlog/; locally, clone it as a sibling.
-val androidlog = listOf(file(".androidlog"), file("../androidlog")).firstOrNull { it.isDirectory }
-    ?: error("androidlog not found — git clone https://github.com/mikelward/androidlog ../androidlog")
-includeBuild(androidlog)
-```
-
-`app/build.gradle.kts`:
+`settings.gradle.kts`, inside `dependencyResolutionManagement { repositories { … } }`:
 
 ```kotlin
-implementation("com.mikelward.androidlog:logging-android:0.0")
+// Scoped to the one group: without `includeGroup` this repository would be
+// consulted for every unresolved coordinate in the build.
+maven {
+    name = "androidlog"
+    url = uri("https://raw.githubusercontent.com/mikelward/androidlog/maven")
+    content { includeGroup("com.mikelward.androidlog") }
+}
 ```
 
-The version there is inert — composite substitution matches on group and name
-and swaps in the local build before anything resolves remotely.
+`gradle/libs.versions.toml`:
 
-The consumer's CI, with no `ref:`, so it takes the default branch:
+```toml
+[versions]
+androidlog = "2.0.49"
+
+[libraries]
+androidlog-logging-core = { group = "com.mikelward.androidlog", name = "logging-core", version.ref = "androidlog" }
+androidlog-logging-android = { group = "com.mikelward.androidlog", name = "logging-android", version.ref = "androidlog" }
+```
+
+And the consumer's `gradle-update.yml`, so the weekly batch can see a release
+at all — the engine cannot discover versions in a repository it does not know
+about, and the failure is silence rather than a red run:
 
 ```yaml
-- uses: actions/checkout@v5
-  with:
-    repository: mikelward/androidlog
-    path: .androidlog
-    persist-credentials: false
+with:
+  extra-repositories: |
+    https://raw.githubusercontent.com/mikelward/androidlog/maven
+  # Both coordinates: they share one version key, and the input exempts a key
+  # only when every coordinate it pins is named. The cooldown exists to let a
+  # bad third-party release be yanked before it reaches a consumer; it buys
+  # nothing against a library this owner publishes and reviews.
+  no-cooldown-for: |
+    com.mikelward.androidlog:logging-core
+    com.mikelward.androidlog:logging-android
 ```
 
-And one line in the consumer's `.claude/hooks/session-start.sh`, beside the
-Android SDK provisioning it already does:
+### Working on both at once
 
-```sh
-git clone --depth 1 https://github.com/mikelward/androidlog .androidlog 2>/dev/null \
-  || git -C .androidlog pull --ff-only
-```
+`includeBuild` still works, and it is the fast edit-here-rebuild-the-app loop —
+but it is opt-in, behind `-PandroidlogLocal` (or `androidlogLocal=true` in a
+local `gradle.properties`), keyed on the property rather than on a sibling
+checkout merely existing. A composite puts two AGP versions in one Gradle
+invocation, and AGP's `AgpVersionCompatibilityRule` refuses to compare them at
+all, so tracking `@main` that way meant a patch bump here failed configuration
+in every consumer at once. That is what the coordinate removes.
 
-### The version is `1.0.<commit count>`
+### The version is SemVer, from `2.0.x`
 
-Every module publishes at `1.0.` plus `git rev-list --count HEAD`, so a commit
-reaching `main` is publishable exactly once and a later one can never reuse its
-number. Nothing is bumped by hand and there is no tag to forget.
+`MAJOR.MINOR.PATCH`, with the usual meanings — `SPEC.md` is the contract and
+this is the summary. `MAJOR.MINOR` is declared in `gradle/version-series.txt`,
+and editing that file *is* the release decision. `PATCH` is what it has always
+been: the number of commits on the release line, so a commit reaching `main` is
+publishable exactly once and a later one can never reuse a number. It does not
+reset when the minor moves — the one deliberate deviation from strict SemVer,
+because a number that is unique across the repository's whole history is worth
+more on an immutable coordinate than a tidy reset.
 
-It starts at **1.0, not 0.x**, and that is a requirement rather than taste:
-mikelward/gradle-update reads a major version as the leading integer, so at
-`0.x` every release looks like the same major to a consumer's weekly dependency
-batch and is taken automatically — including one that breaks the API, in the
-phase where SemVer says breaking changes are allowed. Moving to `2.0` is how a
-breaking change announces itself to that batch.
+**A minor or patch bump is safe to take.** That is what the weekly
+`gradle-update` batch auto-merges, and if one of them breaks a consumer, the
+version was wrong — a bug here, not there. A **major** never arrives that way:
+the batch holds a coordinate within its current major, so someone takes it
+deliberately, with the breaking changes in front of them.
 
-The count is derived from the checkout, and there are two ways to get a number
+**Everything up to `1.0.48` was not SemVer**, though `1.0.x` implied it was: the
+series was hard-coded and the third component was the total commit count, so a
+breaking change and a typo fix produced the same bump. One did break — 
+`formatLogMessage`'s `redactSensitive` parameter became `leavingDevice` — and a
+consumer met it while taking what its numbers described as six patches. `2.0.x`
+is the first release under the real contract.
+
+The patch level is derived from the checkout, and there are two ways to get a number
 that is wrong rather than absent. Both are worse than no answer, because a
 plausible one names a release that already exists with different contents:
 
@@ -109,7 +134,9 @@ load-bearing:
   repository is contained by it either way, and only the top level tells them
   apart.
 - It refuses to guess when either check fails, or when there is no `.git`
-  anywhere: `1.0.0-undetermined`, never a plausible number.
+  anywhere: `<series>.0-undetermined` — `2.0.0-undetermined` today — and
+  `0.0.0-undetermined` when the series file itself is missing or malformed,
+  since there is then no series to name. Never a plausible number.
 - The publish tasks refuse that version outright, on **every route out**:
   both task types, since `publishToMavenLocal` is a sibling of the remote
   publish task rather than a subtype; and both entry points, since the offramp
@@ -213,19 +240,25 @@ substitution are unchanged.
 
 An ordinary consumer build needs AGP anyway and keeps including the root.
 
-### What the no-pin choice costs
+### What the pin buys, and what it still costs
 
-Two things, worth stating rather than discovering:
+A merge here no longer reaches anyone's build. Each consumer names a version,
+and a bad merge is caught by this repository's own pull request or by the
+consumer's bump PR — never by four apps going red at once, which is what
+tracking `@main` through a composite build meant and what actually happened on
+2026-08-30.
 
-A bad merge here reddens all four apps' next build. That is the accepted trade
-in the sibling `lanes` and `codex-review` repositories, but there the failure
-direction is safe — a blocked merge. Here a privacy-floor regression could ship
-in an APK instead. So the floor's tests live here and gate this repository's own
-pull requests, and a consumer keeps a thin conformance test of its own.
+What is still true is the direction the failure points. In the sibling `lanes`
+and `codex-review` repositories a bad merge blocks a merge, which is safe; here
+a privacy-floor regression could ship in an APK. A version pin bounds the blast
+radius but does not change that, so the floor's tests live here and gate this
+repository's own pull requests, and a consumer keeps a thin conformance test of
+its own.
 
-A release build stops being reproducible from the app's own SHA alone. The fix
-is cheap: record the resolved `androidlog` SHA in the app's `BuildConfig`, so a
-shipped build names what it was built against.
+The cost of the pin is that somebody has to take it. That is what the weekly
+`gradle-update` batch is for, and why the version has to mean something: the
+batch takes a minor or patch unread, so a breaking change mislabeled as either
+lands in four apps with nobody looking. See `SPEC.md`.
 
 ## Using it
 

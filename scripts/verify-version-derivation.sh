@@ -56,8 +56,34 @@ if [ -n "$(git -C "$repo" status --porcelain)" ]; then
     echo "      so uncommitted changes are not covered by this run." >&2
 fi
 
-expected="1.0.$(git -C "$repo" rev-list --count HEAD)"
-undetermined="1.0.0-undetermined"
+# The expected version is derived the same way the build derives it, but with
+# git rather than Gradle -- an independent second implementation, so a bug that
+# reaches both is a bug this script cannot see, and one that reaches either
+# alone is exactly what it catches.
+#
+# `MAJOR.MINOR` is declared in the series file; the patch level is the distance
+# from the commit that last changed it. See SPEC.md.
+series_path="gradle/version-series.txt"
+# From HEAD, not the working tree. Every fixture below is cloned from HEAD, so
+# reading an uncommitted edit here would compare this tree's new series against
+# the old one the fixtures actually derive -- a failure that says the code is
+# broken when it is only unsaved, which is the confusing direction.
+series=$(git -C "$repo" show "HEAD:$series_path" | tr -d '[:space:]')
+# Refuse rather than test against a guess: an empty or malformed series would
+# make every assertion below compare two wrong answers and pass. Same shape the
+# build enforces, leading zeros included, so the two cannot disagree about what
+# counts as a series.
+printf '%s' "$series" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' ||
+    fail "$series_path does not hold MAJOR.MINOR (read '$series')"
+
+# Patch level for a given fixture, counted from ITS OWN history -- so a fixture
+# that adds a commit moves, which is what the divergent-branch case asserts.
+patch_of() {
+    git -C "$1" rev-list --count HEAD
+}
+
+expected="$series.$(patch_of "$repo")"
+undetermined="$series.0-undetermined"
 
 # Publishing is allowed only from the release line, so each fixture is given one.
 #
@@ -201,6 +227,43 @@ for module in logging-android logging-core; do
     fi
 done
 
+# --- 1a. A malformed series: refused rather than published non-SemVer ------
+#
+# Clean, complete, on its own release line -- every guard about the COUNT passes.
+# What is wrong is the declared half, and a leading zero is the case a `\d+`
+# regex waves through: `02.0` is not a SemVer identifier, but it is also not
+# `undetermined`, so nothing downstream would have stopped it. The coordinate
+# would then sort and compare wrongly in every consumer's tooling, permanently,
+# because a published version cannot be withdrawn.
+#
+# Committed, not just written: the derivation reads the working tree for the
+# series but the publish guard runs against a clean tree, so an uncommitted
+# edit would be refused for being dirty and prove nothing about the regex.
+git clone --quiet "file://$repo" "$work/badseries"
+printf '02.0\n' > "$work/badseries/$series_path"
+git -C "$work/badseries" -c user.email=t@example.com -c user.name=t \
+    commit --quiet -am "a series with a leading zero"
+set_release_line "$work/badseries"
+
+actual=$(version_of "$work/badseries")
+# `0.0.0-undetermined` exactly: with no usable series there is none to name, so
+# the fallback names neither half of the malformed one.
+if [ "$actual" = "0.0.0-undetermined" ]; then
+    ok "a leading-zero series derives $actual"
+else
+    fail "a leading-zero series derived '$actual', expected '0.0.0-undetermined'"
+fi
+
+for task in :logging-core:publishAllPublicationsToStagingRepository \
+    :logging-core:publishToMavenLocal; do
+    outcome=$(publish_outcome "$work/badseries" "$task")
+    if [ "$outcome" = refused ]; then
+        ok "a leading-zero series refuses $task"
+    else
+        fail "a leading-zero series did not refuse $task ($outcome)"
+    fi
+done
+
 # --- 1b. A divergent branch: the count is real but not unique --------------
 #
 # Clean, complete, and genuinely this repository -- it passes every other guard.
@@ -218,11 +281,11 @@ git -C "$work/divergent" -c user.email=t@example.com -c user.name=t \
 
 # It still derives a count -- ordinary builds and a consumer's composite are
 # untouched here as everywhere else, so this asserts what does NOT change too.
-# Compared against this fixture's OWN count, exactly -- not a `1.0.*` glob,
-# which `1.0.0-undetermined` also matches, so folding the release-line check
-# into the version passed while nothing noticed. (Found by mutation-testing this
-# script; a loose pattern is how an assertion stops asserting.)
-diverged="1.0.$(git -C "$work/divergent" rev-list --count HEAD)"
+# Compared against this fixture's OWN patch level, exactly -- not a `$series.*`
+# glob, which `$series.0-undetermined` also matches, so folding the release-line
+# check into the version passed while nothing noticed. (Found by mutation-testing
+# this script; a loose pattern is how an assertion stops asserting.)
+diverged="$series.$(patch_of "$work/divergent")"
 actual=$(version_of "$work/divergent")
 if [ "$actual" = "$diverged" ]; then
     ok "a divergent branch still derives its count for ordinary builds ($actual)"

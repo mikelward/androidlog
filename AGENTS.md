@@ -13,18 +13,21 @@ report. It was extracted from four hand-maintained copies — `simmo`,
 (the two `DebugFileSink.kt` copies differed by 525 lines, and each had had its
 own bug found in review that the others never got).
 
-**Consumers track `@main` by git clone plus a Gradle composite build**, so a
-merge here reaches every consumer's next build with no release step in between
-and nothing to bump. Everything below follows from that; `README.md` has the
-wiring.
+**Consumers pin a version.** The build publishes a complete Maven repository
+into this repository's own `maven` branch, which raw.githubusercontent.com
+serves, and every consumer resolves a coordinate from it — see `README.md` for
+the wiring and `SPEC.md` for what the number promises.
 
-That is changing, deliberately. The build now derives a real version —
-`1.0.<commit count>` — and publishes a complete repository tree under
-`build/maven/`, so a consumer can take a coordinate instead. Nothing serves that
-tree yet (`TODO.md`), and the composite stays supported either way: it is the
-fast edit-here-rebuild-the-app loop. What the coordinate removes is the AGP
-lockstep below, which is the constraint that broke every clothescast build at
-once on 2026-08-30.
+So a merge here reaches nobody until someone takes it, which is the point. It
+used to be the opposite: consumers tracked `@main` through a Gradle composite
+build, nothing to bump and nothing to forget — and also two AGP versions in one
+Gradle invocation, which `AgpVersionCompatibilityRule` refuses to compare at
+all, so a patch bump here broke every clothescast build at once on 2026-08-30.
+A resolved AAR carries no `AgpVersionAttr`.
+
+The composite is still supported and is still the right tool for working on the
+library and an app together — it is opt-in per consumer, behind
+`-PandroidlogLocal`. What it is no longer is how anyone's CI resolves this.
 
 Keep this file as short as it can be and still work. Every session loads it
 whole, so each rule costs context on every turn: add one the first time
@@ -82,18 +85,46 @@ has stopped biting.
 - **`minSdk` is 31**, the floor across the consumer fleet (`clothescast`;
   simmo and typelauncher are 34, snoozemo 35). Raising it silently drops a
   consumer, so it is a migration note in that app, not a tidy-up here.
-- **AGP and Kotlin stay in step with the consumers**, and *any* difference
-  counts. A composite build puts this build's toolchain alongside theirs in one
+- **AGP and Kotlin stay in step with the consumers, on the composite path.**
+  `-PandroidlogLocal` puts this build's toolchain alongside an app's in one
   Gradle invocation, and AGP's `AgpVersionCompatibilityRule` refuses to compare
   two versions at all — 9.3.1 against 9.3.2 fails to configure, with no pin to
-  hide behind. What keeps them level is `gradle-update.yml`: this repository is
-  on the same weekly batch as the four apps, so an AGP release reaches all five
-  in the same window. Being off that batch is what let this repository fall a
-  patch behind and break every consumer at once (2026-08-30).
+  hide behind. `gradle-update.yml` keeps them level: this repository rides the
+  same weekly batch as the four apps, so an AGP release reaches all five in one
+  window. Being off that batch is what let this repository fall a patch behind
+  and break every clothescast build at once (2026-08-30) — back when every
+  consumer resolved this way and none of them had a choice. A published AAR
+  carries no `AgpVersionAttr`, so the ordinary path is now immune; this rule
+  protects the opt-in one, which is the loop anyone working on both uses.
 - **App-specific report *content* does not belong here.** `DecisionSnapshot`,
   `ActiveSnooze`, an `Intent` summary — those are each app's domain. A call site
   summarizes its own type and passes the result through `safe(...)`, deciding
   for itself what the summary may say.
+
+## Versioning
+
+- **Every pull request decides its release level, and says so in the PR body.**
+  `SPEC.md` holds the contract; the mechanism is `gradle/version-series.txt`,
+  which holds `MAJOR.MINOR` and is the only part anyone edits by hand. Patch
+  stays the commit count on the release line and does not reset — deliberate,
+  so no two releases ever share a number.
+- **MAJOR for anything that breaks a consumer's source or its behavior.** Source
+  is broader than "removed a public symbol": a renamed parameter breaks every
+  named argument, a new required parameter breaks every call. Behavior is the
+  one this library gets wrong most easily — a change to what leaves the device
+  breaks a consumer's privacy posture with no signature to notice, so it is
+  MAJOR whether or not the API moved.
+- **MINOR for something added, PATCH for everything else.** The weekly
+  `gradle-update` batch auto-merges both in every consumer, so calling a
+  breaking change either one ships it unread into four apps.
+- **Prefer a deprecated alias to a bare rename.** It turns a consumer's red
+  build into a warning on a bump they were taking anyway, and it is what lets a
+  rename be MINOR instead of MAJOR. Remove the alias in a later major, not in
+  the release that adds it.
+- **Nothing was SemVer before `2.0.x`**, and `1.0.x` claimed otherwise -- the
+  series was hard-coded and the third component was the total commit count, so
+  a breaking change and a typo fix produced the same bump. Don't cite a `1.0.x`
+  release as precedent for what a version number here means.
 
 ## Testing
 
@@ -160,11 +191,15 @@ has stopped biting.
 - **Open the pull request without being asked**, ready for review, not a draft.
 - **Refresh the title and body with the push, not after it** — same step, so
   they describe the branch's latest state, not the scope it had when opened.
-- **Pilot a consumer before merging, not after.** Consumers track `@main`, so
-  merging here *is* the rollout. Point one app's `settings.gradle.kts` at the
-  branch and take that app's PR green first; take the others after the merge,
-  one at a time. They share one automated reviewer, so the same change opened
-  four times is the same finding four times.
+- **Pilot a consumer before merging, not after.** Merging no longer reaches
+  anyone's build on its own — that is what the version pin bought — but it does
+  publish a coordinate, and a published coordinate cannot be withdrawn or
+  corrected. So the cost of merging something wrong did not go away; it moved
+  from four red builds to a permanent bad release. Take one app's PR green
+  against the change first (`-PandroidlogLocal` against a local checkout, or the
+  branch's own published version once it has one), then bump the others after
+  the merge, one at a time. They share one automated reviewer, so the same
+  change opened four times is the same finding four times.
 - **Codex is the automated reviewer**, and its reviews are triggered
   automatically. Address its comments without being asked, folding each fix
   into the commit it belongs to. Judge every comment on merit: verify the claim
