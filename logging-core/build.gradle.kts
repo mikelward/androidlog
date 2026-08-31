@@ -4,15 +4,26 @@ import org.gradle.api.artifacts.result.UnresolvedDependencyResult
 
 plugins {
     alias(libs.plugins.kotlin.jvm)
+    // Published as a coordinate of its own, not folded into the AAR: the AAR
+    // depends on it with `api`, so a consumer resolving the AAR resolves this
+    // too, and its POM has to name something that exists.
+    `maven-publish`
 }
 
-// Set here rather than only in the root build's `allprojects`, because
 // `logging-core/settings.gradle.kts` makes this module the root of a second,
-// Android-free entry point where that block does not run. The substitution a
-// consumer's composite build performs matches on these, so a missing group is
-// the difference between the offramp working and resolving `:0.0` remotely.
-group = "com.mikelward.androidlog"
-version = "0.0"
+// Android-free entry point, where the main build's root script -- and so the
+// coordinates it sets -- never runs. Applying the same derivation script here
+// is what keeps the two entry points naming one version: a local copy of the
+// number would fail silently, publishing this module under a version the
+// sibling AAR's POM does not name. Under the main build the root has already
+// applied it, so this is skipped rather than run twice.
+//
+// The substitution a consumer's composite build performs matches on the group,
+// so a missing one is the difference between the offramp working and resolving
+// remotely.
+if (project == rootProject) {
+    apply(from = file("../gradle/version.gradle.kts"))
+}
 
 // Deliberately a plain Kotlin JVM module, not an Android library. The privacy
 // floor lives here, and a floor that can only be tested on a device is a floor
@@ -23,6 +34,23 @@ version = "0.0"
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(17)
+    }
+    // Sources travel with the artifact. This library exists to be read at the
+    // point a consumer is trying to explain a log line it produced, and a
+    // decompiled stack frame is a poor substitute for the comment above it.
+    withSourcesJar()
+}
+
+publishing {
+    publications {
+        register<MavenPublication>("maven") {
+            from(components["java"])
+            pom {
+                name = "androidlog logging-core"
+                description = "The privacy floor and ring buffer, testable without Android."
+                url = "https://github.com/mikelward/androidlog"
+            }
+        }
     }
 }
 

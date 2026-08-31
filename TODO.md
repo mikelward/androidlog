@@ -552,6 +552,49 @@ own `runCatching`, before the snapshot and after the crash marker.
 
 ## Not built yet
 
+- **Publish the staged repository from CI, and serve it over HTTP.** The Gradle
+  side is done: `./gradlew publishAllPublicationsToStagingRepository` writes a
+  complete repository tree — POMs, Gradle module metadata, sources jars,
+  checksums and a merged `maven-metadata.xml` — under `build/maven/`. What is
+  missing is the workflow that puts it somewhere a consumer can resolve from,
+  and the consumer-side wiring that follows.
+
+  Three things it has to get right, all of them observed rather than assumed
+  while building the Gradle side:
+
+  - **Seed the staging directory from the existing published tree before
+    publishing.** Gradle *merges* into an `maven-metadata.xml` it finds at a
+    `file:` repository and *replaces* one it does not — verified by seeding a
+    fake `1.0.30` and republishing `1.0.35`, which produced a metadata file
+    listing both. Publishing into an empty directory and committing the result
+    would silently drop every prior version from the metadata while leaving the
+    artifacts in place, so the repository would look intact and resolve only
+    the newest release.
+  - **Split the trust the way the fleet already does.** The job that runs
+    Gradle runs dependency code — AGP, the Kotlin plugin, whatever they
+    resolve — so it must not hold a token that can write to the repository. A
+    second job with nothing but the artifact and a checkout is what commits.
+    `mikelward/ci-commit-artifact` exists for exactly this shape and is the
+    first thing to read.
+  - **Refuse to overwrite.** A published coordinate cannot be corrected, so the
+    committing job re-derives the check itself: nothing already on the branch
+    may change or disappear, `maven-metadata.xml` excepted, and that one must
+    still list every version it listed before. A guard derived from a file
+    somebody else wrote is not a guard.
+
+  Then the consumer side, one app at a time: a `maven { url }` pointing at the
+  served tree with `content { includeGroup("com.mikelward.androidlog") }`, the
+  coordinate in place of the composite, and — in its `gradle-update.yml`
+  caller — the `extra-repositories` and `no-cooldown-for` inputs from
+  mikelward/gradle-update#28. The waiver is needed because
+  `raw.githubusercontent.com` serves no `Last-Modified`, so the batch cannot
+  read a release date and would defer the coordinate forever.
+
+  Keep `includeBuild` working throughout. The fast edit-here-rebuild-the-app
+  loop is the reason the composite existed, and losing it would be a real cost;
+  what publishing removes is the *requirement* to use it, and with it the AGP
+  lockstep that broke every clothescast build at once on 2026-08-30.
+
 - **Require `lanes`, `codex`, `codex-review-check / codex-review-check`, and
   `zizmor` in the main ruleset** (plus conversations resolved, and branches up
   to date), once each has reported at least once — a step outside what a

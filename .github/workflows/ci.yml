@@ -63,6 +63,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # The published version's patch level is the commit count, and the
+          # step that verifies that derivation needs real history to build its
+          # complete-checkout case from -- the default depth-1 checkout is
+          # exactly the shallow clone it exists to catch.
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: actions/setup-java@v5
@@ -89,6 +94,13 @@ jobs:
       - name: Check the Android-free entry point
         working-directory: logging-core
         run: ../gradlew test --stacktrace
+
+      # The version derivation and its publish refusals, which no unit test can
+      # reach: the cases ARE git checkouts on disk (a shallow clone, and a tree
+      # with no `.git` inside another repository). Runs after `check` so the
+      # Gradle caches are warm; about ten seconds locally.
+      - name: Verify the version derivation
+        run: ./scripts/verify-version-derivation.sh
 
       # A guard against a *false pass* cannot be proven by a passing run. The
       # version this check replaced -- ported from snoozemo, where it had been

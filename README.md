@@ -75,6 +75,71 @@ git clone --depth 1 https://github.com/mikelward/androidlog .androidlog 2>/dev/n
   || git -C .androidlog pull --ff-only
 ```
 
+### The version is `1.0.<commit count>`
+
+Every module publishes at `1.0.` plus `git rev-list --count HEAD`, so a commit
+reaching `main` is publishable exactly once and a later one can never reuse its
+number. Nothing is bumped by hand and there is no tag to forget.
+
+It starts at **1.0, not 0.x**, and that is a requirement rather than taste:
+mikelward/gradle-update reads a major version as the leading integer, so at
+`0.x` every release looks like the same major to a consumer's weekly dependency
+batch and is taken automatically — including one that breaks the API, in the
+phase where SemVer says breaking changes are allowed. Moving to `2.0` is how a
+breaking change announces itself to that batch.
+
+The count is derived from the checkout, and there are two ways to get a number
+that is wrong rather than absent. Both are worse than no answer, because a
+plausible one names a release that already exists with different contents:
+
+- **A shallow clone.** `git rev-list --count` answers anyway, with no warning.
+- **A tree with no `.git` of its own.** Git discovery walks *up*, so a source
+  archive unpacked inside another checkout — where a `curl | tar` lands as often
+  as not — is answered by that unrelated repository.
+
+Four things stand between either and a bad publish, and only the last is
+load-bearing:
+
+- `scripts/unshallow.sh`, run from the session-start hook, deepens the sandbox's
+  clone before anything reads history. Best-effort, and it says so when it
+  fails.
+- `gradle/version.gradle.kts` requires that `git rev-parse --show-toplevel`
+  equals this checkout, anchored to the script's own location so both entry
+  points agree. Equality rather than containment: a copy vendored *into* another
+  repository is contained by it either way, and only the top level tells them
+  apart.
+- It refuses to guess when either check fails, or when there is no `.git`
+  anywhere: `1.0.0-undetermined`, never a plausible number.
+- The publish tasks refuse that version outright, on **every route out**:
+  both task types, since `publishToMavenLocal` is a sibling of the remote
+  publish task rather than a subtype; and both entry points, since the offramp
+  makes `logging-core` a root that never evaluates the main build script — which
+  is why the guard lives in the shared version script rather than in either
+  root. Building, testing and a consumer's composite build are unaffected — the
+  version is inert there — so the failure lands only where it cannot be taken
+  back. It also refuses off the **release line**: a count is unique within one
+  history and not across branches, so a branch forking from `main` and adding
+  the same number of commits derives the same number for different contents.
+  Publishing is a release action, which is what that check makes true — and the
+  release line is `refs/remotes/origin/main`'s **first-parent lineage**, not
+  everything reachable from it, since a merged side branch is reachable and
+  "reachable" would admit after the merge exactly the commit it refused before.
+  And it refuses from a **dirty** checkout: editing a tracked file does
+  not move the count, so the version would stay right while the tree it names
+  was wrong. Untracked files don't count — build output is not what a
+  coordinate would misdescribe — and this costs nothing, because trying an
+  in-progress change against a consuming app is what `includeBuild` is for.
+
+`scripts/verify-version-derivation.sh` holds all of it, in CI and locally:
+it builds each of those checkouts and asserts both directions, including that a
+complete one still publishes — without that control, a build that refused
+everything would pass.
+
+Publishing is configured but not yet automated: `./gradlew
+publishAllPublicationsToStagingRepository` writes a complete repository tree
+under `build/maven/`, and the workflow that commits it to a branch this
+repository serves over HTTP is the next step (`TODO.md`).
+
 ### An offramp build includes `logging-core/`, not the root
 
 Several consumers keep a second Gradle root scoped to their pure-Kotlin

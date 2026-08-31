@@ -13,10 +13,18 @@ report. It was extracted from four hand-maintained copies — `simmo`,
 (the two `DebugFileSink.kt` copies differed by 525 lines, and each had had its
 own bug found in review that the others never got).
 
-**Consumers track `@main` by git clone plus a Gradle composite build — there is
-no version, no tag and no SHA anywhere.** A merge here reaches every consumer's
-next build with no release step in between, and nothing to bump. Everything
-below follows from that; `README.md` has the wiring.
+**Consumers track `@main` by git clone plus a Gradle composite build**, so a
+merge here reaches every consumer's next build with no release step in between
+and nothing to bump. Everything below follows from that; `README.md` has the
+wiring.
+
+That is changing, deliberately. The build now derives a real version —
+`1.0.<commit count>` — and publishes a complete repository tree under
+`build/maven/`, so a consumer can take a coordinate instead. Nothing serves that
+tree yet (`TODO.md`), and the composite stays supported either way: it is the
+fast edit-here-rebuild-the-app loop. What the coordinate removes is the AGP
+lockstep below, which is the constraint that broke every clothescast build at
+once on 2026-08-30.
 
 Keep this file as short as it can be and still work. Every session loads it
 whole, so each rule costs context on every turn: add one the first time
@@ -70,7 +78,21 @@ has stopped biting.
 
 ## Testing
 
-- `./gradlew test` and `./gradlew check` (which runs `verifyNoAndroid`).
+- `./gradlew test` and `./gradlew check` (which runs `verifyNoAndroid`), plus
+  `scripts/verify-version-derivation.sh`, which no unit test can replace: its
+  cases ARE git checkouts on disk (a shallow clone; a tree with no `.git` inside
+  another repository; a dirty tree; a branch off the release line), and what
+  they prove is that the published version identifies THIS checkout on the
+  release line, or is refused. Each fixture is given a synthesized
+  `refs/remotes/origin/main` -- the code under test never exists on the real one
+  until it merges, and without one per fixture every refusal would be the
+  release-line guard rather than the defect being tested. The success case runs
+  the AGGREGATE publish and asserts what it produced, cross-module POM
+  dependency included: `check` builds the AAR but publishes nothing, so a broken
+  Android publication would otherwise leave CI green and a consumer with an
+  unresolvable repository. It runs in CI after `check`, needs `fetch-depth: 0`,
+  and grades HEAD rather than the working tree -- it says so when the tree is
+  dirty.
 - **CI carries the fleet's standard checks: `lanes`, `codex`, and `zizmor`.**
   The lane engine is `mikelward/lanes`, tracked `@main` — this repository
   carries only its policy (`.github/lanes.conf`) and the thin `classify` /
