@@ -208,19 +208,21 @@ paragraph and was left saying the opposite here (Codex, PR #13).
 **A report says what it actually contains, not what the flag currently says.**
 The first draft of this rule was *turning redaction back on clears the buffer
 and the file*, and that is necessary but nowhere near sufficient (Codex, PR
-#13). Prior runs deliberately survive an opt-out — `DebugFileSink.onCleared`
-skips `current` while a retained previous run is there and never touches the
-rotated `androidlog-prev-*` set, because a crash the user has not seen yet is
-exactly what that set exists to keep. So: record unredacted, restart so the run
-rotates, turn redaction back on, and `readPreviousRun()` still offers a full
-run to a share whose consent line, derived from today's flag, calls it
-redacted.
+#13). A *redaction* change purges nothing — only the recording opt-out does
+(2026-08-31), and these are separate switches. So: record unredacted, restart
+so the run rotates, turn redaction back on, and `readPreviousRun()` still
+offers a full run to a share whose consent line, derived from today's flag,
+calls it redacted.
 
-Purging the prior-run set on the transition is the wrong repair — it destroys
-an unshared crash report to protect data the user themselves chose to record.
-The right one is to **carry the mode with the run** and derive the consent copy
-from the union of what the report includes: any unredacted run in it makes the
-report unredacted, whatever the setting reads now.
+Purging the prior-run set on the transition is the wrong repair *for this*,
+and remains so. It is now what the **recording** opt-out does — reversed by the
+maintainer, 2026-08-31, see *The opt-out deletes every prior run* below — but
+these are two different switches: turning **redaction** back on is not a request
+to delete anything, so answering it by destroying an unshared crash report would
+still be spending the user's own recorded data to fix a labeling bug. The right
+repair here is unchanged: **carry the mode with the run** and derive the consent
+copy from the union of what the report includes — any unredacted run in it makes
+the report unredacted, whatever the setting reads now.
 
 **The mark has to be durable before the content it describes, not applied at
 rotation** (Codex, PR #13, against the first version of this paragraph, which
@@ -457,31 +459,92 @@ PR #4).
   opening.
 - **Reversible:** one call site.
 
-### The opt-out purge is not durable across a process death
+### RESOLVED: the opt-out purge is not durable across a process death
+
+**Closed 2026-08-31**, by the change that widened the opt-out (below). Kept
+rather than deleted because the reasoning that left it open was sound and the
+thing that changed was not a new technique but a realization about what was
+already on disk.
 
 Codex raised this as a P1 on PR #4. `setRecording(false)` reaches
-`DebugFileSink.onCleared`, which *enqueues* the purge of `debug.log` rather than
-doing it inline. A process killed between `setRecording(false)` returning and
-that task draining leaves the file, and the next start rotates it into the
-prior-run set — where a report can still pick up entries from before the user
-opted out, which is the exact leak the purge exists to close.
+`DebugFileSink.onCleared`, which *enqueues* the purge of `androidlog.log`
+rather than doing it inline. A process killed between `setRecording(false)`
+returning and that task draining leaves the file, and the next start rotates it
+into the prior-run set — where a report can still pick up entries from before
+the user opted out, which is the exact leak the purge exists to close.
 
-**Real, and deliberately left open**, because every way of closing it costs more
-than the window it removes.
+Every closure considered at the time cost more than the window it removed. A
+synchronous write runs under the buffer's monitor, so it blocks every recorder
+in the process for as long as storage is slow — a hang on the app's own threads
+to close a window that needs a kill inside a few milliseconds. A durable record
+of the request has the same problem one level down: it is a write, so a kill
+before *it* lands leaves the same gap, and it adds a file whose own failure
+modes then need answering.
 
-- The window is one in-flight file operation wide. The task is enqueued with no
-  delay, so it runs ahead of any debounced write, and the worker is doing at most
-  one thing.
-- **Alternative — write the purge synchronously.** `onCleared` runs under the
-  buffer's monitor, so a disk write there blocks every recorder in the process
-  for as long as storage is slow. That is a hang on the app's own threads to
-  close a window that needs a kill inside a few milliseconds.
-- **Alternative — a durable record of the request, consumed at the next start.**
-  That record has the same problem one level down: it is a write, so a kill
-  before *it* lands leaves the same gap, and it adds a file whose own failure
-  modes then need answering.
-- **Reversible:** whichever fix is chosen, it is local to `onCleared` and the
-  startup rotation. Nothing else depends on the purge being asynchronous.
+**What was missed: the setting is already that durable record.** The app
+persists it and passes it to `setRecording` at startup, so no second file is
+needed — `start()` reads `log.isRecording` on the worker, and a start that finds
+recording off purges instead of rotating. The window still exists, and now
+closes at the next start rather than staying open forever.
+
+### A stand-down recorded while recording is off can go unreported
+
+Found while testing the refused-startup-purge fix (PR #23), and **pre-existing
+— not introduced by it**. `standDownFromMirroring` holds its reason when
+`log.warning` does not land, and `reportStandDown` runs from
+`runDebouncedWrite`. But a stand-down is exactly what stops mirroring, so when
+one is recorded while recording is off there may be no later write to carry the
+held reason, and it can sit there for the life of the process.
+
+The purge's own held report does not have this problem: a failed purge does not
+stand mirroring down, so writes still happen and `reportPurgeFailure` runs from
+the same place. It is specifically the stand-down that suppresses its own
+carrier.
+
+Not fixed here, and deliberately: the fix is a second reporting route that does
+not depend on mirroring, which is a change to the reporting design rather than
+to this PR's subject. The user-visible consequence is bounded — the *caller* is
+told through `StorageOutcomes` on the paths that matter, which is what PR #23
+added for the refused startup purge; what can be lost is the log line
+explaining it.
+
+- **Reversible:** it is an addition, not a change to anything existing.
+
+### The opt-out deletes every prior run
+
+**Decided by the maintainer, 2026-08-31.** `onCleared` used to discard only
+`current` and `temp`, deliberately: prior runs survived an opt-out because a
+crash the user has not sent yet is what the rotated set exists to hold, and
+deleting it destroys evidence the user themselves chose to record.
+
+That reasoning was made without the consuming apps' own copy in view. Snoozemo's
+`SPEC.md` §4.6 already promises the opposite — *"turning the setting off deletes
+what was kept, immediately: the current run and every earlier one still held,
+pinned crashes included"* — so the setting was reporting success over files it
+had left on disk, which is the worse of the two failures. Losing an unsent crash
+is the user's own call at the moment they turn the setting off.
+
+So the purge now takes `current` unconditionally (no carve-out for a run a
+failed rotation left there), `temp`, and every `androidlog-prev-*` entry. A
+directory that will not list fails the opt-out rather than reading as empty: it
+cannot claim to have removed files it never saw. An entry that will not go but
+held nothing — the obstruction directory a failed rotation leaves under a
+prior-run name — is not reported, since the warning would be about data that is
+in fact gone.
+
+- **Scope today is Snoozemo alone.** It is the only consumer with an on/off
+  switch (Settings → *Debug log*, `DebugLogStore`). clothescast never calls
+  `setRecording`, so `onCleared` never fires there; Type Launcher and Simmo are
+  not migrated and have no switch either. The others inherit this if they grow
+  one.
+- **Not the analytics preference.** Type Launcher's *Analytics* toggle governs
+  Crashlytics and Performance Monitoring — data that leaves the device. The
+  on-device log is a separate flow that leaves only when the user shares it, and
+  wiring the purge to Analytics would delete the local evidence a user needs in
+  order to file a bug report by hand.
+- **Reversible:** `purgeOnWorker` and the guard at the top of `start()`'s worker
+  task. The tests that asserted the old rule are renamed rather than deleted, so
+  the reversal is greppable.
 
 ### The floor is applied at ingestion, so there is one rendering
 
