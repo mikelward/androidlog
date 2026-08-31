@@ -98,9 +98,10 @@ object DebugReport {
      * A failure inside [buildPayload] is contained: a report is most useful
      * after something has already gone wrong, so a failure while inspecting
      * that state must never become a second one. The app's section then names
-     * the failure's *type* — never its message, per the floor — and the prior
-     * run is still appended and still consumed, because it is still there to
-     * read.
+     * the failure's *type* only — a stand-in, not a floor: the failure is
+     * recorded through [log] one line earlier, with its message, into the run
+     * this report is already carrying. And the prior run is still appended and
+     * still consumed, because it is still there to read.
      */
     fun collect(
         log: DebugLog,

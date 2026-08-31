@@ -152,7 +152,23 @@ question of whether the other three *should* be able to reach it.
 default (on) preserves today's behavior exactly, so nothing an existing install
 has recorded changes.
 
-### ANSWERED: a per-app redaction setting, default reduced
+### SUPERSEDED: a per-app redaction setting, default reduced
+
+**Superseded 2026-08-31 by the on-device/off-device split** (see *REVERSED: the
+floor is applied at ingestion* below). This section's whole purpose was to buy
+Type Launcher a full local log without a second rendering; the split gives every
+app one by default, so there is nothing left for a setting to choose. What goes
+with it: `either(...)` is not needed and will not be added, the hidden five-tap
+gesture is not needed, and the sticky per-run redaction mark and flag-derived
+consent copy below dissolve with the flag they described — a share now always
+carries the device's own form, so the consent copy is fixed text again and is
+accurate by construction.
+
+Kept rather than deleted because two of its findings survive on their own and
+are cited elsewhere: **snoozemo's timestamps are not tier-two data**
+(maintainer, 2026-08-30), and **the two tiers** — tier one is reduced by the app
+before the library sees it, in every mode, which is exactly what the split
+leans on.
 
 Raised 2026-08-30 by surveying the third consumer, answered by the maintainer
 the same day. The question was whether this library should keep a second,
@@ -637,15 +653,217 @@ in fact gone.
   task. The tests that asserted the old rule are renamed rather than deleted, so
   the reversal is greppable.
 
-### The floor is applied at ingestion, so there is one rendering
+### An off-device sink, so the library does the fan-out
 
-**Amended, not reversed (2026-08-30).** The maintainer's per-app redaction
-setting — recorded under *Decisions needing review* — keeps exactly one
-rendering and keeps it at ingestion; it makes the choice a process-wide
-parameter instead of a constant, so the buffer, the file and every sink still
-carry identical text. What stays forbidden is what this section was written
-against: a rendering chosen *per sink*. Not built yet, and deliberately
-deferred until Type Launcher is migrated.
+Proposed by the maintainer, 2026-08-31, on reading Codex's P1 against PR #24:
+*"I feel like we want it as a sink after androidlog already filtered.. maybe we
+can have multiple layers?"* Agreed as the shape of the telemetry step, and
+recorded here rather than built into the PR that made it possible.
+
+**Confirmed by the maintainer** on the point a reviewer will object to first —
+*"destination class — there are exactly two, a sink declares which it is, and it
+can't invent a third"* — *"yes exactly"*. That sentence is the whole answer to
+the no-per-sink-rendering rule, so it is written down rather than left to be
+re-derived.
+
+**What it replaces.** Every consumer hand-writes its own fan-out today. Type
+Launcher's `LauncherDebugLog.event` is three calls in a row — `record(...)`,
+`Log.d(...)`, `LauncherTelemetry.log(formatLogMessage(..., leavingDevice =
+true))` — repeated across `pinnedEvent`, `warning` and `failure`, with `failure`
+adding a fourth for the reconstructed throwable. Four functions that must each
+remember to reduce, in each of four apps, is the duplication this library exists
+to end, and a call site that forgets one is a silent leak rather than a
+compile error.
+
+**The shape.** A sink declares which kind of destination it is, and the library
+delivers the rendering that destination may have. Something like an optional
+`Destination` on `addSink`, defaulting to on-device so every existing call site
+is unchanged:
+
+```kotlin
+enum class Destination { DEVICE, OFF_DEVICE }
+fun addSink(sink: Sink, destination: Destination = Destination.DEVICE)
+```
+
+**Why this is not the per-sink rendering the floor forbids.** That rule was
+against a sink *choosing* how a value is written — a rendering per sink, with
+the reduction depending on each one remembering to ask. Here the choice belongs
+to the destination class, there are exactly two of them, and a sink cannot
+invent a third: it says what it *is*, and the library decides what that gets.
+The old rule's specific worry — a value in full in the process while a reduced
+copy goes elsewhere — is already spent under the boundary rule, since the full
+form now lives in the buffer and the file by design.
+
+**What it buys beyond tidiness.** It answers Codex's P1 (PR #24) properly. That
+finding is currently answered by documentation — `Sink`'s KDoc says a sink is an
+on-device destination and nothing enforces it. Under this, a consumer wanting an
+off-device sink says so and gets the reduced text, and the mistake Codex
+described stops being available rather than being merely warned against.
+
+**The sketch, as settled** (maintainer, 2026-08-31). Two values and one
+optional argument, and nothing else:
+
+```kotlin
+enum class Destination { DEVICE, OFF_DEVICE }
+fun addSink(sink: Sink, destination: Destination = Destination.DEVICE)
+```
+
+**A `minLevel` filter was designed and then dropped, and the reason is worth
+keeping.** The idea was a per-registration floor so an off-device sink could
+take warnings and failures while the device kept everything — Crashlytics keeps
+a bounded breadcrumb ring, so a chatty log evicts the lines a crash is read
+backwards from. Counting the fleet's actual call sites killed it:
+
+| | `event` (D) | `verbose` (V) | `info` (I) | `warning` (W) | `failure`/`error` |
+|---|---|---|---|---|---|
+| typelauncher | 183 | 0 | 0 | 16 | 91 |
+| simmo | 16 | 0 | 0 | 111 | 0 |
+| snoozemo | 38 | 0 | 0 | 26 | 30 |
+| clothescast | 1 | 1 | 1 | 2 | 8 |
+
+`verbose` and `info` are vestigial — one call each, both in clothescast. So the
+dial has exactly two reachable positions, `D`-and-above and `W`-and-above, and
+the second is the wrong one: every app records its state transitions through
+`event`, which is `D`, so a `W` floor leaves the breadcrumb trail holding the
+warnings and the crash — the part the stack trace already gives you. A control
+whose only two settings are "the default" and "break it" is not a control.
+
+So: **no `minLevel`.** An off-device sink gets every line, which is what Type
+Launcher sends today, so the migration preserves behavior. If a ring ever does
+overflow, add filtering then, with the evidence in hand — and note the volume
+case is already handled a layer up, by lines that never enter the buffer at all
+(Type Launcher's `trace()`, one line per icon per render size, is logcat-only
+and so reaches no sink). **This library has no `trace()` equivalent**, so Type
+Launcher's migration needs one or those lines need somewhere else to go.
+
+**The level filter and the redaction are orthogonal, and only the second is a
+privacy control.** Destination decides what the text *says* — off device, an
+untagged `String` and a `sensitive(...)` value both render `•••` and throwable
+messages are dropped. A level would only ever have decided which *lines* go.
+There is no level at which anything leaves unreduced, which is why getting the
+dial wrong could only ever have cost noise, never exposure.
+
+**A per-call opt-in was considered and set aside — as a judgment, not a
+refutation** (maintainer, 2026-08-31). A `log()` / `logT()` pair, deciding per
+message. Named functions beat a boolean here, and the repo has the precedent:
+`warning` and `failure` are separate names precisely so the compiler finds the
+misuse rather than an overload silently binding it wrong.
+
+An earlier draft of this entry argued it would cost Type Launcher a per-call-
+site decision 323 times. **That was wrong and the maintainer caught it**: Type
+Launcher sends every line to telemetry today, so migrating would be a
+mechanical rename of all 323, with nothing to decide at any of them.
+
+What actually favors registration is structural, and smaller than that:
+
+- **The API surface doubles.** Seven functions become fourteen, and every
+  future one is two.
+- **"Where does this go" gets distributed.** Registration keeps it as one line
+  of configuration a reader can check; a per-call pair makes it a property of
+  300+ call sites, which drifts as people copy the neighboring line.
+
+What favors `logT()`, and is the stronger half of its case:
+
+- **It fails safe.** With the plain name local-only, forgetting the opt-in
+  means a line does not reach telemetry — the right direction to fail, and
+  better than registration's, where a new call site joins the stream by
+  default.
+- **It expresses something registration cannot at all**: holding one specific
+  line back. Registration has no way to say that without reintroducing a
+  filter, which is the thing deleted above.
+
+So: build registration, and reach for a per-line opt-out only when a line
+actually needs holding back — at which point the failure-direction argument
+above is the one to re-read, because it is the real cost of having chosen
+registration.
+
+**Still open, and worth deciding before building:**
+- Render the off-device form lazily, only when an off-device sink is registered
+  — otherwise every entry pays for a second rendering nobody reads.
+- `recordException` needs a *Throwable*, not a string (Type Launcher's
+  `redactedForTelemetry()` rebuilds the cause chain with empty messages). So the
+  off-device sink interface probably carries the throwable alongside the line,
+  or the library grows the reconstruction. That is the option-A work below.
+- Whether the app's telemetry gate (Type Launcher's Analytics preference) lives
+  in the sink or in the library. In the sink, almost certainly — and note this
+  is a *whole-channel* switch, "may we send at all", tied to a consent UI and a
+  Play Data Safety declaration, not per-message selection. Per-message privacy
+  is already finer-grained and better served by `sensitive(...)`, which
+  withholds one argument rather than a whole line.
+
+### Reconsider dropping every off-device exception message
+
+Deferred by the maintainer, 2026-08-31, alongside the split above: *"the concern
+was we can't ever fully redact sensitive things from the exception message
+because we don't know the types/content/sensitivity, but we also lose a lot by
+dropping it fully. So I want a to-do to reconsider, but I'm happy with the split
+we just agreed for now. Off device is the boundary for exception messages."*
+
+What it costs today: a crash report that names `IllegalStateException` and its
+frames, where the message would have said which of five preconditions failed.
+For a platform exception whose message is fixed vocabulary — `Binder` died,
+`Activity` not found for an action — dropping it buys nothing and loses the
+answer.
+
+The candidate, if it is taken: a call-site opt-in, `failure(safe(throwable), …)`,
+carrying the message off device only where the call site has judged that this
+type's message is vocabulary rather than content. It fails closed — an untagged
+throwable keeps today's behavior — and it puts the decision where the type is
+known, which is the one place it *can* be made. What it does not solve: a
+platform type whose message is vocabulary in the case the call site had in mind
+and content in another, which is why this is a to-do rather than a plan.
+
+Not a candidate: classifying message content here. The message's shape and its
+sensitivity are both unknown to this code, so any partial answer is a guess, and
+a guess that fails open is the failure mode the type rule exists to retire.
+
+### Simmo: a masked number is `sensitive`, not `safe`
+
+For simmo's migration, and recorded here because it is the vocabulary question
+the split answers (maintainer, 2026-08-31): *"app redacts plus sensitive for
+phone numbers, log library ensures sensitive and non-safe strings don't go off
+device."*
+
+So `redactNumber` stays where it is — the app reduces tier-one data before the
+library sees it, which is the floor that never moves — and its **result** is
+wrapped in `sensitive(...)` rather than `safe(...)`. That keeps
+`+61••••••678 (len=12)` in the device's own log, where the country code and last
+three digits are what makes a routing failure diagnosable, and renders `•••` in
+anything leaving. `safe(...)` would have carried the masked form off device too,
+which is more than simmo has ever sent.
+
+The same reading applies to any app value that is reduced but still narrows to a
+person: masked, not anonymous. `safe(...)` is for fixed vocabulary — a state
+name, an intent action, a wake-up source — where there is nothing left to narrow.
+
+### REVERSED: the floor is applied at ingestion, so there is one rendering
+
+**Reversed by the maintainer, 2026-08-31.** The floor is a **boundary**, not an
+ingestion filter: what the log records for the device carries every argument in
+full, throwable messages included, and `•••` appears only in a rendering that is
+leaving — `formatLogMessage(..., leavingDevice = true)`, `offDeviceTrace(...)`.
+
+What forced it: surveying Type Launcher showed the single rendering was the
+*reduced* one, so migrating it would not merely have dropped its exception
+messages — it would have blanked its whole local log, every package and
+component name included, which is the entire diagnostic that log exists for.
+The same reasoning applies to the others; simmo only escaped it by reducing its
+own values far enough upstream that the loss did not show.
+
+Why this is not the two-form design the argument below was written against: the
+choice is made by **destination**, never per sink and never per call site. Every
+on-device destination — the buffer, `snapshot()`, every sink, the persisted
+file, the report the user chooses to share — carries the same text. There is one
+other rendering, and it exists only where something leaves without the user in
+the loop.
+
+And the real floor did not move: a full dialed number, an ICCID, a coordinate, a
+whole SSID is reduced by the app before the library sees it, so what is now
+rendered in full is already the app's reduced form. This governs the tier below
+that — a package name, a row id, a place name.
+
+Kept because two things it established still hold: a rendering is never chosen
+per sink, and the file never carries more than the buffer.
 
 
 Codex raised this twice on PR #4, as a P1 both times: the persisted file carried
@@ -676,10 +894,11 @@ Two things that made this cheap rather than the capability loss I argued it was:
   the core owns the default.
 
 One widening came with it: a bare `Throwable` argument now passes the type rule.
-Its rendering here is fixed to the class name and the no-messages floor
-guarantees nothing reaches its message, so it names a type rather than a person —
-the same reason an enum passes. Withheld, it took the one thing a failure line is
-read for.
+Its rendering *as an argument* is fixed to the class name in both directions, so
+it names a type rather than a person — the same reason an enum passes. Withheld,
+it took the one thing a failure line is read for. (The 2026-08-31 reversal above
+does not touch this: the split governs the throwable a failure carries, never
+one bound into a `%s`.)
 
 Left deliberately narrow: an *unknown* type also renders as its class name and
 could pass by the same argument. It does not, because that would rest on a
@@ -981,12 +1200,13 @@ own `runCatching`, before the snapshot and after the crash marker.
   module that needs resources, which is why it is its own module. **It has to
   show the user the report before it is sent** — but not for the reason this
   entry used to give (Codex, PR #4). The old rationale was that the on-device
-  log rendered everything in full and the share was where reduction happened;
-  the floor moved to ingestion, so there is one rendering and the file already
-  holds the reduced text. The preview stands on its own: a report names the
-  user's own device state, and sending it is irreversible, so they should see
-  what they are sending before it goes. **Do not build a second, fuller
-  rendering to preview** — that is the two-form design this PR removed.
+  log rendered everything in full and the share was where reduction happened.
+  The floor is now a boundary (2026-08-31), so the file holds the device's full
+  form and a share carries it — which puts some of that old rationale back, but
+  not as the reason. The preview stands on its own: a report names the user's
+  own device state, and sending it is irreversible, so they should see what
+  they are sending before it goes. **Do not build a second, fuller rendering
+  to preview** — the preview shows the file as it is.
 - **Each migration deletes its own app's legacy log files.** This library writes
   `androidlog.log` / `androidlog-prev-*`; simmo and typelauncher's own sinks
   write `debug.log` / `debug-prev-*`, snoozemo and clothescast others again.

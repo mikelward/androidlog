@@ -33,10 +33,22 @@ import kotlin.concurrent.write
  *
  * **The privacy floor is enforced by what this API accepts, not by scrubbing**
  * (see `LogValue.kt`): a hard-coded format string plus arguments, each argument
- * carried or withheld on its own by its type. The two places data-shaped values
- * could still slip through are closed structurally — a throwable renders as
- * **types and stack frames only, never messages**, and a composite renders its
- * elements as arguments in their own right, so each is judged by the same rule.
+ * carried or withheld on its own by its type. A composite renders its elements
+ * as arguments in their own right, so each is judged by the same rule, and a
+ * throwable bound into a `%s` placeholder renders as its type alone — that one
+ * holds in both directions, because it rests on never calling an unknown
+ * `toString()` rather than on where a line is going.
+ *
+ * **The floor is a boundary, not an ingestion filter, and everything this class
+ * returns is on the device's side of it.** [snapshot], [pinnedSnapshot],
+ * [boundedSnapshot], every [Sink] and anything persisted from them carry the
+ * full rendering: untagged strings as they were passed, and each throwable's
+ * message with its type and frames. That is deliberate — this log exists to be
+ * read by the person whose device it is — but it makes one thing the caller's
+ * job: **nothing here may be forwarded off the device as it stands.** A
+ * consumer building a crash-reporter breadcrumb, an automatic report, anything
+ * that leaves without the user in the loop, renders it from
+ * [formatLogMessage] with `leavingDevice = true` and [offDeviceTrace] instead.
  */
 open class DebugLog(
     /** Bounds the buffer; old entries fall off the front. */
@@ -88,6 +100,17 @@ open class DebugLog(
         const val DEFAULT_MAX_ENTRY_CHARS = 2_000
         const val DEFAULT_MAX_TRACE_FRAMES = 6
         const val DEFAULT_MAX_CAUSE_LINKS = 5
+
+        /**
+         * How much of one throwable's message the device's own copy keeps.
+         *
+         * Not a constructor setting, unlike the frame and cause-link bounds:
+         * those trade diagnostic depth against the entry budget and an app
+         * might reasonably want a different trade. This one exists only so a
+         * pathological message cannot spend the whole entry, and the frames it
+         * would push out are the part nothing else can recover.
+         */
+        private const val MAX_MESSAGE_CHARS = 300
 
         private val TIMESTAMP: DateTimeFormatter =
             DateTimeFormatter.ofPattern("MM-dd HH:mm:ss.SSS", Locale.US)
@@ -247,6 +270,22 @@ open class DebugLog(
      * Where each entry is mirrored once it is safely in the buffer — the
      * persisted file, logcat, anything the app adds. Each call is isolated, so
      * one sink's failure can't reach another or the caller.
+     *
+     * **A sink is an on-device destination, and that is a contract rather than
+     * a convention** (Codex, PR #24). What arrives here is the rendering this
+     * device keeps: every argument in full and each throwable's message with
+     * it. So a sink may write to disk, to logcat, to a screen, to anything the
+     * user can reach — and may not forward to a crash reporter, an analytics
+     * service, or any other automatic channel, because the text it is handed
+     * is not the form that may leave.
+     *
+     * Nothing here can enforce that, and nothing here should try: an app
+     * building something that leaves renders it itself, from
+     * [formatLogMessage] with `leavingDevice = true` and [offDeviceTrace], as
+     * its own call rather than as a sink. Handing a sink structured data so it
+     * could re-render for its own destination is the per-sink rendering the
+     * floor forbids — it puts a value in the process in two forms and makes
+     * the reduction depend on each sink remembering to ask.
      *
      * **A sink enqueues; it does not write inline.** Delivery happens under the
      * buffer's monitor, so a sink that blocks here blocks every other recorder,
@@ -464,12 +503,19 @@ open class DebugLog(
      * user's, and each argument is carried or withheld on its own by
      * [logArgumentMayLeaveDevice].
      *
-     * **The floor is applied here, as the entry is recorded, and there is one
-     * rendering.** An argument it withholds renders as [REDACTED_PLACEHOLDER]
-     * in the buffer, on the device's own log screen, in every sink and in
-     * anything persisted or shared — there is no fuller form anywhere. A call
-     * site that has already reduced a value keeps it by saying `safe(...)`;
-     * one that has not sees the placeholder the first time anyone looks.
+     * **What is recorded here is the device's own copy, and it is whole.**
+     * Every argument renders as it was passed, so the buffer, the log screen,
+     * every sink and anything persisted from them read the same full text. The
+     * floor applies at the boundary instead: an argument
+     * [logArgumentMayLeaveDevice] withholds renders as [REDACTED_PLACEHOLDER]
+     * in [formatLogMessage] with `leavingDevice = true`, which is what a
+     * caller building something that *leaves* renders from.
+     *
+     * So `safe(...)` is not what keeps a value here — nothing withholds it
+     * here. It is what carries a value off the device as well, for a call site
+     * that has already reduced it; and `sensitive(...)` is the other way
+     * round, keeping the full form on the device and withholding it from
+     * anything that leaves.
      *
      * Interpolating into [format] defeats it. The type system cannot enforce
      * that, so it is a rule: pass values as arguments.
@@ -806,16 +852,29 @@ open class DebugLog(
         // dropped call or a stuck snooze is not. Built before the gate is
         // taken, so rendering never holds it.
         //
-        // **Redacted here, once, and there is no other form.** The floor is
-        // applied at ingestion rather than at whichever boundary happens to be
-        // last, so the buffer, `snapshot()`, every sink and anything derived
-        // from them all carry the same text. Rendering full and reducing later
-        // would mean two renderings of every entry -- twice the buffer, and a
-        // rule that holds only as long as every future reader remembers to ask
-        // for the reduced one. An argument the type rule withholds never exists
-        // in full anywhere in this process (maintainer, 2026-08-30).
+        // **Rendered for this device, which is where this log lives.** The
+        // buffer, `snapshot()`, every sink and the persisted file are all on
+        // the device, and nothing among them leaves it without the user
+        // opening a report and consenting. So they carry the full rendering:
+        // the strings that make a log worth reading -- a component, a label,
+        // a package -- and a throwable's message with it.
+        //
+        // This reverses *the floor is applied at ingestion, so there is one
+        // rendering* (maintainer, 2026-08-31). That rule reduced the buffer
+        // itself, on the reasoning that a value the type rule withholds should
+        // exist in full nowhere in the process. What it cost was the log: an
+        // untagged `String` is every identifier *and* every diagnostic, so
+        // reducing at ingestion left the on-device log reading `•••` where the
+        // answer was supposed to be. The rule was aimed at what *leaves*, and
+        // there was one rendering to hang it on; with two, it applies where it
+        // was always pointed -- see [formatLogMessage] with `leavingDevice =
+        // true`, and [offDeviceTrace].
+        //
+        // The floor that does not move is the app's: a full number, an ICCID,
+        // a coordinate is reduced *before* this sees it, and no rendering here
+        // can put one back.
         val entry = runCatching {
-            render(now, level, formatLogMessage(format, args, redactSensitive = true), throwable)
+            render(now, level, formatLogMessage(format, args, leavingDevice = false), throwable)
         }.getOrElse { return false }
         gate.read {
             // Still the same session? Anything else — a disable, a re-enable,
@@ -1051,7 +1110,7 @@ open class DebugLog(
         val entry = if (throwable == null) {
             "$timestamp $level $message"
         } else {
-            "$timestamp $level $message\n${throwable.typesAndFrames().trimEnd()}"
+            "$timestamp $level $message\n${throwable.typesAndFrames(leavingDevice = false).trimEnd()}"
         }
         if (entry.length <= maxEntryChars) return entry
         // Stepped back off a high surrogate, so the cut never splits a pair and
@@ -1062,15 +1121,47 @@ open class DebugLog(
     }
 
     /**
-     * A cause chain as **types and frames only** — deliberately never
-     * `getMessage()`, from any link.
+     * [throwable] as types and frames, with no message from any link — the one
+     * form of it that may leave the device.
      *
-     * A platform exception quotes what it was given, and on the paths this log
-     * exists for that is exactly what the floor bans: the number that was
-     * dialed, the network that was joined, the package that failed to launch.
-     * There is no scrubber here to catch it (AGENTS.md), so the message is not
-     * read at all. The type names the failure and the frames locate it, which is
-     * what a bug report needs.
+     * The public half of the split [typesAndFrames] describes. What this log
+     * records for the device itself carries each link's message; a consumer
+     * building something that leaves — a crash-reporter breadcrumb, an
+     * automatic report — asks for this instead, and gets the reduced form
+     * without having to know how to reduce it. The counterpart for a formatted
+     * message is [formatLogMessage] with `leavingDevice = true`.
+     *
+     * Bounded per link and per chain by this log's own settings, like a
+     * recorded entry, but not truncated to `maxEntryChars`: the caller knows
+     * what its destination will take.
+     */
+    fun offDeviceTrace(throwable: Throwable): String =
+        throwable.typesAndFrames(leavingDevice = true).trimEnd()
+
+    /**
+     * A cause chain as types and frames — and, on the device's own copy, each
+     * link's message.
+     *
+     * **Off the device the message is never read, from any link.** A platform
+     * exception quotes what it was given, and on the paths this log exists for
+     * that is exactly what the floor bans: the number that was dialed, the
+     * network that was joined, the package that failed to launch. There is no
+     * scrubber here to catch it (AGENTS.md), and there cannot usefully be one —
+     * the message's content and its sensitivity are both unknown to this code,
+     * so any partial answer would be a guess. The type names the failure and
+     * the frames locate it, which is what an automatic report may carry.
+     *
+     * **On the device it is read in full**, because the same argument runs the
+     * other way there: dropping it costs `ActivityNotFoundException`'s intent
+     * and `NameNotFoundException`'s package, which is the whole of what those
+     * failures are diagnosed from, and nothing here leaves without the user
+     * opening a report and consenting (maintainer, 2026-08-31). Whole or
+     * nothing, chosen by destination, is what lets this avoid classifying
+     * message content it cannot classify.
+     *
+     * Whether an off-device message could be opted into per call site — where
+     * the type is known and its message is vocabulary — is recorded in
+     * `TODO.md` rather than built.
      *
      * Walks the cause chain and names what each link suppressed (see
      * [appendSuppressed]) -- a close failure is on neither, and is lost by a
@@ -1079,7 +1170,7 @@ open class DebugLog(
      * Guarded against a cyclic cause chain, and bounded per link and per chain
      * so one throw can't consume the whole entry budget.
      */
-    private fun Throwable.typesAndFrames(): String = buildString {
+    private fun Throwable.typesAndFrames(leavingDevice: Boolean): String = buildString {
         val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
         var prefix = ""
         var links = 0
@@ -1091,15 +1182,62 @@ open class DebugLog(
                 appendLine("\t... more causes elided")
                 break
             }
-            appendLine(prefix + throwable.javaClass.name)
+            appendLine(prefix + throwable.javaClass.name + messageSuffix(throwable, leavingDevice))
             val frames = throwable.stackTrace
             val keep = minOf(maxTraceFrames, frames.size)
             for (i in 0 until keep) appendLine("\tat ${frames[i]}")
             if (frames.size > keep) appendLine("\t... ${frames.size - keep} more")
-            appendSuppressed(throwable)
+            appendSuppressed(throwable, leavingDevice)
             current = runCatching { throwable.cause }.getOrNull()
             prefix = "Caused by: "
         }
+    }
+
+    /**
+     * A throwable's message, ready to append after its type — or nothing at all
+     * when this rendering is leaving the device.
+     *
+     * Read through `runCatching` because `getMessage()` is overridable and runs
+     * arbitrary code on the recording path; a throw here would lose the entry
+     * that was being written about a failure, which is the worst moment for it.
+     * An absent or blank message renders as nothing rather than a bare colon.
+     */
+    private fun messageSuffix(throwable: Throwable, leavingDevice: Boolean): String {
+        if (leavingDevice) return ""
+        val message = runCatching { throwable.message }.getOrNull() ?: return ""
+        // Bounded **before** flattening rather than after (Codex, PR #24).
+        // Flattening first built a whole copy of a message that might be
+        // megabytes, on the recording path, only to throw all but a few hundred
+        // characters of it away -- paying in full the allocation the bound
+        // exists to prevent. `length` and `take` are both cheap, so nothing
+        // beyond this prefix is ever copied.
+        val overlong = message.length > MAX_MESSAGE_CHARS
+        val head = if (overlong) message.take(MAX_MESSAGE_CHARS + 1) else message
+        // Flattened, because a message is the one part of this rendering whose
+        // content nothing here chose. A newline in it would otherwise open a
+        // line indistinguishable from the ones this builds -- `Caused by: `
+        // and `\tat ` are only text -- so a message could describe a failure
+        // that never happened, in a log someone pastes into a bug report.
+        //
+        // Flattening never grows a string: a line's `trim` only removes, and
+        // one separator stands in for the newline it replaces. So the cut below
+        // can only shorten what is already at most `MAX_MESSAGE_CHARS + 1`, and
+        // a message that is mostly newlines simply contributes less than the
+        // bound rather than being read further to fill it.
+        val kept = head.lineSequence().joinToString(" ") { it.trim() }.trim()
+        // A blank message renders as nothing rather than a bare colon -- but a
+        // long one whose *prefix* is all whitespace still says so, because
+        // content was read and dropped and a silent drop is the one thing this
+        // library does not do.
+        if (kept.isEmpty()) return if (overlong) ": $TRUNCATION_MARKER" else ""
+        // The bound itself, for the same reason the frames and the cause chain
+        // have one: a message long enough to reach this would otherwise push
+        // the frames out, and the frames are the half of a failure line that
+        // cannot be recovered from anywhere else. The marker is driven by
+        // `overlong` -- what was dropped is raw message, whether or not the
+        // flattened form still reaches the bound.
+        if (!overlong) return ": $kept"
+        return ": " + kept.take(codePointCut(kept, MAX_MESSAGE_CHARS)) + TRUNCATION_MARKER
     }
 
     /**
@@ -1122,12 +1260,15 @@ open class DebugLog(
      * it answers the same question: how many linked throwables may one entry
      * name. Costs nothing on the common path, where nothing is suppressed.
      */
-    private fun StringBuilder.appendSuppressed(throwable: Throwable) {
+    private fun StringBuilder.appendSuppressed(throwable: Throwable, leavingDevice: Boolean) {
         // `suppressed` allocates a copy on each call and is overridable, so it
         // is read once and guarded like `cause` is.
         val suppressed = runCatching { throwable.suppressed }.getOrNull() ?: return
         val keep = minOf(maxCauseLinks, suppressed.size)
-        for (i in 0 until keep) appendLine("\tSuppressed: ${suppressed[i].javaClass.name}")
+        for (i in 0 until keep) {
+            val link = suppressed[i]
+            appendLine("\tSuppressed: ${link.javaClass.name}${messageSuffix(link, leavingDevice)}")
+        }
         if (suppressed.size > keep) {
             appendLine("\t... ${suppressed.size - keep} more suppressed")
         }

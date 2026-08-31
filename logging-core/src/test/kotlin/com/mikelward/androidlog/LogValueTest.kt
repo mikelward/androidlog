@@ -53,15 +53,15 @@ class LogValueTest {
     }
 
     private fun full(format: String, vararg args: Any?) =
-        formatLogMessage(format, args, redactSensitive = false)
+        formatLogMessage(format, args, leavingDevice = false)
 
-    private fun mirrored(format: String, vararg args: Any?) =
-        formatLogMessage(format, args, redactSensitive = true)
+    private fun offDevice(format: String, vararg args: Any?) =
+        formatLogMessage(format, args, leavingDevice = true)
 
     @Test
     fun `a String is withheld off device but kept on it`() {
         assertEquals("joined ExampleWifi", full("joined %s", "ExampleWifi"))
-        assertEquals("joined $REDACTED_PLACEHOLDER", mirrored("joined %s", "ExampleWifi"))
+        assertEquals("joined $REDACTED_PLACEHOLDER", offDevice("joined %s", "ExampleWifi"))
     }
 
     @Test
@@ -76,7 +76,7 @@ class LogValueTest {
         assertTrue(logArgumentMayLeaveDevice(null))
         assertEquals(
             "mode=ARMED distance=120m ok=true",
-            mirrored("mode=%s distance=%sm ok=%s", Mode.ARMED, 120, true),
+            offDevice("mode=%s distance=%sm ok=%s", Mode.ARMED, 120, true),
         )
     }
 
@@ -91,7 +91,7 @@ class LogValueTest {
         assertTrue(logArgumentMayLeaveDevice(safe("android.intent.action.MAIN")))
         assertEquals(
             "action=android.intent.action.MAIN",
-            mirrored("action=%s", safe("android.intent.action.MAIN")),
+            offDevice("action=%s", safe("android.intent.action.MAIN")),
         )
     }
 
@@ -99,19 +99,18 @@ class LogValueTest {
     fun `sensitive withholds a number the type rule would carry`() {
         assertFalse(logArgumentMayLeaveDevice(sensitive(51.5)))
         assertEquals("lat=51.5", full("lat=%s", sensitive(51.5)))
-        assertEquals("lat=$REDACTED_PLACEHOLDER", mirrored("lat=%s", sensitive(51.5)))
+        assertEquals("lat=$REDACTED_PLACEHOLDER", offDevice("lat=%s", sensitive(51.5)))
     }
 
     @Test
     fun `a summary the call site reduced itself is carried as it wrote it`() {
-        // An app summarizes its own domain type and vouches for the result. It
-        // reads the same everywhere, because there is one rendering: this used
-        // to be a two-field `LogSummary` picking between a full form and a
-        // reduced one, and the reduced one is the only one anything ever asked
-        // for once the floor moved to ingestion.
+        // An app summarizes its own domain type and vouches for the result,
+        // so it reads the same in both directions -- which is what `safe`
+        // means. This used to be a two-field `LogSummary`, each call site
+        // writing the value out twice; one tag on one rendering replaced it.
         val summary = safe("snooze(3h)")
         assertEquals("state=snooze(3h)", full("state=%s", summary))
-        assertEquals("state=snooze(3h)", mirrored("state=%s", summary))
+        assertEquals("state=snooze(3h)", offDevice("state=%s", summary))
     }
 
     @Test
@@ -127,7 +126,7 @@ class LogValueTest {
     @Test
     fun `a surplus argument is appended and redacted like a placed one`() {
         assertEquals("a=1 [unplaced arg] secret", full("a=%s", 1, "secret"))
-        assertEquals("a=1 [unplaced arg] $REDACTED_PLACEHOLDER", mirrored("a=%s", 1, "secret"))
+        assertEquals("a=1 [unplaced arg] $REDACTED_PLACEHOLDER", offDevice("a=%s", 1, "secret"))
     }
 
     @Test
@@ -144,7 +143,7 @@ class LogValueTest {
     fun `an untagged enum renders its constant name, not an overridden toString`() {
         assertTrue(logArgumentMayLeaveDevice(Leaky.CURRENT))
         assertEquals("mode=CURRENT", full("mode=%s", Leaky.CURRENT))
-        assertEquals("mode=CURRENT", mirrored("mode=%s", Leaky.CURRENT))
+        assertEquals("mode=CURRENT", offDevice("mode=%s", Leaky.CURRENT))
     }
 
     @Test
@@ -154,13 +153,14 @@ class LogValueTest {
 
     @Test
     fun `a tag decides what may leave the device, not how a value is written`() {
-        // `safe` used to mean both, and the second meaning was a way around the
-        // no-messages rule. It now answers only the floor's question, so the
+        // `safe` used to mean both, and the second meaning was a way around
+        // the type-only rendering a throwable argument gets. It now answers
+        // only the boundary's question, so the
         // enum still renders its constant name rather than an override that
         // reads live state.
         assertTrue(logArgumentMayLeaveDevice(safe(Leaky.CURRENT)))
         assertEquals("mode=CURRENT", full("mode=%s", safe(Leaky.CURRENT)))
-        assertEquals("mode=CURRENT", mirrored("mode=%s", safe(Leaky.CURRENT)))
+        assertEquals("mode=CURRENT", offDevice("mode=%s", safe(Leaky.CURRENT)))
     }
 
     @Test
@@ -205,7 +205,7 @@ class LogValueTest {
         assertEquals("state [place=a place]", full("state %s", listOf(summary)))
         // An untagged composite is withheld whole, so reaching the element at
         // all takes a `safe` composite.
-        assertEquals("state [place=a place]", mirrored("state %s", safe(listOf(summary))))
+        assertEquals("state [place=a place]", offDevice("state %s", safe(listOf(summary))))
     }
 
     @Test
@@ -215,7 +215,7 @@ class LogValueTest {
         val tagged = safe(listOf("cell", sensitive(51.5)))
         assertTrue(logArgumentMayLeaveDevice(tagged))
         assertEquals("at [cell, 51.5]", full("at %s", tagged))
-        assertEquals("at [cell, •••]", mirrored("at %s", tagged))
+        assertEquals("at [cell, •••]", offDevice("at %s", tagged))
     }
 
     @Test
@@ -223,7 +223,7 @@ class LogValueTest {
         // The other direction. Re-applying the whole floor per element would
         // withhold every `String` in a composite the call site had already
         // vouched for, which costs the diagnostic and protects nothing.
-        assertEquals("sources [wifi, motion]", mirrored("sources %s", safe(listOf("wifi", "motion"))))
+        assertEquals("sources [wifi, motion]", offDevice("sources %s", safe(listOf("wifi", "motion"))))
     }
 
     @Test
@@ -287,7 +287,7 @@ class LogValueTest {
     fun `sensitive wins however many safe wrappers are around it`() {
         assertFalse(logArgumentMayLeaveDevice(safe(sensitive("ExampleWifi"))))
         assertFalse(logArgumentMayLeaveDevice(safe(safe(sensitive(1.0)))))
-        assertEquals("at $REDACTED_PLACEHOLDER", mirrored("at %s", safe(sensitive("ExampleWifi"))))
+        assertEquals("at $REDACTED_PLACEHOLDER", offDevice("at %s", safe(sensitive("ExampleWifi"))))
         // On device it is still rendered in full -- withholding is about what
         // leaves, not about what the user reads before sharing.
         assertEquals("at ExampleWifi", full("at %s", safe(sensitive("ExampleWifi"))))
@@ -300,7 +300,7 @@ class LogValueTest {
         // generated `toString()` on the outer tag would otherwise print.
         val summary = safe("at a place, 12m")
         assertEquals("snooze at a place, 12m", full("snooze %s", safe(summary)))
-        assertEquals("snooze at a place, 12m", mirrored("snooze %s", safe(summary)))
+        assertEquals("snooze at a place, 12m", offDevice("snooze %s", safe(summary)))
     }
 
     @Test
@@ -308,6 +308,6 @@ class LogValueTest {
         // The other direction: collapsing the tags must not cost `safe` its
         // whole purpose.
         assertTrue(logArgumentMayLeaveDevice(safe("ExampleWifi")))
-        assertEquals("at ExampleWifi", mirrored("at %s", safe("ExampleWifi")))
+        assertEquals("at ExampleWifi", offDevice("at %s", safe("ExampleWifi")))
     }
 }

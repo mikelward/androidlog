@@ -57,14 +57,26 @@ class DebugLogTest {
     }
 
     @Test
-    fun `an event is recorded with its level, and the floor applied at ingestion`() {
-        // One rendering, and it is the reduced one. The buffer never holds a
-        // form the floor would withhold, so nothing downstream -- a sink, a
-        // file, a report -- has to remember to ask for the safe version.
+    fun `an event is recorded with its level, rendered in full for this device`() {
+        // Reversed from `the floor applied at ingestion` (maintainer,
+        // 2026-08-31): what the device keeps is the whole value, because the
+        // log the user opens to explain their own bug was the thing being
+        // blanked. The floor moved to the boundary -- see the off-device half
+        // below, which is the same call rendered to leave.
         val log = log()
         log.event("joined %s at %s", "ExampleWifi", 3)
         val line = log.events().single()
-        assertTrue(line, line.endsWith(" D joined $REDACTED_PLACEHOLDER at 3"))
+        assertTrue(line, line.endsWith(" D joined ExampleWifi at 3"))
+    }
+
+    @Test
+    fun `the same event leaving the device is reduced`() {
+        // Both directions in one place, so neither can quietly become the
+        // other: an untagged String is the device's to read and nobody else's.
+        assertEquals(
+            "joined $REDACTED_PLACEHOLDER at 3",
+            formatLogMessage("joined %s at %s", arrayOf<Any?>("ExampleWifi", 3), leavingDevice = true),
+        )
     }
 
     @Test
@@ -149,13 +161,79 @@ class DebugLogTest {
     }
 
     @Test
-    fun `a failure renders the exception type and frames but never its message`() {
+    fun `a failure renders the exception type, frames and message on this device`() {
+        // `ActivityNotFoundException`'s intent and `NameNotFoundException`'s
+        // package live in the message and nowhere else, so the device's own
+        // copy reads it (maintainer, 2026-08-31).
         val log = log()
-        log.failure(IllegalStateException("dialed +15550100"), "route failed")
+        log.failure(IllegalStateException("no handler for share"), "route failed")
         val line = log.events().single()
-        assertTrue(line, "java.lang.IllegalStateException" in line)
+        assertTrue(line, "java.lang.IllegalStateException: no handler for share" in line)
         assertTrue(line, "\tat " in line)
-        assertFalse(line, "+15550100" in line)
+    }
+
+    @Test
+    fun `a failure leaving the device keeps its type and frames but drops the message`() {
+        val log = log()
+        val trace = log.offDeviceTrace(IllegalStateException("dialed +15550100"))
+        assertTrue(trace, trace.startsWith("java.lang.IllegalStateException\n"))
+        assertTrue(trace, "\tat " in trace)
+        assertFalse(trace, "+15550100" in trace)
+        // Not a colon left dangling where the message was cut out.
+        assertFalse(trace, "IllegalStateException:" in trace)
+    }
+
+    @Test
+    fun `a message with newlines in it cannot forge a cause or a frame`() {
+        // The message is the one part of this rendering nothing here chose, and
+        // `Caused by: ` and `\tat ` are only text -- so a line break in it
+        // would open a line a reader cannot tell from a real one.
+        val log = log()
+        log.failure(
+            IllegalStateException("first\nCaused by: java.lang.SecurityException\n\tat Fake.kt:1"),
+            "route failed",
+        )
+        val line = log.events().single()
+        assertTrue(line, "first Caused by: java.lang.SecurityException at Fake.kt:1" in line)
+        assertFalse(line, "\nCaused by:" in line)
+        // The one real frame line is still there, so this did not simply strip
+        // everything that looked structural.
+        assertTrue(line, "\n\tat " in line)
+    }
+
+    @Test
+    fun `an enormous message is bounded so the frames survive it`() {
+        // Same budget the frames and the cause chain are held to: one throw
+        // must not spend the whole entry. The frames are the half of a failure
+        // line nothing else can recover.
+        val log = log(maxEntryChars = 100_000)
+        log.failure(IllegalStateException("x".repeat(5_000)), "route failed")
+        val line = log.events().single()
+        assertTrue(line, "…(truncated)" in line)
+        assertTrue(line, line.length < 1_000)
+        assertTrue(line, "\n\tat " in line)
+    }
+
+    @Test
+    fun `an overlong message is marked truncated even where its prefix says nothing`() {
+        // The bound is applied to the raw message before it is flattened, so a
+        // message whose first characters are all whitespace contributes less
+        // than the bound rather than being read on to fill it. What it must not
+        // do is drop the whole thing in silence.
+        val log = log(maxEntryChars = 100_000)
+        log.failure(IllegalStateException("\n".repeat(400) + "the part that mattered"), "boom")
+        val line = log.events().single()
+        assertTrue(line, "java.lang.IllegalStateException: …(truncated)" in line)
+        assertTrue(line, "\n\tat " in line)
+    }
+
+    @Test
+    fun `a blank message renders no trailing colon`() {
+        val log = log()
+        log.failure(IllegalStateException("   "), "route failed")
+        val line = log.events().single()
+        assertTrue(line, "java.lang.IllegalStateException\n" in line)
+        assertFalse(line, "IllegalStateException:" in line)
     }
 
     // A close failure -- `use { }`, try-with-resources -- is neither the thrown
@@ -174,7 +252,7 @@ class DebugLogTest {
     }
 
     @Test
-    fun `a suppressed exception's message never reaches the log`() {
+    fun `a suppressed exception's message follows the same split as any other`() {
         val log = log()
         val failure = IllegalStateException("write failed")
         failure.addSuppressed(java.io.IOException("could not close ExampleWifi"))
@@ -182,10 +260,12 @@ class DebugLogTest {
         log.failure(failure, "save failed")
 
         val line = log.events().single()
-        // The whole reason a type is safe to carry: the floor reads no
-        // throwable's message, and a suppressed one is no exception to that.
-        assertFalse(line, "ExampleWifi" in line)
-        assertFalse(line, "could not close" in line)
+        assertTrue(line, "Suppressed: java.io.IOException: could not close ExampleWifi" in line)
+        // A suppressed link is no exception to the boundary either.
+        val trace = log.offDeviceTrace(failure)
+        assertTrue(trace, "Suppressed: java.io.IOException" in trace)
+        assertFalse(trace, "ExampleWifi" in trace)
+        assertFalse(trace, "could not close" in trace)
     }
 
     @Test
@@ -219,14 +299,21 @@ class DebugLogTest {
     }
 
     @Test
-    fun `a cause chain renders every link without any message`() {
+    fun `every link of a cause chain follows the split, not just the first`() {
         val log = log()
         val cause = IllegalArgumentException("ssid ExampleWifi")
-        log.failure(RuntimeException("wrapper", cause), "lookup failed")
+        val failure = RuntimeException("wrapper", cause)
+
+        log.failure(failure, "lookup failed")
+
         val line = log.events().single()
-        assertTrue(line, "Caused by: java.lang.IllegalArgumentException" in line)
-        assertFalse(line, "ExampleWifi" in line)
-        assertFalse(line, "wrapper" in line)
+        assertTrue(line, "java.lang.RuntimeException: wrapper" in line)
+        assertTrue(line, "Caused by: java.lang.IllegalArgumentException: ssid ExampleWifi" in line)
+
+        val trace = log.offDeviceTrace(failure)
+        assertTrue(trace, "Caused by: java.lang.IllegalArgumentException" in trace)
+        assertFalse(trace, "ExampleWifi" in trace)
+        assertFalse(trace, "wrapper" in trace)
     }
 
     @Test
@@ -260,14 +347,20 @@ class DebugLogTest {
     @Test
     fun `a throwable passed to warning is rerouted to failure instead of rendered`() {
         val log = log()
-        log.warning("gave up after %s", 3, IllegalStateException("dialed +15550100"))
+        val boom = IllegalStateException("dialed +15550100")
+        log.warning("gave up after %s", 3, boom)
         val line = log.events().single()
         assertTrue(line, "use failure()" in line)
         assertTrue(line, "gave up after 3" in line)
         assertTrue(line, "java.lang.IllegalStateException" in line)
-        // The reason the reroute exists: rendered as an argument it would have
-        // carried its own message into the log through toString().
-        assertFalse(line, "+15550100" in line)
+        // What the reroute buys is the frames: bound into a placeholder the
+        // throwable renders as its type and stops there, so the stack of the
+        // thing that actually failed is lost.
+        assertTrue(line, "\n\tat " in line)
+        // Carried rather than placed, so the device's copy reads its message
+        // and the off-device rendering of the same throwable does not.
+        assertTrue(line, "IllegalStateException: dialed +15550100" in line)
+        assertFalse(log.offDeviceTrace(boom), "+15550100" in log.offDeviceTrace(boom))
     }
 
     @Test
@@ -287,7 +380,11 @@ class DebugLogTest {
     }
 
     @Test
-    fun `a throwable in a surplus argument to failure renders no message either`() {
+    fun `a throwable in a surplus argument renders no message, on device or off`() {
+        // The split governs the throwable a failure *carries*; one bound into
+        // a placeholder renders as its type in both directions, because that
+        // rendering rests on never calling an unknown `toString()` rather than
+        // on where the line is going.
         val log = log()
         log.failure(
             RuntimeException("outer"),
@@ -295,8 +392,10 @@ class DebugLogTest {
             IllegalStateException("ssid ExampleWifi"),
         )
         val line = log.events().single()
+        assertTrue(line, "java.lang.IllegalStateException" in line)
         assertFalse(line, "ExampleWifi" in line)
-        assertFalse(line, "outer" in line)
+        // The carried one does read its message here, which is the split.
+        assertTrue(line, "java.lang.RuntimeException: outer" in line)
     }
 
     @Test
@@ -930,10 +1029,9 @@ class DebugLogTest {
         // Removing the throwable from the argument list shifted every later
         // value one placeholder left, so this rendered `cause 3 after %s`.
         val log = log()
-        log.warning("cause %s after %s", IllegalStateException("dialed +15550100"), 3)
+        log.warning("cause %s after %s", IllegalStateException("no handler"), 3)
         val line = log.events().single()
         assertTrue(line, "cause java.lang.IllegalStateException after 3" in line)
-        assertFalse(line, "+15550100" in line)
     }
 
     @Test
@@ -967,7 +1065,9 @@ class DebugLogTest {
             assertTrue(line, "java.lang.IllegalStateException" in line)
             // The frames are what the reroute buys, and what was being lost.
             assertTrue(line, "\n\tat " in line)
-            assertFalse(line, "+15550100" in line)
+            // Placed, the tagged throwable still renders as its type alone --
+            // so the message here is the carried one, arriving by the reroute.
+            assertTrue(line, "IllegalStateException: dialed +15550100" in line)
         }
     }
 
@@ -1269,29 +1369,30 @@ class DebugLogTest {
     }
 
     @Test
-    fun `an error carries its exception's type and frames but never its message`() {
+    fun `an error carries its exception's message on device and drops it off`() {
         val log = log()
-        log.error(IllegalStateException("a message nobody may see"), "broke")
+        val boom = IllegalStateException("a message only this device sees")
+        log.error(boom, "broke")
 
         val entry = log.events().single()
-        assertTrue(entry, "IllegalStateException" in entry)
-        assertFalse(entry, "a message nobody may see" in entry)
+        assertTrue(entry, "IllegalStateException: a message only this device sees" in entry)
+        assertFalse(log.offDeviceTrace(boom), "a message only this device sees" in log.offDeviceTrace(boom))
     }
 
     @Test
     fun `a throwable passed to error as an argument is rerouted, not rendered`() {
         // Same misuse `warning` reroutes: bound as a formatting argument it
-        // would render through a toString() this library did not write.
+        // renders as its type and loses the frames the failure is read for.
         val log = log()
-        log.error("broke %s", IllegalStateException("a message nobody may see"))
+        log.error("broke %s", IllegalStateException("no handler"))
 
         val entry = log.events().single()
         assertTrue(entry, "use error(throwable" in entry)
-        assertFalse(entry, "a message nobody may see" in entry)
+        assertTrue(entry, "\n\tat " in entry)
     }
 
     @Test
-    fun `the floor applies to every level`() {
+    fun `every level records in full for this device`() {
         val log = log()
         log.verbose("as %s vouched %s count %s", "unvouched", safe("gfs"), 7)
         log.info("as %s vouched %s count %s", "unvouched", safe("gfs"), 7)
@@ -1302,13 +1403,21 @@ class DebugLogTest {
         // assertion while leaving these levels useless for the diagnostics
         // they exist to carry (AGENTS.md, "assert both directions"; Codex,
         // PR #9). So each level is asserted whole, rather than by counting
-        // placeholders.
+        // placeholders. The withholding half is now the off-device rendering
+        // below, since the device's own copy withholds nothing.
         assertEquals(
             log.events().toString(),
-            List(3) { "as \u2022\u2022\u2022 vouched gfs count 7" },
+            List(3) { "as unvouched vouched gfs count 7" },
             log.events().map { it.substringAfter(" ").substringAfter(" ").substringAfter(" ") },
         )
-        assertTrue(log.events().toString(), log.events().none { "unvouched" in it })
+        assertEquals(
+            "as \u2022\u2022\u2022 vouched gfs count 7",
+            formatLogMessage(
+                "as %s vouched %s count %s",
+                arrayOf<Any?>("unvouched", safe("gfs"), 7),
+                leavingDevice = true,
+            ),
+        )
     }
 
     // --------------------------------------------------------------- pinning
@@ -1422,11 +1531,14 @@ class DebugLogTest {
     }
 
     @Test
-    fun `the floor applies to a pinned line like any other`() {
+    fun `a pinned line records in full like any other`() {
         val log = log()
         log.pinnedEvent("started as %s", "unvouched")
 
-        assertTrue(log.pinnedSnapshot().toString(), log.pinnedSnapshot().any { "started as \u2022\u2022\u2022" in it })
+        assertTrue(
+            log.pinnedSnapshot().toString(),
+            log.pinnedSnapshot().any { "started as unvouched" in it },
+        )
     }
 
     @Test

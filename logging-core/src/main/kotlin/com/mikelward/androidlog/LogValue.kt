@@ -26,23 +26,33 @@ package com.mikelward.androidlog
  * its own sink around this core, where a mistake in it cannot weaken the type
  * rule above.
  *
- * **The floor is applied at ingestion, and there is one rendering.** An earlier
- * revision rendered every entry in full and reduced it only at whatever
- * boundary was judged to be leaving the device. That is two renderings of
- * everything — twice the buffer — and worse, a rule that holds only while every
- * future reader remembers to ask for the reduced form; the durable file was
- * already a reader that did not (maintainer, 2026-08-30). So the buffer,
- * `snapshot()`, every sink, the persisted file and anything derived from them
- * all carry the same text, and a value this rule withholds exists in full
- * nowhere in the process.
+ * **The floor is a boundary, not an ingestion filter** (maintainer,
+ * 2026-08-31). What this log records for the device carries every argument in
+ * full; [REDACTED_PLACEHOLDER] appears only in a rendering that is leaving —
+ * a crash-reporter breadcrumb, an automatic report, anything sent without the
+ * user in the loop. That reverses *the floor is applied at ingestion, and
+ * there is one rendering* (2026-08-30), which reduced the device's own copy
+ * too and so blanked the log the user opens to explain their own bug: a
+ * launcher's failing package, an app's saved place, the network that was
+ * joined all arrive as [String] and all came out as `•••`.
  *
- * That puts the weight on the call sites, deliberately. A consumer that has
- * already reduced a value — a masked number, an account token, a state name —
- * says so with [safe] and keeps it, which is the arrangement the *no scrubber
- * in the core* rule describes: the app owns what its own data reduces to, and
- * this rule owns the default. An unmarked call site shows
- * [REDACTED_PLACEHOLDER] on the device's own log screen the first time anyone
- * looks, rather than quietly degrading a file nobody reads until a crash.
+ * What did not change is where the real floor sits, and it is not here: a full
+ * phone number, an ICCID, a coordinate, a whole SSID is reduced by the app
+ * *before* this code sees it, so the value this renders in full is already the
+ * reduced one. This rule governs the tier below that — a package name, a row
+ * id, a place name — where the local log is the point and the off-device copy
+ * is the risk.
+ *
+ * So a value can now exist in full in the buffer, `snapshot()`, a sink and the
+ * persisted file, and the persisted file is on the device with the rest. What
+ * leaves does so through a rendering that asks for it: [formatLogMessage] with
+ * `leavingDevice = true`, or `DebugLog.offDeviceTrace`.
+ *
+ * That still puts the weight on the call sites for the off-device copy. A
+ * consumer that has already reduced a value — a masked number, an account
+ * token, a state name — says so with [safe] and keeps it there too, which is
+ * the arrangement the *no scrubber in the core* rule describes: the app owns
+ * what its own data reduces to, and this rule owns the default.
  */
 
 /** Rendered in place of an argument that may not leave the device. */
@@ -103,11 +113,12 @@ private fun mayLeaveDeviceUntagged(argument: Any?): Boolean = when (argument) {
     is Float -> true
     is Double -> true
     is Enum<*> -> true
-    // Its rendering here is fixed to the class name, and the no-messages floor
-    // is what makes that true: nothing this library renders reaches a
-    // throwable's message. So a throwable names a *type*, never the user --
-    // the same reason an enum passes. Withholding it cost the one thing a
-    // failure line is read for (maintainer, 2026-08-30).
+    // Its rendering *as an argument* is fixed to the class name, in both
+    // directions -- the on-device/off-device split governs the throwable a
+    // failure carries, never one bound into a placeholder. So a throwable here
+    // names a *type*, never the user, which is the same reason an enum passes.
+    // Withholding it cost the one thing a failure line is read for
+    // (maintainer, 2026-08-30).
     is Throwable -> true
     // Everything else is withheld, `String` above all. An unknown type renders
     // as its class name too, so it could pass by the same argument -- it does
@@ -126,9 +137,9 @@ private const val MAX_RENDERED_ELEMENTS = 20
  * Renders one value — the single rendering path, tagged or not.
  *
  * **The library renders only what it defines the rendering of, and never calls
- * an unknown `toString()`.** That is the whole rule, and it is the one the
- * no-messages floor needs: a `toString()` this code did not write can reach a
- * throwable's message transitively, and four review rounds each found a new
+ * an unknown `toString()`.** That is the whole rule, and it is what keeps a
+ * throwable argument to its type: a `toString()` this code did not write can
+ * reach a throwable's message transitively, and four review rounds each found a new
  * route by which it did (Codex, PR #1) — a bare throwable, `safe(throwable)`,
  * `safe(safe(throwable))`, and a throwable inside a list. Special-casing each
  * route left the mechanism standing; refusing the unknown `toString()` retires
@@ -161,7 +172,7 @@ private const val MAX_RENDERED_ELEMENTS = 20
  * [depth] bounds the recursion, so a self-referential collection renders its
  * type instead of overflowing the stack — recording must not throw.
  */
-private fun renderPlain(value: Any?, redactSensitive: Boolean, depth: Int): String = when {
+private fun renderPlain(value: Any?, leavingDevice: Boolean, depth: Int): String = when {
     value == null -> "null"
     value is String -> value
     value is Boolean || value is Char ||
@@ -171,10 +182,10 @@ private fun renderPlain(value: Any?, redactSensitive: Boolean, depth: Int): Stri
     value is Throwable -> value.javaClass.name
     depth >= MAX_RENDER_DEPTH -> value.javaClass.name
     value is Collection<*> -> renderElements(value.asSequence(), value.size) {
-        renderArgument(it, redactSensitive, depth + 1)
+        renderArgument(it, leavingDevice, depth + 1)
     }
     value is Array<*> -> renderElements(value.asSequence(), value.size) {
-        renderArgument(it, redactSensitive, depth + 1)
+        renderArgument(it, leavingDevice, depth + 1)
     }
     value is Map<*, *> -> renderElements(
         value.entries.asSequence(),
@@ -183,8 +194,8 @@ private fun renderPlain(value: Any?, redactSensitive: Boolean, depth: Int): Stri
         close = "}",
     ) {
         val entry = it as Map.Entry<*, *>
-        renderArgument(entry.key, redactSensitive, depth + 1) + "=" +
-            renderArgument(entry.value, redactSensitive, depth + 1)
+        renderArgument(entry.key, leavingDevice, depth + 1) + "=" +
+            renderArgument(entry.value, leavingDevice, depth + 1)
     }
     else -> value.javaClass.name
 }
@@ -223,8 +234,8 @@ private fun renderElements(
  * defeated the floor twice over, because a tag's *generated* `toString()`
  * prints its contents: `safe(safe(exception))` reached the untagged branch,
  * rendered the outer wrapper through `toString()`, and put the exception
- * message it prints straight into the line the no-messages rule exists to keep
- * it out of. `safe(sensitive(x))` read as safe on the strength of the outer tag
+ * message it prints into a placeholder that renders a throwable as its type
+ * and stops there. `safe(sensitive(x))` read as safe on the strength of the outer tag
  * alone, and a `safe` wrapped around a summary rendered the wrapper rather than
  * the summary (Codex, PR #1).
  *
@@ -287,26 +298,27 @@ internal fun untaggedLogValue(argument: Any?): Any? = untag(argument).value
  * every withheld argument behind [REDACTED_PLACEHOLDER]; the sensitive check
  * below is then a no-op, since nothing sensitive is permitted to reach it.
  */
-private fun renderArgument(argument: Any?, redactSensitive: Boolean, depth: Int = 0): String {
+private fun renderArgument(argument: Any?, leavingDevice: Boolean, depth: Int = 0): String {
     val untagged = untag(argument)
-    if (redactSensitive && untagged.sensitive) return REDACTED_PLACEHOLDER
+    if (leavingDevice && untagged.sensitive) return REDACTED_PLACEHOLDER
     val value = untagged.value
     return when {
         // Tagged or not, one rendering path. A tag answers "may this leave the
         // device?", which is [logArgumentMayLeaveDevice]'s question, and
         // nothing about how the value is written down (maintainer,
         // 2026-08-30). Letting `safe` also mean "print it via `toString()`"
-        // made it a way around the no-messages rule -- `safe(x)` where `x`
-        // holds a throwable rendered the message -- for no benefit the call
+        // made it a way around the type-only rendering an argument gets --
+        // `safe(x)` where `x` holds a throwable printed the message straight
+        // into the placeholder -- for no benefit the call
         // sites were using: `safe` carries fixed-vocabulary strings and state
         // names, and `String` rendering is the same on both paths.
-        else -> renderPlain(value, redactSensitive, depth)
+        else -> renderPlain(value, leavingDevice, depth)
     }
 }
 
 /**
  * Substitutes [args] into [format], replacing each `%s` in order. `%%` renders a
- * literal `%`. When [redactSensitive] is set, any argument
+ * literal `%`. When [leavingDevice] is set, any argument
  * [logArgumentMayLeaveDevice] withholds renders as [REDACTED_PLACEHOLDER]
  * instead — that is the only difference between the on-device rendering and the
  * mirrored one.
@@ -325,13 +337,13 @@ private fun renderArgument(argument: Any?, redactSensitive: Boolean, depth: Int 
 fun formatLogMessage(
     format: String,
     args: Array<out Any?>,
-    redactSensitive: Boolean,
+    leavingDevice: Boolean,
 ): String {
     fun render(argument: Any?): String =
-        if (redactSensitive && !logArgumentMayLeaveDevice(argument)) {
+        if (leavingDevice && !logArgumentMayLeaveDevice(argument)) {
             REDACTED_PLACEHOLDER
         } else {
-            renderArgument(argument, redactSensitive)
+            renderArgument(argument, leavingDevice)
         }
 
     if (args.isEmpty() && '%' !in format) return format
