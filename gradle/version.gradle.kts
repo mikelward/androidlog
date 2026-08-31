@@ -1,5 +1,9 @@
 import org.gradle.api.publish.maven.tasks.AbstractPublishToMaven
 
+// Repository-relative. The one file anyone edits to cut a release; everything
+// else about the version is derived. See SPEC.md.
+val SERIES_PATH = "gradle/version-series.txt"
+
 // The published version, derived once per build and shared by both entry points.
 //
 // This lives in its own script because there are two roots: the main build, and
@@ -11,25 +15,27 @@ import org.gradle.api.publish.maven.tasks.AbstractPublishToMaven
 // Applied to the root project of whichever build is running; it sets the
 // coordinates on every project in it.
 
-// Major and minor are declared; the patch level is the number of commits, so
-// every commit that reaches `main` is publishable exactly once and a later one
-// can never reuse its number.
+// SemVer, with the series declared by hand and the patch level derived.
 //
-// It starts at 1.0, not 0.x, and that is a requirement rather than taste:
-// mikelward/gradle-update reads a major as the leading integer, so at 0.x every
-// release looks like the same major to the weekly batch and is taken
-// automatically — including one that breaks the API, in the phase where SemVer
-// says breaking changes are allowed. See README.md, "Consuming it".
-val versionSeries = "1.0"
-
-// A count taken from a shallow clone is a confident wrong number: the sandbox
-// clones shallow, `git rev-list --count` answers anyway, and the result would
-// name a release that already exists with different contents. So this refuses
-// rather than guessing, and carries the refusal in the version string — the
-// guard on the publish tasks is what turns it into a failure, and only on the
-// paths that publish. An ordinary build, a consumer's composite build, and a
-// source tarball with no `.git` at all all keep working.
-val undetermined = "$versionSeries.0-undetermined"
+// `gradle/version-series.txt` holds `MAJOR.MINOR`. Editing it IS the release
+// decision, and it is the only one a person makes: bump the major for a change
+// that breaks a consumer's source or its behavior, the minor for one that only
+// adds. The patch level stays what it has always been -- the number of commits
+// on the release line -- so nothing has to be tracked or remembered, and no two
+// releases in this repository's history can ever share a number.
+//
+// Until 1.0.48 this was `1.0.<total commit count>` with the series hard-coded,
+// so the major and minor never moved and a breaking change was indistinguishable
+// from a typo fix. `formatLogMessage`'s `redactSensitive` parameter became
+// `leavingDevice` inside that range and every consumer's build broke on a
+// number that read as a patch. That is what this replaces; SPEC.md records the
+// contract and README.md tells a consumer what to expect from a bump.
+//
+// The series is READ FROM A FILE rather than declared here so the boundary is a
+// commit that touched exactly one path: `git log -1 -- <that path>` is then an
+// exact question, where "the commit that last changed this variable" would mean
+// parsing this script's own history.
+// Declared below, once `sourceTree` names the checkout it must be read from.
 
 // The directory the count must describe: this script sits at
 // `<checkout>/gradle/version.gradle.kts`, so its own grandparent IS the
@@ -40,6 +46,40 @@ val undetermined = "$versionSeries.0-undetermined"
 // the two entry points different versions, which is the exact divergence this
 // shared script exists to prevent.
 val sourceTree = buildscript.sourceFile?.canonicalFile?.parentFile?.parentFile
+
+// The declared series, `MAJOR.MINOR`, read from the checkout `sourceTree` names
+// rather than from the process's working directory -- the offramp entry point
+// runs with a different root, and reading the wrong file would give the two
+// entry points different versions.
+//
+// A file that is missing, unreadable, or not two dot-separated integers yields
+// null and therefore an undetermined version, which the publish guard turns
+// into a refusal. Guessing a series is the one failure this whole script exists
+// to prevent, and it is worse here than anywhere else: a wrong MAJOR does not
+// merely name the wrong release, it tells every consumer's weekly batch that a
+// breaking change is safe to auto-merge.
+val seriesFile = sourceTree?.resolve(SERIES_PATH)
+val versionSeries: String? = seriesFile
+    ?.takeIf { it.isFile }
+    ?.let { runCatching { it.readText() }.getOrNull() }
+    ?.trim()
+    // `0|[1-9]\d*` per component, not `\d+`: SemVer forbids a leading zero in a
+    // numeric identifier, and `\d+` would accept `02.0` or `2.00`. Neither is
+    // `undetermined`, so the publish guard would wave it through and the
+    // coordinate would sort and compare wrongly in every consumer's tooling.
+    ?.takeIf { it.matches(Regex("""(0|[1-9]\d*)\.(0|[1-9]\d*)""")) }
+
+// A count taken from a shallow clone is a confident wrong number: the sandbox
+// clones shallow, `git rev-list --count` answers anyway, and the result would
+// name a release that already exists with different contents. So this refuses
+// rather than guessing, and carries the refusal in the version string — the
+// guard on the publish tasks is what turns it into a failure, and only on the
+// paths that publish. An ordinary build, a consumer's composite build, and a
+// source tarball with no `.git` at all all keep working.
+//
+// `0.0` when even the series is unreadable, so the string is still well-formed
+// for anything that parses it before the guard fires.
+val undetermined = "${versionSeries ?: "0.0"}.0-undetermined"
 
 fun gitOutput(vararg args: String): String? {
     // Pinned rather than left to Gradle's default, so every question below is
@@ -133,13 +173,22 @@ val onReleaseLine: Boolean = run {
 }
 
 val derivedVersion: String = run {
-    val count = gitOutput("rev-list", "--count", "HEAD")?.ifEmpty { null }
     // Anything other than a plain `false` counts as shallow, including the null
     // a git that could not answer returns. Fail closed: the cost of guessing
     // wrong is a published coordinate that cannot be corrected.
     val complete = gitOutput("rev-parse", "--is-shallow-repository") == "false"
-    if (count == null || !complete || !belongsToThisTree) undetermined
-    else "$versionSeries.$count"
+    if (versionSeries == null || !complete || !belongsToThisTree) return@run undetermined
+
+    // The patch level is the number of commits on the release line, not the
+    // distance since the series changed, so it never resets and no two releases
+    // in this repository's whole history can share a number. That is one
+    // deliberate deviation from strict SemVer, which asks for a reset when the
+    // minor moves; a reset would buy tidiness and cost the property that
+    // actually matters for an immutable coordinate. Ordering is unaffected --
+    // within a series the count only grows -- and SPEC.md states it.
+    val patch = gitOutput("rev-list", "--count", "HEAD")?.ifEmpty { null }
+        ?: return@run undetermined
+    "$versionSeries.$patch"
 }
 
 // Consumers can resolve this build either way — as published coordinates, or by
