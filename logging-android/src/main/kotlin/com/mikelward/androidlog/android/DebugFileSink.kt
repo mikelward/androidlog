@@ -368,8 +368,12 @@ class DebugFileSink internal constructor(
      * prior run in every sense that matters. Treating it as one everywhere is
      * what keeps a preserved crash reachable: it raises the banner and rides a
      * report during this launch rather than waiting for a rotation that may
-     * never succeed, and an opt-out leaves it alone like any other prior run
-     * (Codex, PR #4).
+     * never succeed, and an opt-out **deletes** it like any other prior run.
+     *
+     * That last clause read the other way until 2026-08-31, when the opt-out
+     * widened to take the whole prior-run set: the purge no longer asks whether
+     * a retained run is sitting in `current`, because that file is a prior run
+     * and prior runs are exactly what it deletes now.
      */
     private fun retainedPreviousRun(): File? =
         // Its presence, not just the flag: a share can consume the retained run
