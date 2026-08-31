@@ -271,12 +271,28 @@ breadcrumbs, an analytics event, anything automatic — says so, and is handed t
 reduced rendering instead:
 
 ```kotlin
-SnoozemoLog.addSink({ line -> Crashlytics.log(line) }, DebugLog.Destination.OFF_DEVICE)
+SnoozemoLog.addSink(
+    object : DebugLog.Sink {
+        override fun log(line: String) = Unit
+        override fun log(line: String, level: Char, throwable: Throwable?) {
+            Crashlytics.log(line)
+            throwable?.let { Crashlytics.recordException(it) }
+        }
+    },
+    DebugLog.Destination.OFF_DEVICE,
+)
 ```
 
 That sink now sees `joined ••• at 3` where the device's own copy reads
-`joined ExampleWifi at 3`, and a throwable's types and frames with no message
-from any link. Widening one value for it is `safe(...)`'s job, at the call site.
+`joined ExampleWifi at 3`. The throwable it is handed is rebuilt with **no
+message from any link** — every type and every frame kept, which is what a
+non-fatal is read for — so it can go straight to `recordException` without one
+quoting what it was given. A device sink gets the original instead. Widening
+one value is `safe(...)`'s job, at the call site.
+
+A sink that only wants the line stays a lambda: the three-argument form is
+defaulted through, so `addSink({ Crashlytics.log(it) }, OFF_DEVICE)` still
+works.
 
 There are exactly two destinations and a sink cannot invent a third: it says
 what it **is**, and the library decides what that gets. That is the difference
@@ -377,17 +393,19 @@ and nothing can enforce it but review.
 the device carries every argument in full — the buffer, `snapshot()`, every
 `Destination.DEVICE` sink, the persisted file and any report the user shares
 deliberately. `•••` appears in a rendering that is *leaving*, and there are
-three of those: a `Destination.OFF_DEVICE` sink, `formatLogMessage(format,
-args, leavingDevice = true)` for a message, and `log.offDeviceTrace(throwable)`
-for a stack. A crash reporter or an automatic report is built from one of them,
+four of those: a `Destination.OFF_DEVICE` sink, `formatLogMessage(format,
+args, leavingDevice = true)` for a message, `log.offDeviceTrace(throwable)` for
+a stack as text, and `log.offDeviceThrowable(throwable)` for one a crash
+reporter's `recordException` will take. A crash reporter or an automatic report is built from one of them,
 and in all three a `String` is withheld while numbers, booleans, enums,
 durations and a throwable's *type* pass untouched.
 
 **A sink declares which destination it is**, and is handed that side's
 rendering — see *Sinks that leave the device* above. Registered without one it
-stays on the device and gets the full text; registered `OFF_DEVICE` it gets the
-reduced text. An app may still build something that leaves itself, from the two
-functions above, rather than as a sink.
+stays on the device and gets the full text and the original throwable;
+registered `OFF_DEVICE` it gets the reduced text and the rebuilt throwable. An
+app may still build something that leaves itself, from the functions above,
+rather than as a sink.
 
 The floor that decides whether a value is somebody's sits **in the app, above
 this**: simmo masks a dialed number before logging it, so what the library sees

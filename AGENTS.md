@@ -60,11 +60,14 @@ has stopped biting.
   rule governs the tier below that. And the split is by destination alone — a
   rendering is never chosen per sink. **A sink declares which destination class
   it is** — `Destination.DEVICE` or `OFF_DEVICE`, PR #26 — and is handed that
-  side's rendering. That *is* the split, applied; what it forbids is a sink
-  choosing **how** a value is written, or being handed structured data so it
-  can re-render for itself. There are two classes and a sink cannot invent a
-  third. An app may still build what leaves itself, from
-  `formatLogMessage(..., leavingDevice = true)` and `offDeviceTrace`.
+  side's rendering, and its throwable in that side's form (PR #27). That *is*
+  the split, applied; what it forbids is a sink choosing **how** a value is
+  written, or reaching a form its destination may not have — which it cannot,
+  since an off-device throwable has already lost every message and an
+  on-device one carries nothing its line did not. There are two classes and a
+  sink cannot invent a third. An app may still build what leaves itself, from
+  `formatLogMessage(..., leavingDevice = true)`, `offDeviceTrace` and
+  `offDeviceThrowable`.
 - **No `getMessage()` from a throwable in anything leaving the device.** A
   platform exception quotes what it was given, and on the paths this log exists
   for that is exactly what may not leave: the number that was dialed, the

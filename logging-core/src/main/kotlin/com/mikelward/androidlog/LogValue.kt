@@ -46,7 +46,9 @@ package com.mikelward.androidlog
  * So a value can now exist in full in the buffer, `snapshot()`, a sink and the
  * persisted file, and the persisted file is on the device with the rest. What
  * leaves does so through a rendering that asks for it: [formatLogMessage] with
- * `leavingDevice = true`, or `DebugLog.offDeviceTrace`.
+ * `leavingDevice = true`, `DebugLog.offDeviceTrace`, or
+ * `DebugLog.offDeviceThrowable` — and a sink registered for
+ * `Destination.OFF_DEVICE`, which is handed all of those already reduced.
  *
  * That still puts the weight on the call sites for the off-device copy. A
  * consumer that has already reduced a value — a masked number, an account
