@@ -263,6 +263,32 @@ SnoozemoLog.addSink(files)
 write. Everything it does touches disk on its own daemon worker, so neither call
 blocks the cold-start path.
 
+### Sinks that leave the device
+
+A sink registered without a destination stays on the device and is handed the
+full rendering. One that will forward what it receives — a crash reporter's
+breadcrumbs, an analytics event, anything automatic — says so, and is handed the
+reduced rendering instead:
+
+```kotlin
+SnoozemoLog.addSink({ line -> Crashlytics.log(line) }, DebugLog.Destination.OFF_DEVICE)
+```
+
+That sink now sees `joined ••• at 3` where the device's own copy reads
+`joined ExampleWifi at 3`, and a throwable's types and frames with no message
+from any link. Widening one value for it is `safe(...)`'s job, at the call site.
+
+There are exactly two destinations and a sink cannot invent a third: it says
+what it **is**, and the library decides what that gets. That is the difference
+between this and a sink choosing its own rendering, which is the thing the
+floor forbids — the reduction never depends on a sink remembering to ask for
+it.
+
+**The destination is not a consent switch.** Whether the app may send anything
+at all is the app's decision, tied to a settings toggle and a Play Data Safety
+declaration; that belongs in the sink, which can simply do nothing when the
+answer is no. The destination only decides what the text says if it goes.
+
 The previous run is then `files.readPreviousRun()`, which hands back a handle —
 its `text` is the report, and `files.clearPreviousRun(handle)` consumes exactly
 the runs that report was built from once it has been sent. The pairing is the
@@ -349,18 +375,19 @@ and nothing can enforce it but review.
 
 **The rule is a boundary, not an ingestion filter.** What the log records for
 the device carries every argument in full — the buffer, `snapshot()`, every
-sink, the persisted file and any report the user shares deliberately. `•••`
-appears in a rendering that is *leaving*: `formatLogMessage(format, args,
-leavingDevice = true)` for a message, `log.offDeviceTrace(throwable)` for a
-stack. Those are what a crash reporter or an automatic report is built from,
-and there a `String` is withheld while numbers, booleans, enums, durations and
-a throwable's *type* pass untouched.
+`Destination.DEVICE` sink, the persisted file and any report the user shares
+deliberately. `•••` appears in a rendering that is *leaving*, and there are
+three of those: a `Destination.OFF_DEVICE` sink, `formatLogMessage(format,
+args, leavingDevice = true)` for a message, and `log.offDeviceTrace(throwable)`
+for a stack. A crash reporter or an automatic report is built from one of them,
+and in all three a `String` is withheld while numbers, booleans, enums,
+durations and a throwable's *type* pass untouched.
 
-**A sink is an on-device destination.** What a sink is handed is the rendering
-this device keeps, so it may write to disk, to logcat, to a screen — and may not
-forward to a crash reporter or any other automatic channel. An app building
-something that leaves renders it itself, from the two functions above, as its
-own call rather than as a sink.
+**A sink declares which destination it is**, and is handed that side's
+rendering — see *Sinks that leave the device* above. Registered without one it
+stays on the device and gets the full text; registered `OFF_DEVICE` it gets the
+reduced text. An app may still build something that leaves itself, from the two
+functions above, rather than as a sink.
 
 The floor that decides whether a value is somebody's sits **in the app, above
 this**: simmo masks a dialed number before logging it, so what the library sees

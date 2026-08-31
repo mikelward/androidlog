@@ -777,9 +777,38 @@ actually needs holding back — at which point the failure-direction argument
 above is the one to re-read, because it is the real cost of having chosen
 registration.
 
+**Shipped, PR #25**: the enum, the two `addSink` overloads, the lazy reduction,
+and the `Sink` contract rewritten around the destination class. Three things the
+build decided rather than copied from the sketch:
+
+- **Two overloads, not a default argument.** `addSink(sink, destination =
+  DEVICE)` makes `destination` the last parameter, so Kotlin binds a trailing
+  lambda to *it* and every `addSink { ... }` in every consumer stops compiling.
+  Putting the sink last instead breaks `addSink(sink)` with a named variable,
+  since a positional argument cannot skip a defaulted parameter. Only two
+  overloads keep both forms, which is what "every existing call site is
+  unchanged" has to mean. The library's own suite caught this, at 24 call sites.
+- **The reduction is never allowed to fall back to the device's rendering.** A
+  reduction that throws yields a fixed notice naming no argument. Substituting
+  the full form there would put it on the far side of the boundary — the one
+  mistake the whole mechanism exists to remove.
+- **The reduction renders outside the buffer's monitor**, beside the device's
+  own, decided by a volatile count of off-device registrations. The first
+  version rendered it lazily *inside* the fan-out, which inverted a lock order
+  the device's rendering had always avoided: a recorder would hold the monitor
+  while walking an app collection, and a thread holding that collection while
+  calling `event()` would wait on the monitor (Codex, PR #26). A sink that
+  registers in the race between the count read and the fan-out gets the notice
+  for that one entry — the same shape as the anchor it is also still waiting
+  for, and it fails toward saying less.
+- **An unvouched value is not rendered at all on the way out**, which is
+  stronger than "rendered and then replaced": `formatLogMessage` short-circuits
+  to the placeholder before touching the value. So a hostile or expensive
+  rendering on a value that may not leave is unreachable off-device. Found
+  while writing the laziness probes — the first two versions measured nothing
+  because of it — and now pinned by its own test.
+
 **Still open, and worth deciding before building:**
-- Render the off-device form lazily, only when an off-device sink is registered
-  — otherwise every entry pays for a second rendering nobody reads.
 - `recordException` needs a *Throwable*, not a string (Type Launcher's
   `redactedForTelemetry()` rebuilds the cause chain with empty messages). So the
   off-device sink interface probably carries the throwable alongside the line,
