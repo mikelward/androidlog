@@ -296,12 +296,16 @@ strength of the setting having changed.
 **A skipped purge is not a successful one**, and this is where naming a
 mechanism went wrong (Codex, PR #13, against the previous version of this
 paragraph, which claimed `onCleared`'s `purgeFailed` already supplied the
-signal). It does not: that method reads
-`if (retainedPreviousRun() == null && !discardContents(current))`, so when a
-failed rotation has left a prior run in place the discard is **skipped** and
-`purgeFailed` is never set — the file survives, unredacted, while the flag
-reads clean. `!purgeFailed` means "nothing went wrong", which is not the same
-claim as "the content is gone", and only the second licenses the reset.
+signal). The example the argument was built on is gone — that method used to
+read `if (retainedPreviousRun() == null && !discardContents(current))`, and the
+guard was removed on 2026-08-31 when the opt-out widened to delete every prior
+run, so that particular skip cannot happen any more. **The requirement it
+established stands**, because `purgeFailed` still answers a different question
+than the reset needs: `!purgeFailed` means "nothing went wrong", which is not
+the same claim as "the content is gone", and only the second licenses the
+reset. Anything that can skip a discard without recording it — an entry
+classified `REMOVABLE`, a path that returns before attempting — reintroduces the
+same gap under a new name.
 
 So the requirement, deliberately without an implementation: the reset is gated
 on a signal that tells **purged** apart from **skipped** and from **failed** —
