@@ -1,0 +1,102 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "com.mikelward.androidlog",
+    "module": "logging-core",
+    "version": "1.0.38",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.7.0"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.4.10"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "logging-core-1.0.38.jar",
+          "url": "logging-core-1.0.38.jar",
+          "size": 30282,
+          "sha512": "fcf926a16e2877037dafec906d95f228b792aec9ee358238de3b6819ca271d4f346e279ae307a6dbc74f779f886faaeeec97ea487c4d9d7c71eb37d89d501496",
+          "sha256": "22b97c4bf77d80a8527616e5ee28161ef1d1498722e22de4bb8c21ba84a0371e",
+          "sha1": "b935e5717d6a9d704df5bedcfdd9f0ea3e56c2bc",
+          "md5": "d3088efe992bc0862335ca59a066fc06"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.4.10"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "logging-core-1.0.38.jar",
+          "url": "logging-core-1.0.38.jar",
+          "size": 30282,
+          "sha512": "fcf926a16e2877037dafec906d95f228b792aec9ee358238de3b6819ca271d4f346e279ae307a6dbc74f779f886faaeeec97ea487c4d9d7c71eb37d89d501496",
+          "sha256": "22b97c4bf77d80a8527616e5ee28161ef1d1498722e22de4bb8c21ba84a0371e",
+          "sha1": "b935e5717d6a9d704df5bedcfdd9f0ea3e56c2bc",
+          "md5": "d3088efe992bc0862335ca59a066fc06"
+        }
+      ]
+    },
+    {
+      "name": "sourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "logging-core-1.0.38-sources.jar",
+          "url": "logging-core-1.0.38-sources.jar",
+          "size": 27215,
+          "sha512": "65dc27acae29361f53446b2b9e850cee083cc8bafd8b043416bb4da5b6d93d3eb0cd293ab4a9e83fe9f639625885d95bb8d85f3583f5ac8cc2b5c6ebc9ea25b1",
+          "sha256": "29e05cbacacf7323297f20624da4ae9a4a8a2c4675da78e79573bd6f64a6bdfa",
+          "sha1": "8396576e6dd0fa8902af6df740eb38fc9f632f70",
+          "md5": "062eddb7234772a0956e45311e3f6667"
+        }
+      ]
+    }
+  ]
+}
