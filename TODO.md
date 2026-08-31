@@ -487,6 +487,48 @@ needed — `start()` reads `log.isRecording` on the worker, and a start that fin
 recording off purges instead of rotating. The window still exists, and now
 closes at the next start rather than staying open forever.
 
+### An opt-out that flaps off and back on around a start is not seen
+
+**Maintainer's call, 2026-08-31: recorded here rather than fixed** (Codex, PR
+#23, its eighth finding). Deliberately tracked, not dismissed.
+
+`start()` reads `log.isRecording` at the call site and again on the worker, and
+purges instead of rotating if *either* says off. Two endpoint reads cannot see a
+value that changed and changed back between them: recording on at the call site,
+the user turns it off — a real opt-out, which promised to delete the saved runs —
+then on again before the enqueued task runs, and both reads say on. The task
+rotates the pre-opt-out files into the shareable prior-run set instead of
+deleting them. The intervening `setRecording(false)` does not catch it either,
+because the documented setup registers the sink *after* `start()`, so `onCleared`
+is not called on it.
+
+**Why it was not fixed with the change that introduced it.** The maintainer's
+reasoning, which is the load-bearing part: a flap too short for the process to
+observe is also one where the state the user *landed on* is "on". They turned
+logging back on, so keeping the saved runs matches their latest expressed
+intent rather than contradicting it — this is closer to arguably-correct
+behavior than to a leak, which is why it is tracked rather than urgent. The
+window itself is small on top of that: between the enqueue and the worker
+picking the task up, microseconds to a few milliseconds, on a path that runs
+before the app has UI, and reaching it needs the user to toggle the setting off
+*and* back on inside it. The remedy is sound
+and is the one Codex named: a **recording-session generation**, a counter that
+ticks on every on/off transition, so the start compares generations rather than
+booleans. `DebugLog` already replaces its private `Session` object on each
+transition, so the state exists; what does not is a way to read it. That makes
+this the first `DebugLog` API change this work would need, which is a decision
+about the library's surface rather than a defect fix.
+
+- **Where it would go:** expose the generation (or the session identity) from
+  `DebugLog`, capture it beside `offWhenStarted`, and treat a changed generation
+  the same as an observed off.
+- **Reversible:** the API addition is additive, and the comparison is local to
+  `start()`'s worker task.
+- **Not a leak of anything already shared.** The files stay on the device, in
+  the set a share offers; nothing leaves. What is arguably broken is the
+  promise that the moment of "off" deleted them — against which the user ended
+  that sequence with logging on.
+
 ### A stand-down recorded while recording is off can go unreported
 
 Found while testing the refused-startup-purge fix (PR #23), and **pre-existing
