@@ -4,6 +4,7 @@ import java.util.zip.ZipFile
 
 plugins {
     alias(libs.plugins.android.library)
+    `maven-publish`
 }
 
 // Everything that needs a `Context` or a platform API. Kept apart from
@@ -31,6 +32,36 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    // Only `release` is published. A debug variant would double every
+    // coordinate for no consumer -- an app takes this library the same way in
+    // both of its own build types -- and AGP requires the choice to be stated
+    // before `components["release"]` exists at all.
+    publishing {
+        singleVariant("release") {
+            // Sources travel with the artifact: this library is read at the
+            // moment someone is trying to explain a log line it produced, and a
+            // decompiled frame is a poor substitute for the comment above it.
+            withSourcesJar()
+        }
+    }
+}
+
+publishing {
+    publications {
+        register<MavenPublication>("release") {
+            // `afterEvaluate` is AGP's requirement, not a preference: the
+            // `release` component is created while the Android extension is
+            // evaluated, so naming it earlier fails with "SoftwareComponent
+            // with name 'release' not found".
+            afterEvaluate { from(components["release"]) }
+            pom {
+                name = "androidlog logging-android"
+                description = "The Android sinks and bug-report transport for androidlog."
+                url = "https://github.com/mikelward/androidlog"
+            }
+        }
     }
 }
 
