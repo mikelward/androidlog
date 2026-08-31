@@ -664,7 +664,7 @@ open class DebugLog(
      * every [Destination.DEVICE] sink and anything persisted from them read
      * the same full text. The floor applies at the boundary instead: an
      * argument [logArgumentMayLeaveDevice] withholds renders as
-     * [REDACTED_PLACEHOLDER] on the far side of it — in a
+     * [OFF_DEVICE_PLACEHOLDER] on the far side of it — in a
      * [Destination.OFF_DEVICE] sink's copy, and in [formatLogMessage] with
      * `leavingDevice = true`, which is what a caller building something that
      * *leaves* renders from itself.

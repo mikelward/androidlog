@@ -129,25 +129,21 @@ growing a second copy for the buffers.
   after the migration than guessed before it). Revisit when Type Launcher's
   loss is concrete rather than projected.
 
-- [ ] **What to call the off-device form — "reduced", and what follows from
-  that.** The codebase converged on a vocabulary without anyone deciding it:
-  *reduced* for the rendering (26 uses), *dropped* for a message (20),
-  *withheld* for a single value (17). *Scrub* and *sanitize* appear only when
-  naming the design that was rejected. **"Redact" is the word to avoid**: it
-  means someone read the text and decided what to black out, which is exactly
-  the content-classifying judgment this design refuses to make — the same
-  reason `redactSensitive` already became `leavingDevice`.
-  **Open, and deferred by the maintainer (2026-08-31)**: `REDACTED_PLACEHOLDER`
-  (the public `const val` for `•••`) still says redaction. Renaming it was
-  proposed and **not taken** — the proposal reached for `WITHHELD_PLACEHOLDER`,
-  a third word, when the argument had just settled on *reduced*, and three
-  words for adjacent concepts is what made it incoherent. What needs deciding
-  first is whether the placeholder marks a **withheld value** or **is the
-  reduced rendering** of one; the name follows from that answer, not before it.
-  Four consumer files reference the constant (snoozemo, typelauncher,
-  clothescast), so a rename is cheap while nothing has adopted the new library
-  version yet — but it is not urgent, and getting the concept right is worth
-  more than getting the rename done.
+- [x] **What to call the off-device form — "reduced", and the placeholder is
+  named for its destination.** The codebase converged on a vocabulary without
+  anyone deciding it: *reduced* for the rendering, *dropped* for a message,
+  *withheld* for a single value. *Scrub* and *sanitize* appear only when naming
+  the design that was rejected. **"Redact" is the word to avoid**: it means
+  someone read the text and decided what to black out, which is exactly the
+  content-classifying judgment this design refuses to make — the same reason
+  `redactSensitive` already became `leavingDevice`.
+  **Settled by the maintainer, 2026-08-31**: the public `const val` for `•••` is
+  `OFF_DEVICE_PLACEHOLDER`. An earlier proposal reached for `WITHHELD_PLACEHOLDER`
+  and stalled on which verb was right — withheld, reduced, redacted — which was
+  the wrong question. The simplification is to pick no verb at all: everything
+  else here is already named for the destination (`Destination.OFF_DEVICE`,
+  `offDeviceThrowable`, `offDeviceTrace`, `leavingDevice`), so the placeholder is
+  too, and there is no fourth word to keep consistent.
 
 ### Should the apps without a logging preference have one?
 
