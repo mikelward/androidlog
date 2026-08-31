@@ -102,6 +102,12 @@ jobs:
       - name: Verify the version derivation
         run: ./scripts/verify-version-derivation.sh
 
+      # The merge guard the release workflow's committing job runs. Pure shell
+      # over two directory trees, so it needs nothing from Gradle and runs in
+      # under a second.
+      - name: Verify the Maven merge guard
+        run: ./scripts/merge-maven-tree-test.sh
+
       # A guard against a *false pass* cannot be proven by a passing run. The
       # version this check replaced -- ported from snoozemo, where it had been
       # enforcing nothing -- went green with an androidx dependency present,

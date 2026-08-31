@@ -160,6 +160,20 @@ for artifact in \
     fi
 done
 
+# The metadata must ADVERTISE this release, not merely exist. A version whose
+# artifacts are staged but which no `maven-metadata.xml` lists is invisible to
+# version-aware resolution -- and mikelward/gradle-update discovers releases by
+# reading exactly that file, so an unlisted version is one no consumer is ever
+# offered. `merge-maven-tree.sh` refuses it at publish time; this catches it
+# one step earlier, where the metadata is actually produced (Codex, PR #22).
+for module in logging-android logging-core; do
+    if grep -q "<version>$expected</version>" "$staged/$module/maven-metadata.xml"; then
+        ok "$module's metadata advertises $expected"
+    else
+        fail "$module's metadata does not list $expected"
+    fi
+done
+
 # The cross-module dependency: the AAR declares `api(project(":logging-core"))`,
 # so its POM has to name a coordinate that exists -- at the SAME version, since
 # two derivations drifting apart is the failure the shared version script was
