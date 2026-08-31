@@ -336,10 +336,10 @@ delivered, and the first clipboard copy then deletes a crash log nobody saw. An
 app that wants no prior run passes a null sink, which reads nothing and consumes
 nothing.
 
-A payload builder that throws is contained — its section says which exception
-type, never its message — and the prior run is still appended and still
-consumed, because it was read and delivered regardless of what the app's own
-section managed to say.
+A payload builder that throws is contained — its section names the exception
+type, and the failure itself is recorded in the log the report already carries
+— and the prior run is still appended and still consumed, because it was read
+and delivered regardless of what the app's own section managed to say.
 
 The rule that matters: **a log call is a hard-coded format string plus
 arguments.** The literal is safe by construction; each argument is carried or
@@ -347,19 +347,29 @@ withheld on its own by its type, and every `String` is withheld unless the call
 site wraps it in `safe(...)`. Interpolating into the format string defeats that,
 and nothing can enforce it but review.
 
-**The rule is applied as the entry is recorded, and there is only one
-rendering.** The buffer holds the reduced text, and that is what `snapshot()`,
-every sink, the persisted file and any report all carry — a withheld value is
-never held in full anywhere in the process, so nothing downstream has to
-remember to ask for a safe version. Numbers, booleans, enums, durations and a
-throwable's *type* pass untouched; a `String` does not.
+**The rule is a boundary, not an ingestion filter.** What the log records for
+the device carries every argument in full — the buffer, `snapshot()`, every
+sink, the persisted file and any report the user shares deliberately. `•••`
+appears in a rendering that is *leaving*: `formatLogMessage(format, args,
+leavingDevice = true)` for a message, `log.offDeviceTrace(throwable)` for a
+stack. Those are what a crash reporter or an automatic report is built from,
+and there a `String` is withheld while numbers, booleans, enums, durations and
+a throwable's *type* pass untouched.
 
-So an app that reduces its own values keeps them by saying so. `simmo` masks a
-dialed number before logging it, and `safe(redactNumber(number))` carries
-`+61••••••678 (len=12)` into the log while a bare number would render as `•••`.
-An unmarked call site shows `•••` on the device's own log screen the first time
-anyone looks, which is the intended feedback: nothing degrades quietly in a file
-nobody reads until a crash.
+**A sink is an on-device destination.** What a sink is handed is the rendering
+this device keeps, so it may write to disk, to logcat, to a screen — and may not
+forward to a crash reporter or any other automatic channel. An app building
+something that leaves renders it itself, from the two functions above, as its
+own call rather than as a sink.
+
+The floor that decides whether a value is somebody's sits **in the app, above
+this**: simmo masks a dialed number before logging it, so what the library sees
+and what the device keeps is already `+61••••••678 (len=12)`. What this
+rule governs is the tier below — a package name, a row id, a place name — where
+the local log is the point and the copy that leaves is the risk. An app that
+has reduced a value and wants it off device too says `safe(...)`; one that
+wants it kept locally and withheld off device says `sensitive(...)` or simply
+leaves the `String` untagged.
 
 ### What a consuming app inherits
 
@@ -370,9 +380,9 @@ consuming app's R8 configuration. It holds one rule:
 -keepnames class ** extends java.lang.Throwable
 ```
 
-A throwable is rendered into the log as its class name and nothing else — that
-is what makes it safe to carry, since the no-messages floor keeps the message
-out. Renamed by R8, that name reads `app.example.a.b` in a log a user pastes
+A throwable bound into a `%s` placeholder is rendered as its class name and
+nothing else, and the one a failure carries is rendered as its class name and
+frames in anything leaving the device. Renamed by R8, that name reads `app.example.a.b` in a log a user pastes
 into an email, and the one thing a failure line exists to say is gone unless the
 reader also has the mapping file for that exact build. Platform and JDK
 exceptions were never affected; R8 does not rename what it does not compile.

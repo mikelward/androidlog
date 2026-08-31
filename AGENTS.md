@@ -44,22 +44,38 @@ has stopped biting.
   in it cannot weaken the type rule. What needs scrubbing differs per app (a
   phone number is simmo's problem, an SSID is snoozemo's, a package name is
   Type Launcher's), and a shared regex would be wrong for three of the four.
-- **The floor is applied at ingestion, and there is one rendering** (maintainer,
-  2026-08-30). `record` renders reduced; the buffer, `snapshot()`, every sink and
-  the persisted file carry that same text, so a withheld value exists in full
-  nowhere in the process and no future reader has to remember to ask for the safe
-  form. Rendering full and reducing at a boundary is what let the durable file
-  carry everything. A consumer that already reduces its own values keeps them by
-  saying `safe(...)`.
-  **Decided but not built:** the reduction becomes a per-app *setting* rather
-  than a constant — default reduced, unredacted behind a hidden gesture — which
-  keeps one rendering applied at ingestion and still forbids a rendering chosen
-  per sink. Deliberately deferred; `TODO.md` carries the design and the
-  reasoning. Until it lands the rule above is the rule, unqualified.
-- **No `getMessage()` from a throwable, ever.** A platform exception quotes
-  what it was given, and on the paths this log exists for that is exactly what
-  the floor bans. Types and stack frames only. There is no scrubber to catch a
-  message, by the rule above, so the message is not read at all.
+- **The floor is a boundary, not an ingestion filter** (maintainer,
+  2026-08-31). What this log records for the device carries every argument in
+  full, throwable messages included; `•••` and the missing message appear only
+  in a rendering that is *leaving* — `formatLogMessage(..., leavingDevice =
+  true)` and `DebugLog.offDeviceTrace`. This reverses *the floor is applied at
+  ingestion, and there is one rendering* (2026-08-30), which reduced the
+  device's own copy too and so blanked the log the user opens to explain their
+  own bug — a launcher's failing package, a saved place, the network that was
+  joined all arrive as `String`. Whole or nothing, chosen by destination, is
+  what lets this avoid classifying content it cannot classify.
+  **The real floor did not move, and it is not here**: a full phone number, an
+  ICCID, a coordinate, a whole SSID is reduced by the app *before* this code
+  sees it, so what is rendered in full is already the app's reduced form. This
+  rule governs the tier below that. And the split is by destination alone — a
+  rendering is never chosen per sink. **A sink is therefore an on-device
+  destination by contract**: it is handed the device's own text, so forwarding
+  one to a crash reporter or any automatic channel leaks by construction, and
+  handing a sink structured data so it could re-render is the per-sink
+  rendering this forbids. What leaves is built by the app, from
+  `formatLogMessage(..., leavingDevice = true)` and `offDeviceTrace`, as its
+  own call.
+- **No `getMessage()` from a throwable in anything leaving the device.** A
+  platform exception quotes what it was given, and on the paths this log exists
+  for that is exactly what may not leave: the number that was dialed, the
+  network that was joined. There is no scrubber to catch it and there cannot
+  usefully be one, since the message's content and its sensitivity are both
+  unknown here. On the device's own copy it is read in full, because dropping
+  it costs `ActivityNotFoundException`'s intent and `NameNotFoundException`'s
+  package, which is the whole of what those are diagnosed from. A throwable
+  bound into a `%s` placeholder is type-only in **both** directions — that
+  rendering rests on never calling an unknown `toString()`, not on where the
+  line is going.
 - **`minSdk` is 31**, the floor across the consumer fleet (`clothescast`;
   simmo and typelauncher are 34, snoozemo 35). Raising it silently drops a
   consumer, so it is a migration note in that app, not a tidy-up here.
