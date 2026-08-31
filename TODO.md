@@ -107,6 +107,48 @@ growing a second copy for the buffers.
 
 ## Decisions needing review
 
+- [ ] **The boundary reversal changed the premise `LogSummary` was deleted on.
+  Not a blocker; worth revisiting.** Recorded as a blocker first and that was
+  wrong (Codex, PR #28) — the answer was already in this file, twice, and the
+  migration proceeds without it.
+  What is settled and stands: `LogSummary` was **deleted in favor of
+  `safe(...)`** (maintainer, 2026-08-30), and the migration path is stated —
+  `Intent.debugSummary()` → `safe(mirrored)`, losing component and package,
+  "a window, not a decision". `either(full, reduced)` is designed above as the
+  eventual replacement, tied to the on-device-only setting and **deliberately
+  deferred**, on the argument that a fleet-wide mechanism serving essentially
+  one app is better built once that app is migrated and the loss is concrete.
+  **What is genuinely new**: the deletion's reasoning was that reducing at
+  ingestion left *one* rendering, so `full` reached nothing and
+  `LogSummary(full, mirrored)` simply *was* `safe(mirrored)`. The boundary rule
+  (2026-08-31) restored the second rendering, so that premise no longer holds —
+  `full` now has somewhere to go. That makes `either(...)` **implementable
+  without the setting**, which it was not when it was deferred.
+  It does not make it necessary, and it does not change the deferral's own
+  argument (the value is almost all Type Launcher's, and is better measured
+  after the migration than guessed before it). Revisit when Type Launcher's
+  loss is concrete rather than projected.
+
+- [ ] **What to call the off-device form — "reduced", and what follows from
+  that.** The codebase converged on a vocabulary without anyone deciding it:
+  *reduced* for the rendering (26 uses), *dropped* for a message (20),
+  *withheld* for a single value (17). *Scrub* and *sanitize* appear only when
+  naming the design that was rejected. **"Redact" is the word to avoid**: it
+  means someone read the text and decided what to black out, which is exactly
+  the content-classifying judgment this design refuses to make — the same
+  reason `redactSensitive` already became `leavingDevice`.
+  **Open, and deferred by the maintainer (2026-08-31)**: `REDACTED_PLACEHOLDER`
+  (the public `const val` for `•••`) still says redaction. Renaming it was
+  proposed and **not taken** — the proposal reached for `WITHHELD_PLACEHOLDER`,
+  a third word, when the argument had just settled on *reduced*, and three
+  words for adjacent concepts is what made it incoherent. What needs deciding
+  first is whether the placeholder marks a **withheld value** or **is the
+  reduced rendering** of one; the name follows from that answer, not before it.
+  Four consumer files reference the constant (snoozemo, typelauncher,
+  clothescast), so a rename is cheap while nothing has adopted the new library
+  version yet — but it is not urgent, and getting the concept right is worth
+  more than getting the rename done.
+
 ### Should the apps without a logging preference have one?
 
 **Raised by the maintainer, 2026-08-31**, while deciding that the opt-out
@@ -1291,26 +1333,3 @@ own `runCatching`, before the snapshot and after the crash marker.
 
   Each migration also deletes that app's legacy log files and marks its
   already-reduced values `safe(...)` — see the entry above.
-
-## Decisions needing review
-
-- [ ] **What to call the off-device form — "reduced", and what follows from
-  that.** The codebase converged on a vocabulary without anyone deciding it:
-  *reduced* for the rendering (26 uses), *dropped* for a message (20),
-  *withheld* for a single value (17). *Scrub* and *sanitize* appear only when
-  naming the design that was rejected. **"Redact" is the word to avoid**: it
-  means someone read the text and decided what to black out, which is exactly
-  the content-classifying judgment this design refuses to make — the same
-  reason `redactSensitive` already became `leavingDevice`.
-  **Open, and deferred by the maintainer (2026-08-31)**: `REDACTED_PLACEHOLDER`
-  (the public `const val` for `•••`) still says redaction. Renaming it was
-  proposed and **not taken** — the proposal reached for `WITHHELD_PLACEHOLDER`,
-  a third word, when the argument had just settled on *reduced*, and three
-  words for adjacent concepts is what made it incoherent. What needs deciding
-  first is whether the placeholder marks a **withheld value** or **is the
-  reduced rendering** of one; the name follows from that answer, not before it.
-  Four consumer files reference the constant (snoozemo, typelauncher,
-  clothescast), so a rename is cheap while nothing has adopted the new library
-  version yet — but it is not urgent, and getting the concept right is worth
-  more than getting the rename done.
-
