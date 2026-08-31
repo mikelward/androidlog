@@ -77,7 +77,7 @@ class DebugLogTest {
         // Both directions in one place, so neither can quietly become the
         // other: an untagged String is the device's to read and nobody else's.
         assertEquals(
-            "joined $REDACTED_PLACEHOLDER at 3",
+            "joined $OFF_DEVICE_PLACEHOLDER at 3",
             formatLogMessage("joined %s at %s", arrayOf<Any?>("ExampleWifi", 3), leavingDevice = true),
         )
     }

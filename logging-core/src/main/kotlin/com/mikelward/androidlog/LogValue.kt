@@ -28,7 +28,7 @@ package com.mikelward.androidlog
  *
  * **The floor is a boundary, not an ingestion filter** (maintainer,
  * 2026-08-31). What this log records for the device carries every argument in
- * full; [REDACTED_PLACEHOLDER] appears only in a rendering that is leaving —
+ * full; [OFF_DEVICE_PLACEHOLDER] appears only in a rendering that is leaving —
  * a crash-reporter breadcrumb, an automatic report, anything sent without the
  * user in the loop. That reverses *the floor is applied at ingestion, and
  * there is one rendering* (2026-08-30), which reduced the device's own copy
@@ -58,7 +58,23 @@ package com.mikelward.androidlog
  */
 
 /** Rendered in place of an argument that may not leave the device. */
-const val REDACTED_PLACEHOLDER = "•••"
+const val OFF_DEVICE_PLACEHOLDER = "•••"
+
+/**
+ * The former name of [OFF_DEVICE_PLACEHOLDER].
+ *
+ * Kept only so a consumer is never broken by the rename itself: clothescast
+ * tracks this repository at `@main` through a composite build, so a bare rename
+ * would redden its next build the moment this merged, with no version to hold
+ * it back and no way to land both halves at once. Each consumer drops its
+ * import when it next touches the file; delete this once none of the four names
+ * it.
+ */
+@Deprecated(
+    "Renamed for its destination, like every other name here.",
+    ReplaceWith("OFF_DEVICE_PLACEHOLDER"),
+)
+const val REDACTED_PLACEHOLDER = OFF_DEVICE_PLACEHOLDER
 
 /**
  * Marks a value that is carried as it is even though its type would withhold
@@ -86,7 +102,7 @@ fun sensitive(value: Any?): SensitiveLogValue = SensitiveLogValue(value)
 
 /**
  * Whether [argument] is carried as it is, rather than as
- * [REDACTED_PLACEHOLDER]. Asked once, as the entry is recorded.
+ * [OFF_DEVICE_PLACEHOLDER]. Asked once, as the entry is recorded.
  *
  * Numbers pass by default: a count, a duration, a distance in meters, a fix
  * accuracy. Those say whether a mechanism worked, which is the diagnostic.
@@ -297,12 +313,12 @@ internal fun untaggedLogValue(argument: Any?): Any? = untag(argument).value
  * vouched for -- over-strict, and paid for in diagnostics.
  *
  * At [depth] 0 this is called from [formatLogMessage], which has already put
- * every withheld argument behind [REDACTED_PLACEHOLDER]; the sensitive check
+ * every withheld argument behind [OFF_DEVICE_PLACEHOLDER]; the sensitive check
  * below is then a no-op, since nothing sensitive is permitted to reach it.
  */
 private fun renderArgument(argument: Any?, leavingDevice: Boolean, depth: Int = 0): String {
     val untagged = untag(argument)
-    if (leavingDevice && untagged.sensitive) return REDACTED_PLACEHOLDER
+    if (leavingDevice && untagged.sensitive) return OFF_DEVICE_PLACEHOLDER
     val value = untagged.value
     return when {
         // Tagged or not, one rendering path. A tag answers "may this leave the
@@ -321,7 +337,7 @@ private fun renderArgument(argument: Any?, leavingDevice: Boolean, depth: Int = 
 /**
  * Substitutes [args] into [format], replacing each `%s` in order. `%%` renders a
  * literal `%`. When [leavingDevice] is set, any argument
- * [logArgumentMayLeaveDevice] withholds renders as [REDACTED_PLACEHOLDER]
+ * [logArgumentMayLeaveDevice] withholds renders as [OFF_DEVICE_PLACEHOLDER]
  * instead — that is the only difference between the on-device rendering and the
  * mirrored one.
  *
@@ -343,7 +359,7 @@ fun formatLogMessage(
 ): String {
     fun render(argument: Any?): String =
         if (leavingDevice && !logArgumentMayLeaveDevice(argument)) {
-            REDACTED_PLACEHOLDER
+            OFF_DEVICE_PLACEHOLDER
         } else {
             renderArgument(argument, leavingDevice)
         }

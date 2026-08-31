@@ -61,7 +61,7 @@ class LogValueTest {
     @Test
     fun `a String is withheld off device but kept on it`() {
         assertEquals("joined ExampleWifi", full("joined %s", "ExampleWifi"))
-        assertEquals("joined $REDACTED_PLACEHOLDER", offDevice("joined %s", "ExampleWifi"))
+        assertEquals("joined $OFF_DEVICE_PLACEHOLDER", offDevice("joined %s", "ExampleWifi"))
     }
 
     @Test
@@ -99,7 +99,7 @@ class LogValueTest {
     fun `sensitive withholds a number the type rule would carry`() {
         assertFalse(logArgumentMayLeaveDevice(sensitive(51.5)))
         assertEquals("lat=51.5", full("lat=%s", sensitive(51.5)))
-        assertEquals("lat=$REDACTED_PLACEHOLDER", offDevice("lat=%s", sensitive(51.5)))
+        assertEquals("lat=$OFF_DEVICE_PLACEHOLDER", offDevice("lat=%s", sensitive(51.5)))
     }
 
     @Test
@@ -123,10 +123,18 @@ class LogValueTest {
         assertEquals("a=1 b=%s", full("a=%s b=%s", 1))
     }
 
+    @Suppress("DEPRECATION")
     @Test
-    fun `a surplus argument is appended and redacted like a placed one`() {
+    fun `the former name still resolves to the same placeholder`() {
+        // The alias exists so the rename alone cannot redden a consumer that
+        // tracks @main; a consumer's own assertions must keep matching.
+        assertEquals(OFF_DEVICE_PLACEHOLDER, REDACTED_PLACEHOLDER)
+    }
+
+    @Test
+    fun `a surplus argument is appended and withheld like a placed one`() {
         assertEquals("a=1 [unplaced arg] secret", full("a=%s", 1, "secret"))
-        assertEquals("a=1 [unplaced arg] $REDACTED_PLACEHOLDER", offDevice("a=%s", 1, "secret"))
+        assertEquals("a=1 [unplaced arg] $OFF_DEVICE_PLACEHOLDER", offDevice("a=%s", 1, "secret"))
     }
 
     @Test
@@ -287,7 +295,7 @@ class LogValueTest {
     fun `sensitive wins however many safe wrappers are around it`() {
         assertFalse(logArgumentMayLeaveDevice(safe(sensitive("ExampleWifi"))))
         assertFalse(logArgumentMayLeaveDevice(safe(safe(sensitive(1.0)))))
-        assertEquals("at $REDACTED_PLACEHOLDER", offDevice("at %s", safe(sensitive("ExampleWifi"))))
+        assertEquals("at $OFF_DEVICE_PLACEHOLDER", offDevice("at %s", safe(sensitive("ExampleWifi"))))
         // On device it is still rendered in full -- withholding is about what
         // leaves, not about what the user reads before sharing.
         assertEquals("at ExampleWifi", full("at %s", safe(sensitive("ExampleWifi"))))
