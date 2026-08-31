@@ -809,10 +809,25 @@ build decided rather than copied from the sketch:
   because of it — and now pinned by its own test.
 
 **Still open, and worth deciding before building:**
-- `recordException` needs a *Throwable*, not a string (Type Launcher's
-  `redactedForTelemetry()` rebuilds the cause chain with empty messages). So the
-  off-device sink interface probably carries the throwable alongside the line,
-  or the library grows the reconstruction. That is the option-A work below.
+- ~~`recordException` needs a *Throwable*, not a string.~~ **Shipped, PR #27**:
+  the library grew the reconstruction (`offDeviceThrowable`) and the sink
+  callback carries it — `Sink.log(line, level, throwable)`, defaulted through so
+  a lambda sink stays a lambda. Each destination gets the throwable in the form
+  it may have: the original on device, the rebuilt one off it.
+  **Why the library rather than the app**: leaving it in the app hands a raw
+  throwable to a sink whose whole definition is "this leaves", which is the leak
+  the destination class exists to remove, and writes it four times. It is also
+  the same policy the library already owned for the string form in
+  `offDeviceTrace`.
+  **It omits rather than sanitizes**, which is what makes it safe to own here:
+  no message is inspected to judge whether it looks risky; every one is dropped,
+  and the type name and frames survive. Type Launcher's own KDoc records why —
+  two rounds of trying to sanitize messages each found another payload
+  ("the signal to stop sanitizing and start omitting").
+  **The cost, and it is forced**: every link becomes one `OffDeviceThrowable`,
+  so a reporter groups on frames rather than exception class. A message cannot
+  be cleared on an existing `Throwable` and arbitrary classes cannot be
+  synthesized, so there is no version of this that preserves the type.
 - Whether the app's telemetry gate (Type Launcher's Analytics preference) lives
   in the sink or in the library. In the sink, almost certainly — and note this
   is a *whole-channel* switch, "may we send at all", tied to a consent UI and a
@@ -1276,3 +1291,26 @@ own `runCatching`, before the snapshot and after the crash marker.
 
   Each migration also deletes that app's legacy log files and marks its
   already-reduced values `safe(...)` — see the entry above.
+
+## Decisions needing review
+
+- [ ] **What to call the off-device form — "reduced", and what follows from
+  that.** The codebase converged on a vocabulary without anyone deciding it:
+  *reduced* for the rendering (26 uses), *dropped* for a message (20),
+  *withheld* for a single value (17). *Scrub* and *sanitize* appear only when
+  naming the design that was rejected. **"Redact" is the word to avoid**: it
+  means someone read the text and decided what to black out, which is exactly
+  the content-classifying judgment this design refuses to make — the same
+  reason `redactSensitive` already became `leavingDevice`.
+  **Open, and deferred by the maintainer (2026-08-31)**: `REDACTED_PLACEHOLDER`
+  (the public `const val` for `•••`) still says redaction. Renaming it was
+  proposed and **not taken** — the proposal reached for `WITHHELD_PLACEHOLDER`,
+  a third word, when the argument had just settled on *reduced*, and three
+  words for adjacent concepts is what made it incoherent. What needs deciding
+  first is whether the placeholder marks a **withheld value** or **is the
+  reduced rendering** of one; the name follows from that answer, not before it.
+  Four consumer files reference the constant (snoozemo, typelauncher,
+  clothescast), so a rename is cheap while nothing has adopted the new library
+  version yet — but it is not urgent, and getting the concept right is worth
+  more than getting the rename done.
+

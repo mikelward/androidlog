@@ -47,12 +47,14 @@ import kotlin.concurrent.write
  * device it is.
  *
  * A sink registered for [Destination.OFF_DEVICE] is handed the reduced
- * rendering instead, so a crash reporter's breadcrumbs or an automatic report
- * can be a sink rather than something the consumer assembles itself. What is
- * still the caller's job is everything **returned** from here: a snapshot is
- * the device's own text, and forwarding one as it stands is the mistake this
- * boundary exists to prevent. Build what leaves from a sink, or from
- * [formatLogMessage] with `leavingDevice = true` and [offDeviceTrace].
+ * rendering instead — and, where the entry had one, a throwable rebuilt with
+ * no message from any link ([offDeviceThrowable]), so a crash reporter's
+ * breadcrumbs *and* its non-fatals can both be a sink rather than something
+ * the consumer assembles itself. What is still the caller's job is everything
+ * **returned** from here: a snapshot is the device's own text, and forwarding
+ * one as it stands is the mistake this boundary exists to prevent. Build what
+ * leaves from a sink, or from [formatLogMessage] with `leavingDevice = true`,
+ * [offDeviceTrace] and [offDeviceThrowable].
  */
 open class DebugLog(
     /** Bounds the buffer; old entries fall off the front. */
@@ -351,7 +353,8 @@ open class DebugLog(
      * [Destination.DEVICE] sink is handed the rendering this device keeps:
      * every argument in full and each throwable's message with it. A
      * [Destination.OFF_DEVICE] sink is handed the reduced rendering, the same
-     * one [formatLogMessage] produces with `leavingDevice = true`.
+     * one [formatLogMessage] produces with `leavingDevice = true`, and a
+     * throwable reduced the same way — see the three-argument [Sink.log].
      *
      * An earlier version of this contract said the on-device form was all a
      * sink ever got, that forwarding it to a crash reporter was forbidden, and
@@ -400,6 +403,33 @@ open class DebugLog(
          * offset markers this class synthesizes.
          */
         fun log(line: String, level: Char) = log(line)
+
+        /**
+         * The same line, plus the throwable it was recorded with — in the form
+         * **this sink's destination may have**.
+         *
+         * A [Destination.DEVICE] sink gets the original. A
+         * [Destination.OFF_DEVICE] sink gets [offDeviceThrowable]'s
+         * reconstruction, which carries every link's type and frames and no
+         * message from any of them. `null` when the entry had no throwable, or
+         * when the reconstruction could not be built.
+         *
+         * This exists because a crash reporter's `recordException` wants an
+         * object rather than text, and it is the reason a reporter can be a
+         * sink at all: without it every consumer rebuilds the reduced form
+         * itself, which is the duplication [Destination] exists to end.
+         *
+         * Defaulted through to [log] so a sink written as a lambda stays a
+         * lambda and every existing one keeps working.
+         *
+         * **Handing this over is not the "structured data so it could
+         * re-render" the floor forbids.** That prohibition is about a sink
+         * being able to reach a form its destination may not have. It cannot
+         * here: an off-device sink's throwable has already lost every message,
+         * so re-rendering it can only produce the reduced form again, and an
+         * on-device sink is given nothing its line did not already carry.
+         */
+        fun log(line: String, level: Char, throwable: Throwable?) = log(line, level)
 
         /**
          * The buffer was emptied because recording was turned off.
@@ -1029,6 +1059,15 @@ open class DebugLog(
         // one entry rather than a rendering taken under the monitor -- the same
         // shape as the anchor it is also still waiting for, and it fails toward
         // saying less.
+        // Rebuilt here for the same reason the reduced line is: `cause` and
+        // `stackTrace` are both overridable, so this walks app code and must
+        // not do it under the buffer's monitor.
+        val offDeviceCause: Throwable? =
+            if (offDeviceSinks == 0 || throwable == null) {
+                null
+            } else {
+                runCatching { offDeviceThrowable(throwable) }.getOrNull()
+            }
         val offDevice: String? = if (offDeviceSinks == 0) {
             null
         } else {
@@ -1065,7 +1104,7 @@ open class DebugLog(
                 // before this session opened.
                 reportClearFailures(now)
                 reportDroppedFromSink(now)
-                append(entry, now, level, pinned, offDevice)
+                append(entry, now, level, pinned, offDevice, throwable, offDeviceCause)
             }
         }
         return true
@@ -1099,6 +1138,12 @@ open class DebugLog(
         // buffer's monitor — see the call in [record]. `null` means an
         // off-device sink gets the notice instead.
         offDevice: String? = entry,
+        // The throwable each side may have. `null` on both for the notices
+        // this class synthesizes, which is every caller that does not pass
+        // them: each renders its throwable into its own text where it has one,
+        // and none of them has a reporter to hand an object to.
+        cause: Throwable? = null,
+        offDeviceCause: Throwable? = null,
     ) {
         val line = Line(entry, at?.offset)
         if (buffer.size >= maxEntries) buffer.removeFirst()
@@ -1109,7 +1154,7 @@ open class DebugLog(
             if (pinnedBuffer.size >= maxPinnedEntries) pinnedBuffer.removeFirst()
             pinnedBuffer.addLast(line)
         }
-        deliver(entry, at, level, offDevice)
+        deliver(entry, at, level, offDevice, cause, offDeviceCause)
     }
 
 
@@ -1243,6 +1288,8 @@ open class DebugLog(
         at: ZonedDateTime?,
         level: Char,
         offDevice: String? = entry,
+        cause: Throwable? = null,
+        offDeviceCause: Throwable? = null,
     ) {
         val offset = at?.offset
         // Already rendered by the caller, outside this monitor. `null` covers
@@ -1304,8 +1351,13 @@ open class DebugLog(
                 // The rendering this sink's destination may have. Decided
                 // here, from what it registered as, rather than by the sink
                 // itself.
-                val text = if (registration.destination == Destination.DEVICE) entry else reduced
-                runCatching { sink.log(text, level) }
+                val onDevice = registration.destination == Destination.DEVICE
+                val text = if (onDevice) entry else reduced
+                // Same rule as the line, applied to the throwable: each
+                // destination gets the form it may have, decided here rather
+                // than by the sink.
+                val thrown = if (onDevice) cause else offDeviceCause
+                runCatching { sink.log(text, level, thrown) }
             }
         } finally {
             deliveringThread = null
@@ -1355,6 +1407,60 @@ open class DebugLog(
      * recorded entry, but not truncated to `maxEntryChars`: the caller knows
      * what its destination will take.
      */
+    /**
+     * [throwable] rebuilt with **no message from any link**, so a crash
+     * reporter's `recordException` can be given a real `Throwable` without one
+     * quoting what it was handed.
+     *
+     * The `Throwable` counterpart to [offDeviceTrace], which answers the same
+     * question for a rendered string. A reporter's non-fatal API wants an
+     * object, not text, and the original cannot be given to it: a message is
+     * uploaded verbatim, and a platform exception routinely quotes what
+     * failed — an intent, a package, a network name.
+     *
+     * **This omits rather than sanitizes**, which is what makes it safe to do
+     * here at all. It never inspects a message to decide whether it looks
+     * risky; every link loses its message unconditionally, and the type name
+     * and frames — which cannot carry a payload — are what survive. A filter
+     * that had to recognize categories is the design this library exists to
+     * replace, and it is not this.
+     *
+     * **The cost, stated because it is real**: every link becomes an
+     * [OffDeviceThrowable], so a reporter grouping by exception class sees one
+     * type for all of them and groups on the frames instead. The original
+     * class name is carried as the stand-in's message, so a report still says
+     * what was thrown. There is no way around it — a message cannot be cleared
+     * on an existing `Throwable`, and arbitrary classes cannot be synthesized.
+     */
+    fun offDeviceThrowable(throwable: Throwable): Throwable {
+        val chain = mutableListOf<Throwable>()
+        val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
+        var current: Throwable? = throwable
+        // Iterative and identity-guarded, for the reason [typesAndFrames] is:
+        // a cause chain can be cyclic (`a.initCause(b); b.initCause(a)`), and
+        // a `StackOverflowError` raised while *preparing* a report would take
+        // out the very failure it was reporting. Bounded by `maxCauseLinks`
+        // too, so one pathological chain cannot dominate a report.
+        while (current != null && seen.add(current) && chain.size < maxCauseLinks) {
+            chain += current
+            current = runCatching { current?.cause }.getOrNull()
+        }
+        var rebuilt: Throwable? = null
+        for (link in chain.asReversed()) {
+            rebuilt = OffDeviceThrowable(link.javaClass.name, rebuilt).also {
+                // The frames are kept in full rather than clipped to
+                // `maxTraceFrames`. That bound exists so one trace cannot
+                // dominate a *text* buffer; here the frames are the entire
+                // diagnostic value, and a crash reporter groups on them.
+                it.stackTrace = runCatching { link.stackTrace }.getOrNull() ?: emptyArray()
+                it.addOffDeviceSuppressed(link)
+            }
+        }
+        return rebuilt ?: OffDeviceThrowable(throwable.javaClass.name, null).also {
+            it.stackTrace = runCatching { throwable.stackTrace }.getOrNull() ?: emptyArray()
+        }
+    }
+
     fun offDeviceTrace(throwable: Throwable): String =
         throwable.typesAndFrames(leavingDevice = true).trimEnd()
 
@@ -1390,6 +1496,51 @@ open class DebugLog(
      * Guarded against a cyclic cause chain, and bounded per link and per chain
      * so one throw can't consume the whole entry budget.
      */
+    /**
+     * Rebuilds [original]'s suppressed exceptions onto this stand-in, message-free.
+     *
+     * Suppressed failures are not on the cause chain, so following `cause`
+     * alone loses them — and they are exactly the interesting half of the
+     * common case: `use { }` and try-with-resources put a *cleanup* failure
+     * here when the body failed too, so a report that drops them says the
+     * write failed and not that closing the file failed as well (Codex,
+     * PR #27). [typesAndFrames] has always kept them, and this is the same
+     * decision for the object form.
+     *
+     * One level deep and bounded by `maxCauseLinks`, matching what
+     * [appendSuppressed] renders: a suppressed link contributes its type and
+     * its frames, not a cause chain of its own. That also makes the walk
+     * trivially terminating — no recursion, so a suppressed exception that
+     * points back into the chain costs one entry rather than a cycle.
+     */
+    private fun Throwable.addOffDeviceSuppressed(original: Throwable) {
+        // `getSuppressed` allocates a copy on each call, so it is read once.
+        // It is `final` in `Throwable`, unlike `cause` and `stackTrace`, so
+        // this one cannot run app code — the guard is for the array read
+        // alone and costs nothing.
+        val suppressed = runCatching { original.suppressed }.getOrNull() ?: return
+        val keep = minOf(maxCauseLinks, suppressed.size)
+        for (i in 0 until keep) {
+            val link = suppressed[i]
+            val stand = OffDeviceThrowable(link.javaClass.name, null).also {
+                it.stackTrace = runCatching { link.stackTrace }.getOrNull() ?: emptyArray()
+            }
+            // Always a fresh stand-in, never `link` itself, so the
+            // same-instance refusal `addSuppressed` makes is unreachable here.
+            addSuppressed(stand)
+        }
+    }
+
+    /**
+     * Stand-in produced by [offDeviceThrowable]. Its message is the original's
+     * class name, so a report still names what was thrown even though every
+     * report of this kind shares one type.
+     */
+    class OffDeviceThrowable internal constructor(
+        message: String,
+        cause: Throwable?,
+    ) : RuntimeException(message, cause)
+
     private fun Throwable.typesAndFrames(leavingDevice: Boolean): String = buildString {
         val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
         var prefix = ""

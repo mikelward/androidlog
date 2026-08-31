@@ -1,7 +1,10 @@
 package com.mikelward.androidlog
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -1670,6 +1673,156 @@ class DebugLogTest {
         val afterRemoval = CountingList()
         log.event("saw %s", safe(afterRemoval))
         assertEquals("device rendering only", 1, afterRemoval.reads)
+    }
+
+    // ------------------------------------------- the throwable a sink receives
+
+    /** Captures what a sink is handed, line and throwable together. */
+    private class RecordingSink : DebugLog.Sink {
+        val entries = mutableListOf<Pair<String, Throwable?>>()
+        override fun log(line: String) = Unit
+        override fun log(line: String, level: Char, throwable: Throwable?) {
+            entries += line to throwable
+        }
+    }
+
+    @Test
+    fun `a device sink gets the original throwable and an off-device sink the rebuilt one`() {
+        // The line's rule, applied to the throwable: each destination gets the
+        // form it may have, decided here rather than by the sink.
+        val log = log()
+        val onDevice = RecordingSink()
+        val offDevice = RecordingSink()
+        log.addSink(onDevice)
+        log.addSink(offDevice, DebugLog.Destination.OFF_DEVICE)
+        val boom = IllegalStateException("ssid=ExampleWifi")
+
+        log.failure(boom, "lookup failed")
+
+        val kept = onDevice.entries.single { "lookup failed" in it.first }.second
+        assertSame(boom, kept)
+
+        val rebuilt = offDevice.entries.single { "lookup failed" in it.first }.second!!
+        assertFalse(rebuilt.toString(), rebuilt.toString().contains("ssid=ExampleWifi"))
+        // The class name survives as the stand-in's message, so a report still
+        // says what was thrown.
+        assertEquals("java.lang.IllegalStateException", rebuilt.message)
+        assertArrayEquals(boom.stackTrace, rebuilt.stackTrace)
+    }
+
+    @Test
+    fun `the rebuilt throwable keeps the whole cause chain and drops every message`() {
+        val log = log()
+        val offDevice = RecordingSink()
+        log.addSink(offDevice, DebugLog.Destination.OFF_DEVICE)
+        val root = IllegalArgumentException("root: ExampleWifi")
+        val middle = IllegalStateException("middle: 51.5,-0.1", root)
+        val top = RuntimeException("top: Home", middle)
+
+        log.failure(top, "chain")
+
+        var link: Throwable? = offDevice.entries.single { "chain" in it.first }.second
+        val names = mutableListOf<String?>()
+        while (link != null) {
+            assertFalse(link.toString(), link.toString().contains("ExampleWifi"))
+            assertFalse(link.toString(), link.toString().contains("51.5"))
+            assertFalse(link.toString(), link.toString().contains("Home"))
+            names += link.message
+            link = link.cause
+        }
+        assertEquals(
+            listOf(
+                "java.lang.RuntimeException",
+                "java.lang.IllegalStateException",
+                "java.lang.IllegalArgumentException",
+            ),
+            names,
+        )
+    }
+
+    @Test
+    fun `rebuilding a cyclic cause chain terminates`() {
+        // A `StackOverflowError` raised while preparing a report would take out
+        // the failure it was reporting, which is the worst moment for it.
+        val a = IllegalStateException("a")
+        val b = IllegalStateException("b")
+        a.initCause(b)
+        b.initCause(a)
+
+        val rebuilt = log().offDeviceThrowable(a)
+
+        var link: Throwable? = rebuilt
+        var links = 0
+        while (link != null && links < 100) {
+            links++
+            link = link.cause
+        }
+        assertTrue("terminated rather than running to the guard", links < 100)
+    }
+
+    @Test
+    fun `no throwable is rebuilt when no off-device sink is registered`() {
+        // Same gate as the reduced line: an entry nobody reads should not pay
+        // for a second form of it.
+        val log = log()
+        val onDevice = RecordingSink()
+        log.addSink(onDevice)
+        val boom = IllegalStateException("boom")
+
+        log.failure(boom, "failed")
+
+        // The device's sink still gets the original -- that costs nothing.
+        assertSame(boom, onDevice.entries.single { "failed" in it.first }.second)
+    }
+
+    @Test
+    fun `an entry without a throwable hands none to either destination`() {
+        val log = log()
+        val onDevice = RecordingSink()
+        val offDevice = RecordingSink()
+        log.addSink(onDevice)
+        log.addSink(offDevice, DebugLog.Destination.OFF_DEVICE)
+
+        log.event("no throwable here")
+
+        assertNull(onDevice.entries.single { "no throwable" in it.first }.second)
+        assertNull(offDevice.entries.single { "no throwable" in it.first }.second)
+    }
+
+    @Test
+    fun `a lambda sink still works and is unaffected`() {
+        // The overload is defaulted through, so the single-abstract-method
+        // shape survives -- which is what keeps every existing registration in
+        // every consumer compiling.
+        val log = log()
+        val seen = mutableListOf<String>()
+        log.addSink { if (!isMarker(it)) seen += it }
+
+        log.failure(IllegalStateException("boom"), "failed")
+
+        assertTrue(seen.toString(), seen.single().contains("failed"))
+    }
+
+    @Test
+    fun `a rebuilt throwable keeps suppressed failures without their messages`() {
+        // The `use { }` shape: the body failed and closing failed too. The
+        // cleanup failure is on `suppressed`, not `cause`, so following the
+        // cause chain alone loses the half that says the file never closed.
+        val log = log()
+        val offDevice = RecordingSink()
+        log.addSink(offDevice, DebugLog.Destination.OFF_DEVICE)
+        val closeFailed = java.io.IOException("could not close /data/ExampleWifi.log")
+        val boom = IllegalStateException("write failed for ExampleWifi")
+        boom.addSuppressed(closeFailed)
+
+        log.failure(boom, "save failed")
+
+        val rebuilt = offDevice.entries.single { "save failed" in it.first }.second!!
+        val suppressed = rebuilt.suppressed.single()
+        assertEquals("java.io.IOException", suppressed.message)
+        assertFalse(suppressed.toString(), suppressed.toString().contains("ExampleWifi"))
+        // The frames are why a suppressed failure is worth keeping at all.
+        assertArrayEquals(closeFailed.stackTrace, suppressed.stackTrace)
     }
 
     // --------------------------------------------------------------- pinning
