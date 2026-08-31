@@ -135,10 +135,61 @@ it builds each of those checkouts and asserts both directions, including that a
 complete one still publishes — without that control, a build that refused
 everything would pass.
 
-Publishing is configured but not yet automated: `./gradlew
-publishAllPublicationsToStagingRepository` writes a complete repository tree
-under `build/maven/`, and the workflow that commits it to a branch this
-repository serves over HTTP is the next step (`TODO.md`).
+`.github/workflows/release.yml` publishes on every push to `main`, into the
+**`maven` branch of this repository** — a Maven repository is a static
+directory tree over HTTP, and `raw.githubusercontent.com` serves one, so there
+is no Sonatype account, no GPG key in CI and no third party in the trust path.
+A consumer points at
+`https://raw.githubusercontent.com/mikelward/androidlog/maven`.
+
+Two jobs, and the split is the point. The first runs `./gradlew` — so it runs
+dependency and plugin code — and holds no token that can write anything; it
+seeds `build/maven` from what is already published, stages the release into it,
+and hands the result over as a workflow artifact, which is inert data rather
+than an execution environment. The second holds `contents: write`, runs no
+dependency code at all, and re-derives for itself whether the merge is safe:
+the staged tree must not be empty, it must *add* at least one version the
+published tree does not have, nothing already published may change or
+disappear, `maven-metadata.xml` — the one file every release rewrites — must
+still list every version it lists today, and every newly staged version must be
+listed by the metadata beside it. A guard reading a verdict the other job wrote
+would not be a guard.
+
+The "must add something" rule is what makes a silently-empty release loud.
+Since the version is a commit count, every push to `main` derives a number the
+published tree cannot already have, so a run that stages none is a run whose
+publish did nothing — and it goes red rather than reporting success over an
+unchanged branch.
+
+A release must also move *forward*. Serializing runs does not order them: a
+re-run for an older commit, executed after a newer one has published, stages a
+version the tree genuinely lacks and satisfies every other rule. Gradle then
+sets `<latest>` and `<release>` to whatever it just published — measured, not
+assumed — so the version list stays intact while both pointers move backwards,
+and `<release>` is what Maven-aware resolution reads for the current release.
+Both the cause (a version at or below the published maximum) and the symptom (a
+pointer that regresses) are refused, and the comparison is a version compare, so
+1.0.9 → 1.0.10 is a release rather than a rejection.
+
+Inside that second job, no checkout persists a credential and the write
+capability is introduced once — as an `env:` on the final step, which is a
+shell script in the workflow itself. `actions/checkout` is still handed the
+job's token by its own default input, which is unavoidable while the job has
+to push and is where the trust boundary genuinely sits; `actions/download-artifact`
+is not, since its `github-token` input has no default and a same-run download
+authenticates with `ACTIONS_RUNTIME_TOKEN`.
+
+Releases are serialized, and a push that arrives while one is running *and*
+another is already pending is superseded — its version number is simply never
+published. That is a gap in the numbering, not lost content: the next release
+publishes a later commit of the same library, and a consumer resolving the
+newest version never sees it.
+
+The seeding is load-bearing rather than an optimization: Gradle *merges* into a
+`maven-metadata.xml` it finds at a `file:` repository and *replaces* one it does
+not, so publishing into an empty directory writes metadata naming only the newest
+release while every earlier artifact stays on the branch — intact-looking, and
+resolving one version.
 
 ### An offramp build includes `logging-core/`, not the root
 

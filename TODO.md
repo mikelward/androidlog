@@ -552,8 +552,9 @@ own `runCatching`, before the snapshot and after the crash marker.
 
 ## Not built yet
 
-- **Publish the staged repository from CI, and serve it over HTTP.** The Gradle
-  side is done: `./gradlew publishAllPublicationsToStagingRepository` writes a
+- **Publish the staged repository from CI, and serve it over HTTP.** *(Built;
+  this entry is kept for the reasoning until the first release has actually
+  run.)* The Gradle side is done: `./gradlew publishAllPublicationsToStagingRepository` writes a
   complete repository tree — POMs, Gradle module metadata, sources jars,
   checksums and a merged `maven-metadata.xml` — under `build/maven/`. What is
   missing is the workflow that puts it somewhere a consumer can resolve from,
@@ -576,11 +577,27 @@ own `runCatching`, before the snapshot and after the crash marker.
     second job with nothing but the artifact and a checkout is what commits.
     `mikelward/ci-commit-artifact` exists for exactly this shape and is the
     first thing to read.
-  - **Refuse to overwrite.** A published coordinate cannot be corrected, so the
-    committing job re-derives the check itself: nothing already on the branch
-    may change or disappear, `maven-metadata.xml` excepted, and that one must
-    still list every version it listed before. A guard derived from a file
-    somebody else wrote is not a guard.
+  - **Refuse to overwrite.** Not because a published coordinate is impossible
+    to correct -- it is a branch in this repository, so a human with a
+    force-push can rewrite it -- but because a consumer that already resolved
+    `1.0.37` has it cached, and a `1.0.37` whose contents changed underneath is
+    the one failure a version number exists to prevent. So the committing job
+    re-derives the check itself: nothing already on the branch may change or
+    disappear, `maven-metadata.xml` excepted, and that one must still list
+    every version it listed before. A guard derived from a file somebody else
+    wrote is not a guard.
+  - **`mikelward/ci-commit-artifact` does NOT fit, though its shape does.**
+    Checked rather than assumed, and worth writing down so it is not
+    re-derived: its `dest-path` *replaces* the destination, so the failure this
+    whole design guards against -- a staging directory that was not seeded --
+    would go from "prior artifacts survive, metadata is wrong" to "every
+    published version deleted in one commit". It is also invoked as a whole
+    job, leaving nowhere to put the merge check between its download and its
+    commit, so the only remaining place would be the job that ran Gradle,
+    whose verdict about its own output is a claim rather than a check. And its
+    `expected-head-sha` is a pull-request staleness guard with no honest value
+    here. `release.yml` implements the same trust split directly; a
+    `concurrency` group covers the staleness it does not.
 
   Then the consumer side, one app at a time: a `maven { url }` pointing at the
   served tree with `content { includeGroup("com.mikelward.androidlog") }`, the

@@ -1,0 +1,262 @@
+name: release
+
+# Publishes the Maven repository this project serves to its consumers, into
+# the `maven` branch of this same repository -- a Maven repository is a static
+# directory tree over HTTP, and `raw.githubusercontent.com` serves one. No
+# Sonatype account, no GPG key in CI, no third party in the trust path.
+#
+# `main` only. The version is `1.0.<commit count>`, which is unique within one
+# history and nowhere else, so the build itself refuses to publish from
+# anything outside `origin/main`'s first-parent lineage -- see
+# gradle/version.gradle.kts. This trigger and that guard say the same thing
+# twice on purpose: the trigger is the intent, the guard is the check.
+on:
+  push:
+    branches: [main]
+
+# Read by default; only the job that commits asks for more, and it asks in its
+# own block rather than here.
+permissions:
+  contents: read
+
+# Two releases interleaving would have each seed from a published tree the
+# other was about to move, so they are serialized. `cancel-in-progress: false`
+# is what stops a running release being killed part-way -- the state that would
+# actually be bad, since the push is what makes a staged tree real.
+#
+# It is NOT a queue, and saying so would be wrong (Codex, PR #22): GitHub keeps
+# at most ONE pending run per group, so a third push while the first is still
+# running supersedes the second pending one, which is cancelled. That commit's
+# version is never published.
+#
+# Accepted, deliberately. The version is a commit count, and what this design
+# promises is that a number never names two different trees -- not that every
+# number exists. A superseded commit loses no CONTENT: the next release
+# publishes a later commit of the same library, which contains it. A consumer
+# resolves the newest available version and never sees the gap. Preserving the
+# numbers instead would mean per-SHA runs plus a fetch-and-retry loop around
+# the push to handle the race they would then create -- real machinery to keep
+# version numbers nothing needs.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Runs Gradle, and therefore runs dependency and plugin code. Holds no token
+  # that can write anything. Everything it produces is inert data handed to the
+  # next job as an artifact -- not a working tree, not an execution environment.
+  stage:
+    name: Stage the repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The version's patch level is the commit count, and the build
+          # refuses to publish from a shallow clone rather than guessing.
+          fetch-depth: 0
+          # This job runs `./gradlew`, so anything left in .git/config is
+          # readable by a build script or a plugin.
+          persist-credentials: false
+
+      # Whether there is anything published yet. Asked explicitly rather than
+      # letting a checkout fail and be tolerated: the first release is a
+      # legitimate state and every later one is not.
+      - name: Look for the published repository
+        id: published
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          # `--exit-code` distinguishes the two answers: 0 is "the branch is
+          # there", 2 is "no ref matched". Anything else is git failing to ask
+          # -- a network blip, a rate limit -- and must NOT be read as "first
+          # release", which would skip seeding and publish metadata naming
+          # only this version. The merge guard would refuse that, so the cost
+          # is a confusing red run rather than a bad branch; this makes it an
+          # honest one instead.
+          set +e
+          git ls-remote --exit-code --heads \
+              "https://github.com/$REPOSITORY" maven >/dev/null
+          status=$?
+          set -e
+          case "$status" in
+            0) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
+            2)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::No maven branch yet; this is the first release."
+              ;;
+            *)
+              echo "::error::Could not ask whether the maven branch exists" \
+                   "(git ls-remote exited $status)."
+              exit 1
+              ;;
+          esac
+
+      # SEEDING, and it is load-bearing rather than an optimization. Gradle
+      # MERGES into a `maven-metadata.xml` it finds at a `file:` repository and
+      # REPLACES one it does not -- so publishing into an empty directory
+      # writes metadata listing only this release, while every earlier
+      # artifact stays on the branch. The result looks intact and resolves one
+      # version. (The merge guard in the next job would refuse that, which is
+      # the point of having both.)
+      - uses: actions/checkout@v5
+        if: steps.published.outputs.exists == 'true'
+        with:
+          ref: maven
+          path: build/maven
+          persist-credentials: false
+
+      # The checkout leaves a `.git` directory inside the staging tree, and
+      # Gradle publishes AROUND it rather than over it -- so it would travel
+      # in the artifact and then be committed into the published branch as a
+      # nested repository. Removed here, and the merge guard refuses a staged
+      # `.git` besides: this step failing silently is the failure that would
+      # otherwise reach the branch.
+      - name: Drop the seed checkout's git directory
+        if: steps.published.outputs.exists == 'true'
+        run: rm -rf build/maven/.git
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@4c125117fe7c5aed11272ec4213f602f012f89f2  # v5
+
+      # `build/maven` is the staging repository the root build declares; the
+      # checkout above put the published tree there, so this adds to it.
+      - run: ./gradlew publishAllPublicationsToStagingRepository --stacktrace
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: maven-repository
+          path: build/maven
+          if-no-files-found: error
+
+  # Commits. Runs no dependency code at all -- a checkout, a download, one
+  # shell script from the reviewed default branch, and git. That is what makes
+  # holding `contents: write` here safe, and it is why this is a separate job
+  # rather than two more steps above.
+  publish:
+    name: Publish the repository
+    needs: stage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write  # push the published tree to the maven branch
+      actions: read  # download the artifact `stage` uploaded
+    steps:
+      # The release machinery itself, from the default branch: reviewed source,
+      # never the staging job's output. Read-only.
+      - uses: actions/checkout@v5
+        with:
+          path: source
+          persist-credentials: false
+
+      # BEFORE the credentialed checkout below, deliberately (Codex, PR #22).
+      # This is action code, not an inert copy: it runs in the job and can read
+      # the filesystem. Downloading it first means the push credential does not
+      # exist on disk while it runs, and afterwards nothing but git and one
+      # reviewed shell script does -- which is the claim this job's whole
+      # existence rests on, so it should be true rather than nearly true.
+      - uses: actions/download-artifact@v6
+        with:
+          name: maven-repository
+          path: incoming
+
+      # The branch being published to. Reading it needs no credential -- this
+      # repository is public -- so this persists none either, and the write
+      # capability is introduced once, in the final step, by the `env:` on it.
+      #
+      # That is narrower than it was (Codex, PR #22). It used to keep the
+      # credential in `published/.git/config` from here to the end of the job,
+      # which meant every later step ran alongside a live push token and the
+      # `artipacked` audit had to be suppressed to say so. Nothing persists it
+      # now, so there is nothing to suppress.
+      #
+      # What remains, stated rather than claimed away: `actions/checkout` is
+      # handed `${{ github.token }}` by its own default input, so both
+      # checkouts receive a `contents: write` token in-process even though
+      # neither writes it down. That is unavoidable while the job must push,
+      # and it is where the trust boundary actually sits -- on GitHub's own
+      # first-party actions, at the same level as the runner and the token
+      # issuer. `actions/download-artifact` is NOT in that set: its
+      # `github-token` input has no default, so it is never handed one, and a
+      # same-run download authenticates with `ACTIONS_RUNTIME_TOKEN` instead
+      # (checked against both action manifests, not assumed).
+      - uses: actions/checkout@v5
+        with:
+          path: published
+          # A shallow clone cannot push: git refuses a "shallow update", and
+          # the whole job exists to push. Nothing here reads the history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The same question `stage` asked, asked the same way, for the same
+      # reason: a git failure must not read as "first release". Asked of the
+      # remote rather than of what the checkout above happens to have fetched
+      # -- whether a checkout populates refs/remotes/origin/* for branches it
+      # was not asked to check out is that action's business and not a
+      # promise, and reading it wrong here would take the orphan path on a
+      # repository that already has a published tree.
+      - name: Check out the maven branch, creating it on the first release
+        working-directory: published
+        run: |
+          set +e
+          git ls-remote --exit-code --heads origin maven >/dev/null
+          status=$?
+          set -e
+          case "$status" in
+            0)
+              git fetch --quiet origin "+refs/heads/maven:refs/remotes/origin/maven"
+              git checkout --quiet -B maven origin/maven
+              ;;
+            2)
+              # An orphan: the published tree shares no history with the
+              # source, and should not carry a copy of it.
+              git checkout --quiet --orphan maven
+              git rm -rqf .
+              ;;
+            *)
+              echo "::error::Could not ask whether the maven branch exists" \
+                   "(git ls-remote exited $status)."
+              exit 1
+              ;;
+          esac
+
+      # Re-derived here rather than trusted from the staging job. That job ran
+      # `./gradlew`, so what it reports about its own output is a claim; this
+      # compares the two trees directly. Refuses anything already published
+      # that would change or disappear, and any metadata that would stop
+      # listing a version it lists today.
+      - name: Merge, refusing to overwrite anything already published
+        run: source/scripts/merge-maven-tree.sh published incoming
+
+      # The ONLY step in this job that is given a credential able to write,
+      # and it is a shell script in this reviewed file. The runner masks
+      # `github.token` in logs, so a failing push cannot print it.
+      - name: Commit and push
+        working-directory: published
+        env:
+          VERSION_FROM: ${{ github.sha }}
+          PUSH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          # The guard refuses a release that adds nothing, so reaching here
+          # with an empty index means the two disagree -- which is worth a red
+          # run, not a green one. A push to `main` always derives a version the
+          # published tree cannot already have.
+          if git diff --quiet --cached; then
+            echo "::error::The merge produced no change, but the guard allowed" \
+                 "it. One of the two is wrong; refusing to report success."
+            exit 1
+          fi
+          git commit --quiet -m "Publish the Maven repository from ${VERSION_FROM}"
+          git push \
+              "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              HEAD:refs/heads/maven
+          echo "::notice::Published to the maven branch."
