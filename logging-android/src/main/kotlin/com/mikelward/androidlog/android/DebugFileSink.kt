@@ -12,6 +12,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -86,6 +87,26 @@ private const val PINNED_PERSIST_BUDGET_CHARS = 20_000
  * handler in the chain or process termination.
  */
 private const val CRASH_WRITE_TIMEOUT_MS = 250L
+
+/**
+ * How long [DebugFileSink.readPreviousRun] waits for the worker before giving
+ * up and reporting that the read did not complete.
+ *
+ * Generous on purpose. The read is queued *behind* whatever the worker is
+ * already doing — the startup rotation above all — and then reads up to
+ * [MAX_PREVIOUS_RUNS] files, so a bound tight enough to catch a genuinely
+ * stuck worker would also fire on a slow device doing nothing wrong. That
+ * failure is the expensive direction: a timed-out read answers null, which a
+ * caller cannot tell from "there is nothing to send", and the run it gave up
+ * on stays on disk unshared.
+ *
+ * What the bound is really for is the other end of the scale. Without one the
+ * wait is unbounded, so a worker that never comes back parks the *calling*
+ * thread for the life of the process — and that caller is typically an app's
+ * own single-threaded worker, which then never runs anything queued behind it
+ * (snoozemo#168).
+ */
+private const val PREVIOUS_RUN_READ_TIMEOUT_MS = 10_000L
 
 /**
  * Debounce window for continuous-mirror writes. Every persisted write is a full
@@ -219,6 +240,15 @@ class DebugFileSink internal constructor(
             Thread(runnable, "androidlog-file-sink").apply { isDaemon = true }
         }.apply { prestartCoreThread() }
     },
+    /**
+     * How long [readPreviousRun] waits on the worker. A seam for the same
+     * reason [workerFactory] is one: the behavior worth testing is what a
+     * caller sees when the worker does not come back, and waiting out
+     * [PREVIOUS_RUN_READ_TIMEOUT_MS] to see it would put ten seconds in a test
+     * suite. Defaulted and last, so no existing call site has to name it;
+     * production always gets the constant.
+     */
+    private val previousRunReadTimeoutMs: Long = PREVIOUS_RUN_READ_TIMEOUT_MS,
 ) : DebugLog.Sink {
 
     /**
@@ -1364,6 +1394,13 @@ class DebugFileSink internal constructor(
      * queued there — otherwise a share racing a slow rotation could scan before
      * `debug.log` is renamed and miss the just-ended run. Call it off the main
      * thread: it blocks on the worker and reads up to [MAX_PREVIOUS_RUNS] files.
+     *
+     * **The wait is bounded** ([PREVIOUS_RUN_READ_TIMEOUT_MS]). It used to be
+     * an unbounded `get()`, which made a worker that never came back park the
+     * caller for the life of the process — and callers are typically an app's
+     * own single-threaded worker, so everything queued behind it stopped too
+     * (snoozemo#168). Giving up answers null like any other unreadable state,
+     * and says which it was in the log.
      * A file that fails to read is skipped and left in place, never destroyed —
      * it is not added to the handle's set, so clearing this report leaves it for
      * the next one.
@@ -1373,7 +1410,10 @@ class DebugFileSink internal constructor(
      * included, and a caller that got nothing deletes nothing.
      */
     fun readPreviousRun(): PreviousRun? =
-        runCatching { worker.submit<PreviousRun?> { readPreviousRunOnWorker() }.get() }
+        runCatching {
+            worker.submit<PreviousRun?> { readPreviousRunOnWorker() }
+                .get(previousRunReadTimeoutMs, TimeUnit.MILLISECONDS)
+        }
             .onFailure { failure ->
                 // Nothing to undo. The task may still be queued and may still
                 // build a handle, but this caller never received it and no other
@@ -1381,7 +1421,19 @@ class DebugFileSink internal constructor(
                 // anybody. That is the whole reason the ticket fields are gone:
                 // they existed to decide whether a *shared* slot still meant
                 // anything, and there is no shared slot now (Codex, PR #4).
-                log.failure(failure, "Earlier runs could not be read")
+                // Named apart from the rest, because they are different faults
+                // with different answers: a read that *failed* will fail again,
+                // while one that ran out of time may simply have been queued
+                // behind a slow rotation and succeed on the next attempt.
+                if (failure is TimeoutException) {
+                    log.failure(
+                        failure,
+                        "Earlier runs could not be read within %s ms",
+                        previousRunReadTimeoutMs,
+                    )
+                } else {
+                    log.failure(failure, "Earlier runs could not be read")
+                }
                 // `get()` clears the flag when it throws this, and swallowing it
                 // would strand a caller that is being asked to stop.
                 if (failure is InterruptedException) Thread.currentThread().interrupt()

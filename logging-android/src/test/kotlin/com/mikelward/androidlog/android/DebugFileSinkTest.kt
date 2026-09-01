@@ -2871,4 +2871,58 @@ class DebugFileSinkTest {
         sink.awaitIdle()
         assertEquals("nothing after the removal", listOf(true, false), seen)
     }
+
+    /**
+     * A worker that never comes back must not park the caller for the life of
+     * the process.
+     *
+     * The wait used to be an unbounded `get()`, and the caller is typically an
+     * app's own single-threaded worker — so one stalled read stopped everything
+     * that app had queued behind it, for good (snoozemo#168). Answering null is
+     * the same thing every other unreadable state answers; what matters is that
+     * it answers at all, and says which failure it was.
+     *
+     * Staged rather than waited for: the worker's single thread is occupied by
+     * a task the test releases, so the timeout is reached deterministically and
+     * the injected bound keeps it to a fraction of a second.
+     */
+    @Test
+    fun `a read gives up when the worker never gets to it`() {
+        val occupied = CountDownLatch(1)
+        val worker = ScheduledThreadPoolExecutor(1) { runnable ->
+            Thread(runnable, "test-file-sink").apply { isDaemon = true }
+        }
+        val reported = mutableListOf<String>()
+        val log = log()
+        log.addSink { line -> reported += line }
+        val sink = DebugFileSink(
+            log,
+            { dir },
+            0L,
+            {},
+            { "1" },
+            { worker },
+            previousRunReadTimeoutMs = 200L,
+        )
+        File(dir, "androidlog-prev-1.log").writeText("an earlier run\n")
+        try {
+            // Held until the assertions are done, so the read below cannot be
+            // reached however the machine is loaded.
+            worker.execute { occupied.await(30, TimeUnit.SECONDS) }
+
+            val startedAt = System.nanoTime()
+            val run = sink.readPreviousRun()
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+
+            assertNull("a read the worker never reached cannot answer with a run", run)
+            assertTrue("it must give up at its own bound, not wait the worker out: $elapsedMs ms", elapsedMs < 15_000)
+            assertTrue(
+                "the log must say the read timed out rather than merely failed: $reported",
+                reported.any { it.contains("could not be read within") },
+            )
+        } finally {
+            occupied.countDown()
+            worker.shutdownNow()
+        }
+    }
 }
