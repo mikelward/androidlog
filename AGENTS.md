@@ -108,15 +108,39 @@ has stopped biting.
   which holds `MAJOR.MINOR` and is the only part anyone edits by hand. Patch
   stays the commit count on the release line and does not reset — deliberate,
   so no two releases ever share a number.
-- **MAJOR for anything that breaks a consumer's source or its behavior.** Source
-  is broader than "removed a public symbol": a renamed parameter breaks every
-  named argument, a new required parameter breaks every call. Behavior is the
-  one this library gets wrong most easily — a change to what leaves the device
-  breaks a consumer's privacy posture with no signature to notice, so it is
-  MAJOR whether or not the API moved.
-- **MINOR for something added, PATCH for everything else.** The weekly
-  `gradle-update` batch auto-merges both in every consumer, so calling a
-  breaking change either one ships it unread into four apps.
+- **Ask the additive question first: is this purely something added, with
+  nothing existing changing meaning?** Then it is MINOR and the two tests below
+  do not apply — a pure addition satisfies both and would otherwise land as
+  PATCH (Codex, PR #32).
+- **For everything else: PATCH needs both halves, MAJOR is either one failing**
+  (maintainer, 2026-09-01) — PATCH when a change is **consistent with the
+  intended design** *and* **requires no client change**. Two independent
+  conditions, neither implying the other, so this does not compress to one
+  question: widening what leaves the device forces no consumer edit at all, and
+  is MAJOR because the *design* moved.
+- **A consumer must edit code** for a **source** break (broader than "removed a
+  public symbol" — a renamed parameter breaks every named argument, a new
+  required parameter every call) or a change to **any documented behavior it
+  builds on** — a persisted format, when a callback fires, what a sink is
+  handed. **The intended design moves** for a change to what leaves the device,
+  which forces no edit and would sail through an edit-only test: that is the
+  failure this library is likeliest not to notice, and why it gets its own
+  half.
+- **What is excluded is visibility on its own.** Every fix changes behavior, so
+  reading MAJOR as "any observable change" would leave PATCH covering comments
+  and nothing else. Bounding a wait that could otherwise park a caller forever
+  was PATCH (PR #31, 2.0.50) even though a read past the bound now answers null
+  where it once returned eventually — the contract already documented null for
+  a read that could not be completed, so the bound made an existing branch
+  reachable rather than changing the design, and no consumer changed a line.
+- **The privacy rule is about the *intended* boundary, in both directions.**
+  Moving where the line is drawn is MAJOR; moving the implementation back onto
+  a line that has not moved is a bug fix, and PATCH — a leak fix sends less off
+  device, and restoring a `safe(...)` argument the code wrongly reduced sends
+  more, and both are patches (Codex, PR #32). What decides it is the claim, not
+  the direction: a fix has to name the documented intent it restores, and if
+  the honest description is "the design *should* allow this", the intent is
+  what moved and it is MAJOR. `SPEC.md` carries the reasoning.
 - **Prefer a deprecated alias to a bare rename.** It turns a consumer's red
   build into a warning on a bump they were taking anyway, and it is what lets a
   rename be MINOR instead of MAJOR. Remove the alias in a later major, not in
