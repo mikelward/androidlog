@@ -26,15 +26,25 @@ concurrency:
   cancel-in-progress: false
 jobs:
   update:
-    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main
+    # PILOT — not for merge as is. Points at the mikelward/gradle-update
+    # branch under review that pins the validator to the running workflow's
+    # own revision and reads the batch credential from an environment only
+    # the publish job declares; back to @main once it lands, keeping the
+    # `secrets: inherit` below.
+    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@claude/github-checks-workflows-review-w2e7w6
     permissions:
       contents: write
       pull-requests: write
       actions: write
-    secrets:
-      token: ${{ secrets.GRADLE_UPDATE_PAT }}
-      app-id: ${{ secrets.GRADLE_UPDATE_APP_ID }}
-      app-private-key: ${{ secrets.GRADLE_UPDATE_APP_PRIVATE_KEY }}
+    # `inherit`, not a `secrets:` block naming GRADLE_UPDATE_PAT: the publish
+    # job reads the credential from this repository's `gradle-update`
+    # environment, and an environment secret reaches a called workflow no
+    # other way. A secret passed by name reaches the runner of every job in
+    # the called workflow, the untrusted update job included, which is what
+    # this replaces — see that repository's docs/PAT.md. The corresponding
+    # zizmor finding (secrets-inherit) is allowed for this file in
+    # .github/zizmor.yml, with the same reason.
+    secrets: inherit
     with:
       # `check` rather than `lint`: it runs lint *and* `verifyNoAndroid` and
       # `verifyConsumerRules`, the two checks that catch a dependency bump
