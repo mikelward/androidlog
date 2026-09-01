@@ -108,15 +108,18 @@ has stopped biting.
   which holds `MAJOR.MINOR` and is the only part anyone edits by hand. Patch
   stays the commit count on the release line and does not reset — deliberate,
   so no two releases ever share a number.
-- **MAJOR for anything that breaks a consumer's source or its behavior.** Source
-  is broader than "removed a public symbol": a renamed parameter breaks every
-  named argument, a new required parameter breaks every call. Behavior is the
-  one this library gets wrong most easily — a change to what leaves the device
-  breaks a consumer's privacy posture with no signature to notice, so it is
-  MAJOR whether or not the API moved.
-- **MINOR for something added, PATCH for everything else.** The weekly
-  `gradle-update` batch auto-merges both in every consumer, so calling a
-  breaking change either one ships it unread into four apps.
+- **Ask the additive question first: is this purely something added, with
+  nothing existing changing meaning?** Then it is MINOR.
+- **Otherwise PATCH needs both halves — *consistent with the intended design*
+  and *no client change* — and MAJOR is either one failing** (maintainer,
+  2026-09-01). A consumer must edit code for a **source** break or a change to
+  **any documented behavior it builds on**; the **intended design** moves when
+  what leaves the device changes, which forces no edit and so gets its own half
+  — the failure this library is likeliest not to notice. Visibility on its own
+  is excluded. The privacy boundary runs both ways: moving the intended line is
+  MAJOR, moving the implementation back onto a line that has not moved is a fix
+  and PATCH, whichever way the output moves. `SPEC.md` carries the reasoning
+  and the worked example.
 - **Prefer a deprecated alias to a bare rename.** It turns a consumer's red
   build into a warning on a bump they were taking anyway, and it is what lets a
   rename be MINOR instead of MAJOR. Remove the alias in a later major, not in

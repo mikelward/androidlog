@@ -11,21 +11,71 @@ usual meanings:
 
 | Part | Moves when | A consumer must |
 |---|---|---|
-| **MAJOR** | a change breaks a consumer's source or its behavior | read the release, then fix and bump together |
+| **MAJOR** | the intended design moved, **or** a consumer must edit code — either alone is enough | read the release, then fix and bump together |
 | **MINOR** | something is added and nothing existing changes meaning | nothing — the bump is safe to take |
 | **PATCH** | neither of the above: a fix, a refactor, docs, tests | nothing |
 
-"Breaks a consumer's source" is the operative test, and it is deliberately
-broader than "removes a public symbol". A renamed parameter breaks every named
-argument; a new required parameter breaks every call; a narrowed return type
-breaks every assignment. All three are MAJOR.
+**Ask the additive question first.** Is this purely something *added*, with
+nothing existing changing meaning? Then it is MINOR, and the two tests below do
+not apply — they sort the remaining cases, and a pure addition would otherwise
+satisfy both and land as PATCH (Codex, PR #32).
 
-**Behavior counts too, and on this library it counts most.** A change that
-widens what a log line carries off the device breaks a consumer's privacy
-posture without touching a single signature, and a consumer that took it as a
-patch would ship it unread. Anything that moves the boundary — what
-`Destination.OFF_DEVICE` receives, what the type rule withholds, what a
-throwable keeps — is MAJOR whether or not the API moved.
+**For everything else: PATCH needs *both* halves, and MAJOR is either one
+failing** (maintainer, 2026-09-01) — a change is PATCH when it is **consistent
+with the intended design** *and* **requires no client change**. Those are two
+independent conditions and neither implies the other, which is why this does not
+compress to a single question. Widening what leaves the device needs no consumer
+edit at all: their code compiles and runs unchanged, and simply transmits more.
+It fails the first half, so it is MAJOR.
+
+**A consumer must edit code** in two cases, and only the first has a signature:
+
+- **Source.** Deliberately broader than "removes a public symbol": a renamed
+  parameter breaks every named argument, a new required parameter breaks every
+  call, a narrowed return type breaks every assignment.
+- **Any documented behavior a consumer builds on**: a persisted format, when a
+  callback fires, what a sink is handed. No signature moves, but code written
+  against the old behavior stops being correct.
+
+**The intended design moves** in a third case, which forces no edit at all —
+and that is precisely why it needs its own half of the test. A change to what
+leaves the device (what `Destination.OFF_DEVICE` receives, what the type rule
+withholds, what a throwable keeps) leaves every consumer compiling and running
+unchanged while transmitting more, so a consumer that took it as a patch would
+ship it unread. Held to the edit test alone it would sail through as PATCH,
+which is the failure this library is likeliest not to notice.
+
+**What is excluded is visibility on its own.** Every fix changes behavior, so
+reading MAJOR as "any observable difference" would leave PATCH covering
+comments and nothing else, and would move the series on work no consumer has to
+read.
+
+**So the boundary rule is about the *intended* line, not the code's current
+behavior at it.** Moving where the line is drawn is MAJOR. Moving the
+implementation back onto a line that has not moved is a bug fix, and PATCH —
+in **either** direction (Codex, PR #32). A leak fix sends less off device; a
+regression that reduces an argument the caller explicitly wrapped in `safe(...)`
+breaks the documented `SafeLogValue` contract, and restoring it sends more. Both
+are patches, and both should be: making consumers take a major to stop leaking
+something is the wrong incentive on the class of bug this library most needs
+shipped quickly.
+
+What carries the weight is therefore the claim, not the direction. A change
+called an implementation fix has to name the documented intent it restores; if
+the honest description is "the design *should* allow this" rather than "the
+design already allowed this and the code did not", the intent is what moved and
+it is MAJOR. Widening is where an unexamined claim costs privacy rather than
+diagnostics, so read the naming hardest there — but it is not a direction that
+is barred.
+
+The case that settled it: bounding `readPreviousRun()`'s wait on the worker
+(PR #31, released 2.0.50). It is observable — a read past the bound now answers
+null where it once returned eventually — and it was still PATCH, on all three
+counts. Nothing public moved, since the constructor is `internal`. Null was
+already the documented outcome for a read that could not be completed, so the
+design did not change; the bound made an existing branch reachable. And what it
+replaced was not behavior a consumer could rely on but a permanent park of the
+caller's thread. No client changed a line.
 
 ### How the number is produced
 
