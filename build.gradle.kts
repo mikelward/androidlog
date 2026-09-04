@@ -50,6 +50,23 @@ allprojects {
                             distribution = "repo"
                         }
                     }
+                    // Here for the same reason the license is, and found the
+                    // same way: Apache-2.0 §4 asks that attribution travel with
+                    // the code, and a consumer's attribution screen builds it
+                    // from this POM. Without a developer the screen names the
+                    // license and nobody at all -- which is what every consumer
+                    // shipped until a licenses page started rendering authors
+                    // and this module's rows came back blank.
+                    //
+                    // Name and profile, no email: the address is not needed to
+                    // attribute the work, and a POM is published forever.
+                    developers {
+                        developer {
+                            id = "mikelward"
+                            name = "Mikel Ward"
+                            url = "https://github.com/mikelward"
+                        }
+                    }
                 }
             }
         }

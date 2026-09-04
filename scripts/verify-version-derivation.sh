@@ -227,6 +227,21 @@ for module in logging-android logging-core; do
     fi
 done
 
+# And both must NAME somebody. Same block, same silent failure mode, and the
+# same symptom one step along: a consumer's attribution screen renders the
+# license it found and no author at all, because Apache-2.0 §4's attribution
+# reaches it through this field or not at all. Matched inside <developers> so a
+# stray <name> elsewhere in the POM -- the module's own, for one -- cannot
+# satisfy it.
+for module in logging-android logging-core; do
+    pom="$staged/$module/$expected/$module-$expected.pom"
+    if tr -d '\n' < "$pom" | grep -q '<developers>.*<name>Mikel Ward</name>.*</developers>'; then
+        ok "$module's POM names its developer"
+    else
+        fail "$module's POM names no developer"
+    fi
+done
+
 # --- 1a. A malformed series: refused rather than published non-SemVer ------
 #
 # Clean, complete, on its own release line -- every guard about the COUNT passes.
