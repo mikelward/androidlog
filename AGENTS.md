@@ -189,7 +189,7 @@ has stopped biting.
   coherent, with review responses folded into the commit they belong to.
   `--force-with-lease` after a rebase, never a bare `--force`.
 - **Open the pull request without being asked**, ready for review, not a draft.
-- **Refresh the title and body with the push, not after it** — same step, so
+- **Refresh the title and body with the push — body first, then push** — so
   they describe the branch's latest state, not the scope it had when opened.
 - **Pilot a consumer before merging, not after.** Merging no longer reaches
   anyone's build on its own — that is what the version pin bought — but it does
