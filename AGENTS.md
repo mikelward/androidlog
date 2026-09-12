@@ -207,14 +207,16 @@ has stopped biting.
   automatically. Address its comments without being asked, folding each fix
   into the commit it belongs to — the one exception being a real finding out of
   scope for this pull request, which you defer instead (see *Deferring a
-  finding* below). Judge every comment on merit: verify the claim
-  before acting, and if it doesn't hold up, reply saying why and decline. A
-  comment citing a rule is a *reading* of that rule, not the rule — check what
-  the rule actually says, since an over-strict reading (the privacy rules
-  especially, where stricter always feels safer) costs the consumers the
-  ability to diagnose their own bugs. A genuine conflict between the rule and
-  what the code needs is the maintainer's call, not one to resolve by quietly
-  narrowing the code.
+  finding* below). Judge every comment on merit: verify the claim before
+  acting, and if it doesn't hold up, reply saying why and decline. A comment
+  citing a rule is a *reading* of that rule, not the rule — check what the rule
+  actually says, since an over-strict reading (the privacy rules especially,
+  where stricter always feels safer) costs the consumers the ability to
+  diagnose their own bugs. A genuine conflict between the rule and what the
+  code needs is the maintainer's call, not one to resolve by quietly narrowing
+  the code. Declining doesn't clear the required `codex` status: post the
+  rebuttal, then `@codex review` once — a push does the same if the rebuttal is
+  up first. Escalate if it re-raises, or stays silent.
 - **A second verified finding in the same mechanism is evidence about the
   design, not another bug.** Look for the same shape elsewhere before fixing
   it, and ask whether a different design would delete the class rather than the
@@ -230,9 +232,9 @@ has stopped biting.
   merge past it: note the follow-up in `TODO.md`, commit and push that first,
   reply on the thread citing the sha, and resolve. A finding with no thread
   (top-level comment or review body) still gets the `TODO.md` record, the push,
-  and the reply — only the resolve is skipped. The push re-triggers Codex;
-  `@codex review` only if nothing comes back five minutes after a push.
-  Escalate only if the re-review re-raises it.
+  and the reply — only the resolve is skipped. The push re-triggers Codex, so
+  don't also poke it unless five minutes pass with nothing back; escalate only
+  if the re-review re-raises it.
 
 ## Language and spelling
 
