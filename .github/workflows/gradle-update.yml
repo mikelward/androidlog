@@ -26,12 +26,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   update:
-    # PILOT — not for merge as is. Points at the mikelward/gradle-update
-    # branch under review that pins the validator to the running workflow's
-    # own revision and reads the batch credential from an environment only
-    # the publish job declares; back to @main once it lands, keeping the
-    # `secrets: inherit` below.
-    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@claude/github-checks-workflows-review-w2e7w6
+    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main
     permissions:
       contents: write
       pull-requests: write
