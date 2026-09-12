@@ -238,8 +238,8 @@ has stopped biting.
   reply on the thread citing the sha, and resolve. A finding with no thread
   (top-level comment or review body) still gets the `TODO.md` record, the push,
   and the reply — only the resolve is skipped. The push re-triggers Codex, so
-  don't also poke it unless five minutes pass with nothing back; escalate only
-  if the re-review re-raises it.
+  don't also poke it unless five minutes pass with nothing back; escalate if
+  the re-review re-raises it, or stays silent.
 
 ## Language and spelling
 
