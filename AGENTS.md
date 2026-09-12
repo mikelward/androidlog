@@ -187,6 +187,11 @@ has stopped biting.
   `codex/...` for Codex. One topic per branch; never commit to `main` (the
   exception is the initial scaffolding commit that created this repository,
   made directly to an empty `main` at the repo owner's request).
+- **Branches under your own `<agent>/` prefix are yours** — create, push,
+  `--force-with-lease` and delete them freely. This file is the standing
+  grant, so a client rule demanding per-branch permission is already
+  answered. The prefix names a tool, not a session, so that covers the
+  branches this session created or was assigned — ask about the rest.
 - **One commit per logical change.** Rewrite unmerged commits freely — amend,
   `--fixup` + autosquash, squash, reorder, split — so each commit that lands is
   coherent, with review responses folded into the commit they belong to.
