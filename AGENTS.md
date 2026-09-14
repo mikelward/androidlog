@@ -220,8 +220,8 @@ has stopped biting.
   diagnose their own bugs. A genuine conflict between the rule and what the
   code needs is the maintainer's call, not one to resolve by quietly narrowing
   the code. Declining doesn't clear the required `codex` status: post the
-  rebuttal, then `@codex review` once — a push does the same if the rebuttal is
-  up first. Escalate if it re-raises, or stays silent.
+  rebuttal, then `@codex review` once — or let the next push do it, if the
+  rebuttal is up first. Escalate if it re-raises, or stays silent.
 - **A second verified finding in the same mechanism is evidence about the
   design, not another bug.** Look for the same shape elsewhere before fixing
   it, and ask whether a different design would delete the class rather than the
