@@ -1270,13 +1270,17 @@ own `runCatching`, before the snapshot and after the crash marker.
   scope will not abort an in-flight read, which is fine for a bounded file read
   but should be stated rather than discovered.
 
-- `:logging-report` — **not built, and may never need to be.** The share sheet
-  and clipboard fallback landed in `:logging-android` as `DebugReport`, taking
-  the chooser title and subject as caller strings, so they need no resources and
-  forced no resource merging on four consumers. What is left for a module of its
-  own is the FileProvider attachment, which only Type Launcher's
-  screenshot-carrying report wants; until something needs it, the module would
-  be a module for one caller.
+- `:logging-report` — **not built, and now unlikely ever to be.** The share
+  sheet and clipboard fallback landed in `:logging-android` as `DebugReport`,
+  taking the chooser title and subject as caller strings, so they need no
+  resources and forced no resource merging on four consumers. The FileProvider
+  attachment was the one thing a module of its own would have carried — and it
+  turned out not to need one: `DebugReport.deliver` takes a caller-minted
+  `content://` URI and attaches it, leaving the `FileProvider`, its authority
+  and its paths in the app whose screenshot it is. A screenshot is app content
+  like the report text, so the app owning the provider is the same split the
+  rest of the report already follows. What would have justified the module —
+  resources here — never materialized.
 
   The old entry read: share sheet, clipboard fallback, FileProvider — the one
   module that needs resources, which is why it is its own module. **It has to
@@ -1324,8 +1328,10 @@ own `runCatching`, before the snapshot and after the crash marker.
   `minSdk` 31 floor, and already uses `safe(...)` at its call sites — so it is
   first. snoozemo has work in flight. typelauncher has PR #675 live in the
   bug-report/crash-log path a migration replaces, and is the heaviest anyway:
-  it is the only report carrying a screenshot, which wants the FileProvider
-  piece this library does not have.
+  it carries a screenshot, which wanted a FileProvider piece the library did
+  not have — until `DebugReport.deliver` grew a screenshot argument (the app
+  mints the URI, the library attaches it), first exercised by clothescast,
+  which carries one too.
 
   Each migration also deletes that app's legacy log files and marks its
   already-reduced values `safe(...)` — see the entry above.

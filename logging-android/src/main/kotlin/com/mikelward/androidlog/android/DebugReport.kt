@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import com.mikelward.androidlog.DebugLog
 
 /**
@@ -142,7 +143,20 @@ object DebugReport {
      * as delivery would consume a crash log on the strength of a sheet the user
      * may have dismissed. Both routes are attempted regardless of whether the
      * other worked.
+     *
+     * An optional [screenshot] rides along in the chooser as an `image/png`
+     * attachment, so a report can show what the user was looking at. It is a
+     * `content://` [Uri] the **app** mints — from its own `FileProvider`, whose
+     * authority and paths only it can declare — because a screenshot is the
+     * app's own content just as the report text is, and owning the provider here
+     * would force resources on every consumer for a picture only some of them
+     * send. Passing it flips the intent's type to `image/png` and grants the
+     * chooser's target read access to the URI; omitting it (the default) shares
+     * text only, exactly as before. The clipboard still carries the text alone —
+     * it is the retained fallback the outcome is gated on, and an image is not
+     * something a paste can recover.
      */
+    @JvmOverloads
     fun deliver(
         context: Context,
         log: DebugLog,
@@ -150,9 +164,11 @@ object DebugReport {
         subject: String,
         chooserTitle: String,
         clipboardLabel: String,
+        screenshot: Uri? = null,
     ): ShareOutcome {
         val copied = copyToClipboard(context, log, clipboardLabel, report.text)
-        val launched = startChooser(context, log, subject, chooserTitle, report.text)
+        val launched =
+            startChooser(context, log, subject, chooserTitle, clipboardLabel, report.text, screenshot)
         return settle(report, copied, launched) { report.sink?.clearPreviousRun(it) }
     }
 
@@ -182,6 +198,26 @@ object DebugReport {
         }
     }
 
+    /**
+     * What the share intent carries, decided by the one fact that changes it:
+     * whether a screenshot is attached. A screenshot flips the type off
+     * `text/plain` and needs a read grant for the chosen target to open the URI;
+     * a text-only report needs neither.
+     *
+     * Separated from [startChooser] for the reason [settle] is separated from
+     * [deliver] — it is reachable without a `Context`, so the rule a mistake
+     * would be silent in (attach the stream but forget the grant, and the target
+     * receives a `content://` URI it cannot read) is covered on a plain JVM.
+     */
+    internal class ShareContent(val mimeType: String, val grantRead: Boolean)
+
+    internal fun shareContentFor(hasScreenshot: Boolean): ShareContent =
+        if (hasScreenshot) {
+            ShareContent(mimeType = "image/png", grantRead = true)
+        } else {
+            ShareContent(mimeType = "text/plain", grantRead = false)
+        }
+
     private fun copyToClipboard(
         context: Context,
         log: DebugLog,
@@ -207,19 +243,41 @@ object DebugReport {
         log: DebugLog,
         subject: String,
         chooserTitle: String,
+        clipLabel: String,
         text: String,
+        screenshot: Uri?,
     ): Boolean =
         runCatching {
+            val content = shareContentFor(hasScreenshot = screenshot != null)
             val send = Intent(Intent.ACTION_SEND).apply {
-                type = "text/plain"
+                type = content.mimeType
                 putExtra(Intent.EXTRA_SUBJECT, subject)
                 putExtra(Intent.EXTRA_TEXT, text)
+                if (screenshot != null) {
+                    putExtra(Intent.EXTRA_STREAM, screenshot)
+                    // A ClipData beside EXTRA_STREAM so the read grant reaches
+                    // whichever target the chooser resolves to, not only the one
+                    // the extra names -- some Android versions carry the grant on
+                    // the ClipData rather than the stream extra.
+                    clipData = ClipData.newRawUri(clipLabel, screenshot)
+                    // The grant flag goes on `send` here, *before* the chooser is
+                    // built: createChooser copies the target's ClipData and grant
+                    // flags onto the chooser at construction, so a flag added
+                    // after would leave the chooser holding a ClipData it has no
+                    // permission to read (Codex, PR #46).
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
             }
-            context.startActivity(
-                Intent.createChooser(send, chooserTitle)
-                    // Some callers hand in a non-Activity context.
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-            )
+            val chooser = Intent.createChooser(send, chooserTitle)
+                // Some callers hand in a non-Activity context.
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (content.grantRead) {
+                // Also on the chooser itself, belt-and-suspenders: the target may
+                // be handed either intent, and the grant only works on the one it
+                // gets.
+                chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(chooser)
             true
         }.getOrElse {
             log.failure(it, "The share chooser could not be opened")
