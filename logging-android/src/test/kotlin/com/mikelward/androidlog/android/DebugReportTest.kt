@@ -187,4 +187,28 @@ class DebugReportTest {
             report.text.indexOf("the app section") < report.text.indexOf("an earlier run"),
         )
     }
+
+    // -------------------------------------------------- attaching a screenshot
+
+    @Test
+    fun `a screenshot shares as an image the target is granted to read`() {
+        // The two facts that must move together: without the grant the chosen
+        // app receives a content:// URI it cannot open, and without the image
+        // type the chooser never surfaces the image-capable targets.
+        val content = DebugReport.shareContentFor(hasScreenshot = true)
+
+        assertEquals("image/png", content.mimeType)
+        assertTrue("a screenshot needs a read grant", content.grantRead)
+    }
+
+    @Test
+    fun `a text-only report shares as plain text with no grant`() {
+        // The other direction, asserted so a change that always attached the
+        // grant -- or always claimed an image -- cannot pass: a report with no
+        // screenshot must stay text/plain and hand out no URI permission.
+        val content = DebugReport.shareContentFor(hasScreenshot = false)
+
+        assertEquals("text/plain", content.mimeType)
+        assertFalse("a text-only report grants nothing", content.grantRead)
+    }
 }

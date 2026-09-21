@@ -24,8 +24,13 @@ The share sheet and clipboard fallback are in `:logging-android` too, as
 `DebugReport`. They were once meant to be a third module — a chooser title names
 the app, and that reads like a resource — but the caller passes the title and
 subject as strings, so nothing needed resources and no consumer pays for
-resource merging. A `:logging-report` module still awaits the one thing that
-genuinely needs them: the FileProvider glue for a report carrying a screenshot.
+resource merging. A report can now carry a **screenshot** the same way: the app
+mints a `content://` URI from its own `FileProvider` and hands it to
+`DebugReport.deliver`, which attaches it. The `FileProvider` and its paths stay
+in the app — a screenshot is the app's own content, and owning the provider
+here would force resources on every consumer for a picture only some of them
+send. So the `:logging-report` module the resources would have needed is not
+built, and may never be.
 
 **What is not here, and will not be: the report's *contents*.** A decision
 snapshot, a snooze summary, an `Intent` rendering — those are each app's own
@@ -396,6 +401,24 @@ when (DebugReport.deliver(context, SnoozemoLog, report, subject, title, label)) 
 Two calls rather than one `suspend` function, because this library takes no
 third-party runtime dependency and so cannot hop threads for you — your own
 scope is a better place for that choice anyway.
+
+To send a **screenshot** alongside the text, hand `deliver` a `content://`
+[Uri] as the trailing `screenshot` argument:
+
+```kotlin
+// The app owns the capture and the FileProvider; the library attaches the URI.
+val shot: Uri? = captureAndPersistScreenshot(activity)   // PixelCopy → PNG → FileProvider
+DebugReport.deliver(activity, SnoozemoLog, report, subject, title, label, screenshot = shot)
+```
+
+The app captures the window (`PixelCopy`), writes the PNG to its own cache, and
+mints the URI from a `FileProvider` **it** declares — the authority and paths
+are the app's, so the library keeps its no-resources promise. `deliver` then
+flips the intent to `image/png` and grants the chosen target read access to the
+URI; a `null` screenshot (the default) shares text only. The clipboard still
+carries the text alone: it is the retained fallback the outcome is gated on, and
+a paste cannot recover an image. Omit the argument and nothing changes for an
+app that shares text.
 
 The prior run is consumed only when the **clipboard copy** landed. A chooser
 reports nothing back, so its launch is not evidence anything was sent, and
