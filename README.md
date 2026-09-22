@@ -18,19 +18,21 @@ and nothing propagated it.
 | Module | What it is | What it holds |
 |---|---|---|
 | `:logging-core` | Plain Kotlin JVM. No Android, enforced by `verifyNoAndroid`. | The bounded buffer, the recording gate, the sink interface, the format-plus-arguments contract, the type rule that is the privacy floor, throwable rendering. |
-| `:logging-android` | Android library, `minSdk` 31, **no resources**. | The platform sinks: logcat, and the persisted file with its rotation and crash record. |
+| `:logging-android` | Android library, `minSdk` 31, **no resources**. | The platform sinks: logcat, and the persisted file with its rotation and crash record; the bug-report transport (`DebugReport`) and screenshot capture (`ReportScreenshot`). |
 
 The share sheet and clipboard fallback are in `:logging-android` too, as
 `DebugReport`. They were once meant to be a third module — a chooser title names
 the app, and that reads like a resource — but the caller passes the title and
 subject as strings, so nothing needed resources and no consumer pays for
-resource merging. A report can now carry a **screenshot** the same way: the app
-mints a `content://` URI from its own `FileProvider` and hands it to
-`DebugReport.deliver`, which attaches it. The `FileProvider` and its paths stay
-in the app — a screenshot is the app's own content, and owning the provider
-here would force resources on every consumer for a picture only some of them
-send. So the `:logging-report` module the resources would have needed is not
-built, and may never be.
+resource merging. A report can now carry a **screenshot** the same way:
+`ReportScreenshot.capture` shoots the window and returns a PNG [File], the app
+mints a `content://` URI from its own `FileProvider`, and `DebugReport.deliver`
+attaches it. The capture (`PixelCopy`, the off-thread buffer, the age-based
+prune) is shared because every app hand-rolled it identically; the `FileProvider`
+and its paths stay in the app — a screenshot is the app's own content, and owning
+the provider here would force resources on every consumer for a picture only some
+of them send. So the `:logging-report` module the resources would have needed is
+not built, and may never be.
 
 **What is not here, and will not be: the report's *contents*.** A decision
 snapshot, a snooze summary, an `Intent` rendering — those are each app's own
@@ -403,22 +405,34 @@ third-party runtime dependency and so cannot hop threads for you — your own
 scope is a better place for that choice anyway.
 
 To send a **screenshot** alongside the text, hand `deliver` a `content://`
-[Uri] as the trailing `screenshot` argument:
+[Uri] as the trailing `screenshot` argument. `ReportScreenshot.capture` does the
+capture — the hardened part every app was hand-rolling the same way — and
+returns the PNG as a plain [File]; the app turns that into a URI through its own
+`FileProvider`:
 
 ```kotlin
-// The app owns the capture and the FileProvider; the library attaches the URI.
-val shot: Uri? = captureAndPersistScreenshot(activity)   // PixelCopy → PNG → FileProvider
+// The library captures and persists the PNG; the app mints the URI from a
+// FileProvider it declares, so the provider (and its resources) stay app-side.
+// Call capture() off the main thread — it blocks on the copy.
+val dir = File(cacheDir, "bug-reports")
+val shot: Uri? = withContext(Dispatchers.IO) {
+    ReportScreenshot.capture(activity, dir, SnoozemoLog)
+}?.let { FileProvider.getUriForFile(this, "$packageName.fileprovider", it) }
 DebugReport.deliver(activity, SnoozemoLog, report, subject, title, label, screenshot = shot)
 ```
 
-The app captures the window (`PixelCopy`), writes the PNG to its own cache, and
-mints the URI from a `FileProvider` **it** declares — the authority and paths
-are the app's, so the library keeps its no-resources promise. `deliver` then
-flips the intent to `image/png` and grants the chosen target read access to the
-URI; a `null` screenshot (the default) shares text only. The clipboard still
-carries the text alone: it is the retained fallback the outcome is gated on, and
-a paste cannot recover an image. Omit the argument and nothing changes for an
-app that shares text.
+`capture` shoots `activity.window` (a dialog over it is a separate window, so an
+`AlertDialog` and its scrim are not in the shot), writes the PNG to `dir`, prunes
+old captures by age, and returns the file — or `null` (a finished window, a
+failed `PixelCopy`, a persist error), which becomes a text-only report rather
+than a dropped share. Every failure is logged sanitized. The app mints the URI
+from a `FileProvider` **it** declares — the authority and paths are the app's, so
+the library keeps its no-resources promise (it takes the capture no further than
+a file for the same reason). `deliver` then flips the intent to `image/png` and
+grants the chosen target read access to the URI; a `null` screenshot (the
+default) shares text only. The clipboard still carries the text alone: it is the
+retained fallback the outcome is gated on, and a paste cannot recover an image.
+Omit the argument and nothing changes for an app that shares text.
 
 The prior run is consumed only when the **clipboard copy** landed. A chooser
 reports nothing back, so its launch is not evidence anything was sent, and
