@@ -1282,6 +1282,16 @@ own `runCatching`, before the snapshot and after the crash marker.
   rest of the report already follows. What would have justified the module —
   resources here — never materialized.
 
+  The *capture* itself is now shared, without needing that module either:
+  `ReportScreenshot.capture` (2.2) does the `PixelCopy` window shot, the
+  off-main buffer, the PNG encode and the age-based prune — the hardened part
+  four apps hand-rolled identically — and returns a plain `File`. The app still
+  mints the `content://` URI from its own `FileProvider`, so the library takes
+  the capture no further than a file and keeps its no-resources, no-`androidx`
+  promise. Coroutine-free and blocking like `collect`/`deliver`: it posts the
+  window read and the copy to the main thread and blocks the caller's background
+  thread, which the app already has a dispatcher to supply.
+
   The old entry read: share sheet, clipboard fallback, FileProvider — the one
   module that needs resources, which is why it is its own module. **It has to
   show the user the report before it is sent** — but not for the reason this
