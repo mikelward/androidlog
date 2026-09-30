@@ -188,6 +188,138 @@ class DebugReportTest {
         )
     }
 
+    // ------------------------------------------------------ the report's size
+
+    /** [chars] characters of numbered lines, oldest first, so a test can tell which end survived. */
+    private fun lines(chars: Int, name: String = "line"): String {
+        val out = StringBuilder()
+        var n = 1
+        while (out.length < chars) out.append("$name ${n++}\n")
+        return out.substring(0, chars)
+    }
+
+    /** Two prior runs, oldest first: a short one, then one too long for the report's share. */
+    private fun sinkWithAShortRunBehindALongOne(): Triple<DebugFileSink, File, File> {
+        val older = File(dir, "androidlog-prev-1.log").apply { writeText("the oldest run\n") }
+        val newer = File(dir, "androidlog-prev-2.log").apply {
+            writeText(lines(30_000, "talkative") + "\nthe stack trace\n")
+        }
+        assertTrue(older.setLastModified(1_000L))
+        assertTrue(newer.setLastModified(2_000L))
+        return Triple(sink(), older, newer)
+    }
+
+    @Test
+    fun `a report is never larger than the cap, however much there is to say`() {
+        val (sink, _, _) = sinkWithAShortRunBehindALongOne()
+
+        val report = DebugReport.collect(log(), sink) { lines(100_000) }
+
+        assertTrue("${report.text.length}", report.text.length <= DebugReport.MAX_REPORT_CHARS)
+        val section = report.text.substring(report.text.indexOf("--- earlier runs ---"))
+        assertTrue("${section.length}", section.length + 2 <= DebugReport.MAX_EARLIER_RUNS_CHARS)
+    }
+
+    @Test
+    fun `an app section within its share arrives whole beside a full prior run`() {
+        val (sink, _, _) = sinkWithAShortRunBehindALongOne()
+        val own = lines(DebugReport.MAX_REPORT_CHARS - DebugReport.MAX_EARLIER_RUNS_CHARS)
+
+        val report = DebugReport.collect(log(), sink) { own }
+
+        assertTrue(report.text.startsWith("$own\n\n--- earlier runs ---\n"))
+        assertFalse(report.text, "cut here" in report.text)
+        assertTrue("${report.text.length}", report.text.length <= DebugReport.MAX_REPORT_CHARS)
+    }
+
+    @Test
+    fun `with no earlier runs the app section can use the whole report`() {
+        val own = lines(DebugReport.MAX_REPORT_CHARS)
+
+        assertEquals(own, DebugReport.collect(log(), sink()) { own }.text)
+        assertEquals(own, DebugReport.collect(log(), sink = null) { own }.text)
+    }
+
+    @Test
+    fun `an app section over the cap keeps both ends, on whole lines, and says how much went`() {
+        val own = lines(100_000)
+        val report = DebugReport.collect(log(), sink = null) { own }
+
+        assertTrue("${report.text.length}", report.text.length <= DebugReport.MAX_REPORT_CHARS)
+        val notice = Regex("""\n\[(\d+) characters cut here to keep the report shareable]\n""")
+        val match = notice.find(report.text)!!
+        val head = report.text.substring(0, match.range.first)
+        val tail = report.text.substring(match.range.last + 1)
+        // Every character is either kept or counted as cut.
+        assertEquals(own.length, head.length + match.groupValues[1].toInt() + tail.length)
+        assertTrue(own.startsWith(head) && own.endsWith(tail))
+        assertTrue(head, head.startsWith("line 1\n"))
+        // Both cuts fall on line breaks, so no line is left half-read.
+        assertEquals('\n', own[head.length])
+        assertEquals('\n', own[own.length - tail.length - 1])
+    }
+
+    @Test
+    fun `the earlier runs keep their newest lines`() {
+        val (sink, _, _) = sinkWithAShortRunBehindALongOne()
+
+        val report = DebugReport.collect(log(), sink) { "the app section" }
+
+        assertTrue(report.text, report.text.trimEnd().endsWith("the stack trace"))
+        assertFalse(report.text, "talkative 1\n" in report.text)
+    }
+
+    @Test
+    fun `a run the report's share left out is not consumed by it`() {
+        val (sink, older, newer) = sinkWithAShortRunBehindALongOne()
+        // The premise: the persisted budget alone would have carried it, so it
+        // is the report's share that leaves it out.
+        assertTrue(sink.readPreviousRun()!!.text.contains("the oldest run"))
+
+        val report = DebugReport.collect(log(), sink) { "the app section" }
+        assertFalse(report.text, "the oldest run" in report.text)
+        DebugReport.settle(report, copied = true, launched = true) { sink.clearPreviousRun(it) }
+        sink.awaitIdle()
+
+        assertTrue("the run nobody was sent survives", older.exists())
+        assertFalse("the run that was sent does not", newer.exists())
+    }
+
+    @Test
+    fun `a heading with no room for the runs leaves them for a later report`() {
+        val sink = sinkWithAPriorRun()
+        val log = log()
+
+        val report = DebugReport.collect(log, sink, heading = "=".repeat(DebugReport.MAX_EARLIER_RUNS_CHARS)) {
+            "the app section"
+        }
+        val cleared = mutableListOf<PreviousRun>()
+        DebugReport.settle(report, copied = true, launched = true) { cleared += it }
+
+        assertEquals("the app section", report.text)
+        assertTrue(cleared.toString(), cleared.isEmpty())
+        assertTrue(log.snapshot().toString(), log.snapshot().any { "leaves no room for the runs" in it })
+        // And an ordinary heading still carries them.
+        assertTrue(DebugReport.collect(log(), sink) { "again" }.text.contains("an earlier run"))
+    }
+
+    @Test
+    fun `a section that fits is returned as it is`() {
+        assertEquals("a\nb", DebugReport.keepingEnds("a\nb", 3))
+    }
+
+    @Test
+    fun `one line too long for the budget keeps both its ends and uses the room`() {
+        val kept = DebugReport.keepingEnds("a".repeat(500) + "b".repeat(500), 100)
+
+        assertTrue("${kept.length}", kept.length <= 100)
+        // Only the notice's digits can leave room unused: it is sized for the
+        // largest count it could name.
+        assertTrue("${kept.length}", kept.length >= 99)
+        assertTrue(kept, kept.startsWith("aaa") && kept.endsWith("bbb"))
+        assertTrue(kept, "characters cut here" in kept)
+    }
+
     // -------------------------------------------------- attaching a screenshot
 
     @Test
