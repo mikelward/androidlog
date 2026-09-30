@@ -1,0 +1,110 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "com.mikelward.androidlog",
+    "module": "logging-android",
+    "version": "2.3.72",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.7.0"
+    }
+  },
+  "variants": [
+    {
+      "name": "releaseVariantReleaseApiPublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-api"
+      },
+      "dependencies": [
+        {
+          "group": "com.mikelward.androidlog",
+          "module": "logging-core",
+          "version": {
+            "requires": "2.3.72"
+          }
+        },
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.4.20"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "logging-android-2.3.72.aar",
+          "url": "logging-android-2.3.72.aar",
+          "size": 70735,
+          "sha512": "acd0cc3d16e6c7f0631fea1df3ef561a7869a72e430229d381a8c901c9f2886453e138ae1c13877467d6f4d7d2e5afb58523c9bccf79a5dd458b27b13152519a",
+          "sha256": "f53297ad47438bd58539570058bcf44bc4a295a2f28dbfd05a44386c0a345132",
+          "sha1": "ab1c219fbb422b1d5af0658a1d18da29d7ef1b0e",
+          "md5": "82e50efc66078eec9d2589da29b3efa4"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseRuntimePublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "com.mikelward.androidlog",
+          "module": "logging-core",
+          "version": {
+            "requires": "2.3.72"
+          }
+        },
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.4.20"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "logging-android-2.3.72.aar",
+          "url": "logging-android-2.3.72.aar",
+          "size": 70735,
+          "sha512": "acd0cc3d16e6c7f0631fea1df3ef561a7869a72e430229d381a8c901c9f2886453e138ae1c13877467d6f4d7d2e5afb58523c9bccf79a5dd458b27b13152519a",
+          "sha256": "f53297ad47438bd58539570058bcf44bc4a295a2f28dbfd05a44386c0a345132",
+          "sha1": "ab1c219fbb422b1d5af0658a1d18da29d7ef1b0e",
+          "md5": "82e50efc66078eec9d2589da29b3efa4"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseSourcePublication",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "logging-android-2.3.72-sources.jar",
+          "url": "logging-android-2.3.72-sources.jar",
+          "size": 58634,
+          "sha512": "b68a3fc63a7faccbc5f07d4e0788d18340fda854d2dd5ade61b5db2e14c0a9de2284543b4c4b0a849508ae0d9f3e8653ef9dfbaf3a24a335be695d873be51499",
+          "sha256": "b70348e6ba969aefc9c5d436346469d352ffabdd1622f5b845ec1d75f10a097c",
+          "sha1": "a60db6db60557b91c8a348abcab5ef66e80726bb",
+          "md5": "86dfe0e229d86ce667b283275c04f6c8"
+        }
+      ]
+    }
+  ]
+}
