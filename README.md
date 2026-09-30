@@ -18,7 +18,7 @@ and nothing propagated it.
 | Module | What it is | What it holds |
 |---|---|---|
 | `:logging-core` | Plain Kotlin JVM. No Android, enforced by `verifyNoAndroid`. | The bounded buffer, the recording gate, the sink interface, the format-plus-arguments contract, the type rule that is the privacy floor, throwable rendering. |
-| `:logging-android` | Android library, `minSdk` 31, **no resources**. | The platform sinks: logcat, and the persisted file with its rotation and crash record; the bug-report transport (`DebugReport`) and screenshot capture (`ReportScreenshot`). |
+| `:logging-android` | Android library, `minSdk` 31, **no resources**. | The platform sinks: logcat, and the persisted file with its rotation and crash record; the bug-report transport (`DebugReport`) and screenshot capture (`ReportScreenshot`); and why the previous processes ended (`ProcessExits`), pinned at the top of the next run's log. |
 
 The share sheet and clipboard fallback are in `:logging-android` too, as
 `DebugReport`. They were once meant to be a third module — a chooser title names
@@ -33,6 +33,15 @@ and its paths stay in the app — a screenshot is the app's own content, and own
 the provider here would force resources on every consumer for a picture only some
 of them send. So the `:logging-report` module the resources would have needed is
 not built, and may never be.
+
+`ProcessExits.logRecent(context, log)` copies the platform's record of why the
+last few processes ended (an ANR, a native crash, a low-memory reclaim, an APK
+update) into the log as pinned lines, with the package's update time beside
+them. Short of an uncaught exception, a process dies without a trace in its
+own log, so this is the only account the next run gets. It blocks on two binder calls, so an app runs it off the main thread once its
+stored recording setting is applied. The platform's free-text description is
+left out unless the app passes `includeDescription = true`, and even then it
+stays in the device's own copy only.
 
 **What is not here, and will not be: the report's *contents*.** A decision
 snapshot, a snooze summary, an `Intent` rendering — those are each app's own

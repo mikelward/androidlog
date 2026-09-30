@@ -1345,3 +1345,10 @@ own `runCatching`, before the snapshot and after the crash marker.
 
   Each migration also deletes that app's legacy log files and marks its
   already-reduced values `safe(...)` — see the entry above.
+
+- **Move the apps onto `ProcessExits` (2.3).** simmo, snoozemo, typelauncher and
+  clothescast each carry their own `ProcessExitReasons.kt`, the copy this was
+  lifted from. snoozemo is the pilot. The rest delete theirs one at a time, each
+  choosing `includeDescription`: typelauncher and clothescast log the description
+  today and simmo doesn't. stopdash never had a copy and takes the shared one
+  directly.
