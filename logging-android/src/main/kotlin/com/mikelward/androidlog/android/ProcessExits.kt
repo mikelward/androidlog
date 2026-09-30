@@ -35,24 +35,63 @@ object ProcessExits {
     const val DEFAULT_MAX_RECORDS: Int = 5
 
     /**
-     * Logs up to [maxRecords] of this package's recent process exits, newest
-     * first, then the package's own update and install times, each as a
+     * How much of the platform's description one exit line keeps. The only
+     * field here with no bound of its own, so without this a batch has no size
+     * a report can reserve room for (see [maxBatchChars]). The same bound
+     * [DebugLog] gives a throwable's message, and long enough for an ANR's
+     * "Input dispatching timed out (…)" sentence.
+     */
+    const val MAX_DESCRIPTION_CHARS: Int = 300
+
+    /**
+     * The most characters one [logRecent] batch of up to [maxRecords] exits
+     * takes in the log, each line's timestamp, newline and offset anchor
+     * included: what to pass as `pinnedBudgetChars` to
+     * [DebugLog.boundedSnapshot] so a report carries the whole batch.
+     *
+     * A budget any smaller drops lines from the front of the batch, which is
+     * its oldest exits: the batch is written oldest first so that any limit
+     * the log applies costs the least useful line, not the exit that explains
+     * this start. Add to it for any lines of the app's own that it also pins.
+     */
+    fun maxBatchChars(maxRecords: Int = DEFAULT_MAX_RECORDS): Int {
+        requirePositive(maxRecords)
+        // A count whose reserve can't be represented is refused rather than
+        // wrapped: an overflowed Int is negative, and a negative reserve keeps
+        // nothing (Codex, PR #50). A count meaning "all of them" has no reserve.
+        require(maxRecords <= MAX_RESERVABLE_RECORDS) {
+            "maxRecords must be at most $MAX_RESERVABLE_RECORDS to have a reserve, was $maxRecords"
+        }
+        return maxRecords * EXIT_LINE_CHARS + PACKAGE_LINE_CHARS
+    }
+
+    /**
+     * Logs the package's own update and install times, then up to
+     * [maxRecords] of its recent process exits oldest first, each as a
      * [DebugLog.pinnedEvent] on [log] so the ring doesn't evict them before a
-     * report is shared.
+     * report is shared. Least useful first, so any limit on pinned lines costs
+     * the newest exit last.
      *
      * **Blocks on two binder calls**, so call it off the main thread, and after
      * the app has applied its stored recording setting to [log]: with recording
      * off it returns without querying anything.
      *
      * [includeDescription] adds the platform's free-text description of each
-     * exit. It is composed by the system and can name another package, so it
-     * is off unless the app has decided it wants it; even then it is passed as
-     * an ordinary argument, so the floor renders it in full only in the
-     * device's own copy and withholds it from anything leaving the device.
+     * exit, cut to [MAX_DESCRIPTION_CHARS] and kept on one line. It is composed
+     * by the system and can name another package, so it is off unless the app
+     * has decided it wants it; even then it is passed as an ordinary argument,
+     * so the floor renders it only in the device's own copy and withholds it
+     * from anything leaving the device.
      *
-     * Never throws: a query that fails is logged through [DebugLog.failure] and
-     * leaves a pinned line saying so, since a missing section would otherwise
-     * read like one that was never wired up.
+     * A report built with [DebugLog.boundedSnapshot] keeps the whole batch when
+     * it reserves [maxBatchChars] for pinned lines.
+     *
+     * Never throws for a failed query: one that fails is logged through
+     * [DebugLog.failure] and leaves a pinned line saying so, since a missing
+     * section would otherwise read like one that was never wired up.
+     *
+     * [maxRecords] must be positive. The platform reads 0 as "every record",
+     * which no [maxBatchChars] reserve can hold.
      */
     fun logRecent(
         context: Context,
@@ -60,6 +99,7 @@ object ProcessExits {
         includeDescription: Boolean = false,
         maxRecords: Int = DEFAULT_MAX_RECORDS,
     ) {
+        requirePositive(maxRecords)
         val activityManager = context.getSystemService(ActivityManager::class.java)
         record(
             log = log,
@@ -67,7 +107,13 @@ object ProcessExits {
             // pid 0 means any process of this package; asking by pid would miss
             // exactly the abrupt deaths this is for.
             exits = activityManager?.let { manager ->
-                { manager.getHistoricalProcessExitReasons(context.packageName, 0, maxRecords).map(::toExit) }
+                // Taken to the count as well as asked for it, so the batch can
+                // never outgrow the reserve [maxBatchChars] declares for it.
+                {
+                    manager.getHistoricalProcessExitReasons(context.packageName, 0, maxRecords)
+                        .take(maxRecords)
+                        .map(::toExit)
+                }
             },
             packageTimes = {
                 val info = context.packageManager.getPackageInfo(context.packageName, 0)
@@ -93,7 +139,8 @@ object ProcessExits {
     /**
      * The part [logRecent] shares between the apps, reachable without a
      * `Context`: this module's tests run on a plain JVM (see [DebugReport]).
-     * [exits] is null when there is no `ActivityManager` to ask.
+     * [exits] answers newest first, as the platform does, and is null when
+     * there is no `ActivityManager` to ask.
      */
     internal fun record(
         log: DebugLog,
@@ -117,12 +164,20 @@ object ProcessExits {
             log.pinnedEvent("processExits unavailable reason=%s", safe("queryFailed"))
             return
         }
+        // Least useful first. Every limit the log applies to pinned lines --
+        // their count, a report's reserve -- drops from the front, so the
+        // front holds what matters least and the end the exit that explains
+        // this start (Codex, PR #50). The package times come first: they only
+        // help read the exits, and a log keeping a single pinned line should
+        // keep an exit, not them. logPackageTimes catches its own failures,
+        // so going first can't cost the exits that follow.
+        logPackageTimes(log, packageTimes)
         if (records.isEmpty()) {
             log.pinnedEvent("processExits none")
         } else {
-            // Newest first, as the platform returns them: the most recent exit
-            // is the one that explains this start.
-            records.forEach { exit ->
+            // Then the exits oldest first, reversing the platform's order. It
+            // also reads like the rest of the log.
+            records.asReversed().forEach { exit ->
                 val fields = "processExit reason=%s importance=%s status=%s timestamp=%s"
                 val named = arrayOf<Any?>(
                     safe(exitReasonName(exit.reason)),
@@ -131,14 +186,12 @@ object ProcessExits {
                     safe(utcTimestamp(exit.timestamp)),
                 )
                 if (includeDescription) {
-                    log.pinnedEvent("$fields description=%s", *named, exit.description)
+                    log.pinnedEvent("$fields description=%s", *named, boundedDescription(exit.description))
                 } else {
                     log.pinnedEvent(fields, *named)
                 }
             }
         }
-        // Last, so a failure here can't cost the exit records already logged.
-        logPackageTimes(log, packageTimes)
     }
 
     private fun logPackageTimes(log: DebugLog, packageTimes: () -> PackageTimes) {
@@ -223,4 +276,64 @@ object ProcessExits {
 
     private val UTC_TIMESTAMP: DateTimeFormatter =
         DateTimeFormatter.ofPattern("yyyy-MMM-dd'T'HH:mm:ss'Z'", Locale.US)
+
+    /**
+     * [description] cut to [MAX_DESCRIPTION_CHARS] and flattened onto one line.
+     *
+     * Cut before flattening, so a description of any length costs only the
+     * prefix kept. Flattened because it is text the system composed: a newline
+     * in it would open a line reading like one this log wrote.
+     */
+    internal fun boundedDescription(description: String?): String? {
+        if (description == null) return null
+        val overlong = description.length > MAX_DESCRIPTION_CHARS
+        val head = if (overlong) description.take(MAX_DESCRIPTION_CHARS + 1) else description
+        val flat = head.lineSequence().joinToString(" ") { it.trim() }.trim()
+        if (!overlong) return flat
+        // Stepped back off a high surrogate, so the cut never strands half a
+        // pair. Checked even when the cut is at the end: the prefix read above
+        // can itself end mid-pair, and flattening can shorten it to the bound
+        // (Codex, PR #50).
+        var cut = minOf(MAX_DESCRIPTION_CHARS, flat.length)
+        if (cut > 0 && Character.isHighSurrogate(flat[cut - 1])) cut--
+        return flat.take(cut) + TRUNCATED
+    }
+
+    private fun requirePositive(maxRecords: Int) =
+        require(maxRecords > 0) { "maxRecords must be positive, was $maxRecords" }
+
+    /** The marker [DebugLog] puts on anything it cuts, so a cut reads the same here. */
+    private const val TRUNCATED = "…(truncated)"
+
+    /** The longest a reason or importance renders: an unrecognized minimum `Int`. */
+    private const val LONGEST_NAME_CHARS = 25 // "unrecognized(-2147483648)"
+
+    /** The longest a status renders. */
+    private const val LONGEST_STATUS_CHARS = 11 // "-2147483648"
+
+    /** An upper bound on what [utcTimestamp] renders, its fallback included. */
+    private const val LONGEST_TIMESTAMP_CHARS = 34 // "unrenderable(-9223372036854775808)"
+
+    private const val MAX_EXIT_MESSAGE_CHARS =
+        "processExit reason= importance= status= timestamp= description=".length +
+            2 * LONGEST_NAME_CHARS + LONGEST_STATUS_CHARS + LONGEST_TIMESTAMP_CHARS +
+            MAX_DESCRIPTION_CHARS + TRUNCATED.length
+
+    private const val MAX_PACKAGE_MESSAGE_CHARS =
+        "ownPackage lastUpdateTime= firstInstallTime=".length + 2 * LONGEST_TIMESTAMP_CHARS
+
+    /**
+     * What [DebugLog] adds around each message when it is counted against a
+     * budget: the timestamp and level (21), the newline, and an offset anchor
+     * (about 26). Over-reserved, since the log's line format is its own to
+     * change; the tests hold this to what the real log renders.
+     */
+    private const val LINE_ALLOWANCE_CHARS = 64
+
+    private const val EXIT_LINE_CHARS = MAX_EXIT_MESSAGE_CHARS + LINE_ALLOWANCE_CHARS
+
+    private const val PACKAGE_LINE_CHARS = MAX_PACKAGE_MESSAGE_CHARS + LINE_ALLOWANCE_CHARS
+
+    /** The largest count whose [maxBatchChars] fits in an `Int`. */
+    private const val MAX_RESERVABLE_RECORDS = (Int.MAX_VALUE - PACKAGE_LINE_CHARS) / EXIT_LINE_CHARS
 }

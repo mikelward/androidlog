@@ -6,6 +6,7 @@ import com.mikelward.androidlog.DebugLog
 import com.mikelward.androidlog.OFF_DEVICE_PLACEHOLDER
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -41,7 +42,8 @@ class ProcessExitsTest {
         log.pinnedSnapshot().filter { "processExit" in it || "ownPackage" in it }
 
     @Test
-    fun `each exit is pinned newest first with its reason and importance named`() {
+    fun `the package times are pinned first, then each exit oldest first with its reason and importance named`() {
+        // Newest first, as the platform answers.
         record({
             listOf(
                 exit(ApplicationExitInfo.REASON_CRASH),
@@ -52,12 +54,57 @@ class ProcessExitsTest {
         val lines = pinned()
         assertEquals(lines.toString(), 3, lines.size)
         assertTrue(lines[0], lines[0].endsWith(
-            "processExit reason=crash importance=foreground status=0 timestamp=1970-Jan-02T00:00:00Z",
+            "ownPackage lastUpdateTime=1970-Jan-02T00:00:00Z firstInstallTime=1970-Jan-02T00:00:00Z",
         ))
         assertTrue(lines[1], lines[1].contains("reason=packageUpdated importance=cached"))
         assertTrue(lines[2], lines[2].endsWith(
-            "ownPackage lastUpdateTime=1970-Jan-02T00:00:00Z firstInstallTime=1970-Jan-02T00:00:00Z",
+            "processExit reason=crash importance=foreground status=0 timestamp=1970-Jan-02T00:00:00Z",
         ))
+    }
+
+    /** Five exits, newest first as the platform answers: the newest is the ANR. */
+    private val fiveExits = listOf(
+        exit(ApplicationExitInfo.REASON_ANR),
+        exit(ApplicationExitInfo.REASON_CRASH),
+        exit(ApplicationExitInfo.REASON_LOW_MEMORY),
+        exit(ApplicationExitInfo.REASON_USER_STOPPED),
+        exit(ApplicationExitInfo.REASON_PACKAGE_UPDATED),
+    )
+
+    @Test
+    fun `a pinned buffer too small for the batch loses the package times and oldest exits, not the newest`() {
+        val small = DebugLog(maxPinnedEntries = 3, readMillis = { 0L })
+
+        ProcessExits.record(small, includeDescription = false, { fiveExits }) { times }
+
+        val lines = small.pinnedSnapshot().filter { "processExit" in it || "ownPackage" in it }
+        assertEquals(lines.toString(), 3, lines.size)
+        assertTrue(lines[0], "reason=lowMemory" in lines[0])
+        assertTrue(lines[1], "reason=crash" in lines[1])
+        assertTrue(lines[2], "reason=anr" in lines[2])
+    }
+
+    @Test
+    fun `a single pinned entry keeps the newest exit`() {
+        val one = DebugLog(maxPinnedEntries = 1, readMillis = { 0L })
+
+        ProcessExits.record(one, includeDescription = false, { fiveExits }) { times }
+
+        val lines = one.pinnedSnapshot().filter { "processExit" in it || "ownPackage" in it }
+        assertTrue(lines.toString(), lines.single().contains("reason=anr"))
+    }
+
+    @Test
+    fun `a report reserve too small for the batch loses the oldest exits, not the newest`() {
+        val log = DebugLog(maxEntries = 10, readMillis = { 0L })
+        ProcessExits.record(log, includeDescription = false, { fiveExits }) { times }
+        repeat(20) { log.event("later %s", it) }
+        // Room for about half the batch.
+        val full = log.boundedSnapshot(ProcessExits.maxBatchChars(), 0).sumOf { it.length + 1 }
+        val short = log.boundedSnapshot(pinnedBudgetChars = full / 2, recentBudgetChars = 0)
+
+        assertTrue(short.toString(), short.last().contains("reason=anr"))
+        assertFalse(short.toString(), short.any { "reason=packageUpdated" in it })
     }
 
     @Test
@@ -74,7 +121,7 @@ class ProcessExitsTest {
 
         record({ listOf(exit(ApplicationExitInfo.REASON_CRASH)) }, includeDescription = true)
 
-        assertTrue(pinned().toString(), pinned()[0].endsWith("description=stopped by the installer"))
+        assertTrue(pinned().toString(), pinned().single { "processExit " in it }.endsWith("description=stopped by the installer"))
         // The named fields cross; only the platform's own text is held back.
         assertTrue(offDevice.toString(), offDevice.single().endsWith(
             "processExit reason=crash importance=foreground status=0 " +
@@ -83,11 +130,96 @@ class ProcessExitsTest {
     }
 
     @Test
+    fun `a long description is cut to its bound and kept on one line`() {
+        val long = "Input dispatching timed out\n" + "x".repeat(2 * ProcessExits.MAX_DESCRIPTION_CHARS)
+
+        record({ listOf(exit(ApplicationExitInfo.REASON_ANR, description = long)) }, includeDescription = true)
+
+        val line = pinned().single { "processExit " in it }
+        val description = line.substringAfter("description=")
+        assertTrue(line, description.startsWith("Input dispatching timed out xxx"))
+        assertTrue(line, description.endsWith("…(truncated)"))
+        assertEquals(line, ProcessExits.MAX_DESCRIPTION_CHARS, description.removeSuffix("…(truncated)").length)
+        assertFalse(line, "\n" in line)
+    }
+
+    @Test
+    fun `a cut never leaves half a surrogate pair, even where flattening shortened the text to the bound`() {
+        // The prefix read ends on the emoji's high surrogate; dropping the
+        // leading newline then brings the flattened text to exactly the bound.
+        val description = "\n" + "a".repeat(ProcessExits.MAX_DESCRIPTION_CHARS - 1) + "\uD83D\uDE00" + "b".repeat(50)
+
+        val bounded = ProcessExits.boundedDescription(description)!!.removeSuffix("…(truncated)")
+
+        assertEquals("a".repeat(ProcessExits.MAX_DESCRIPTION_CHARS - 1), bounded)
+    }
+
+    @Test
+    fun `a record count the platform would read as every record is refused`() {
+        // getHistoricalProcessExitReasons reads 0 as no limit, which no
+        // reserve can be sized for.
+        assertThrows(IllegalArgumentException::class.java) { ProcessExits.maxBatchChars(0) }
+        assertThrows(IllegalArgumentException::class.java) { ProcessExits.maxBatchChars(-1) }
+    }
+
+    @Test
+    fun `a record count too large to reserve for is refused rather than overflowing`() {
+        assertThrows(IllegalArgumentException::class.java) { ProcessExits.maxBatchChars(Int.MAX_VALUE) }
+        // Right at the edge: the largest count whose reserve fits is accepted
+        // and positive, and one more is refused.
+        val perExit = ProcessExits.maxBatchChars(2) - ProcessExits.maxBatchChars(1)
+        val packageLine = ProcessExits.maxBatchChars(1) - perExit
+        val largest = (Int.MAX_VALUE - packageLine) / perExit
+        assertTrue("$largest", ProcessExits.maxBatchChars(largest) > 0)
+        assertThrows(IllegalArgumentException::class.java) { ProcessExits.maxBatchChars(largest + 1) }
+    }
+
+    @Test
+    fun `a short description is kept whole, only flattened`() {
+        assertEquals("one two", ProcessExits.boundedDescription("one\n  two"))
+        assertEquals(null, ProcessExits.boundedDescription(null))
+    }
+
+    @Test
+    fun `a full batch at its longest fits the reserve it declares, after the ring has dropped it`() {
+        // A small ring, so a handful of later lines evicts the whole batch and
+        // only the pinned copy can carry it into a report.
+        val log = DebugLog(maxEntries = 10, readMillis = { 0L })
+        val longest = List(ProcessExits.DEFAULT_MAX_RECORDS) {
+            ProcessExits.Exit(
+                reason = Int.MIN_VALUE,
+                importance = Int.MIN_VALUE,
+                status = Int.MIN_VALUE,
+                timestamp = Long.MIN_VALUE,
+                description = "y".repeat(10 * ProcessExits.MAX_DESCRIPTION_CHARS),
+            )
+        }
+        ProcessExits.record(log, includeDescription = true, { longest }) {
+            ProcessExits.PackageTimes(lastUpdate = Long.MIN_VALUE, firstInstall = Long.MIN_VALUE)
+        }
+        repeat(20) { log.event("later %s", it) }
+        // Precondition: the ring alone has lost every line of the batch.
+        assertFalse(log.snapshot().any { "processExit" in it || "ownPackage" in it })
+
+        val kept = log.boundedSnapshot(pinnedBudgetChars = ProcessExits.maxBatchChars(), recentBudgetChars = 0)
+
+        val exits = kept.filter { "processExit " in it }
+        assertEquals(kept.toString(), ProcessExits.DEFAULT_MAX_RECORDS, exits.size)
+        // Whole, not clamped to fit.
+        exits.forEach { assertTrue(it, it.endsWith("…(truncated)") && "unrecognized(-2147483648)" in it) }
+        assertTrue(kept.toString(), kept.any { "ownPackage lastUpdateTime=" in it && "firstInstallTime=" in it })
+        // And not so loose that it takes a report's space for nothing: within
+        // one line's allowance per line of what the batch really renders to.
+        val rendered = kept.sumOf { it.length + 1 }
+        assertTrue("$rendered of ${ProcessExits.maxBatchChars()}", ProcessExits.maxBatchChars() - rendered < 64 * 6)
+    }
+
+    @Test
     fun `no exit records says so, rather than looking like a query never made`() {
         record({ emptyList() })
 
         assertEquals(pinned().toString(), 2, pinned().size)
-        assertTrue(pinned()[0], pinned()[0].endsWith("processExits none"))
+        assertTrue(pinned()[1], pinned()[1].endsWith("processExits none"))
     }
 
     @Test
@@ -106,13 +238,13 @@ class ProcessExitsTest {
     }
 
     @Test
-    fun `a failed package lookup keeps the exit records already logged`() {
+    fun `a failed package lookup still logs every exit`() {
         record({ listOf(exit(ApplicationExitInfo.REASON_ANR)) }, packageTimes = { throw IllegalStateException("dead") })
 
         val lines = pinned()
         assertEquals(lines.toString(), 2, lines.size)
-        assertTrue(lines[0], lines[0].contains("reason=anr"))
-        assertTrue(lines[1], lines[1].endsWith("ownPackage unavailable reason=queryFailed"))
+        assertTrue(lines[0], lines[0].endsWith("ownPackage unavailable reason=queryFailed"))
+        assertTrue(lines[1], lines[1].contains("reason=anr"))
     }
 
     @Test

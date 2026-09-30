@@ -41,7 +41,11 @@ them. Short of an uncaught exception, a process dies without a trace in its
 own log, so this is the only account the next run gets. It blocks on two binder calls, so an app runs it off the main thread once its
 stored recording setting is applied. The platform's free-text description is
 left out unless the app passes `includeDescription = true`, and even then it
-stays in the device's own copy only.
+stays in the device's own copy only, cut to 300 characters on one line. A report
+built with `boundedSnapshot` keeps the whole batch when it reserves
+`ProcessExits.maxBatchChars()` for pinned lines. The batch is written least
+useful first (the package times, then the exits oldest first), so any limit
+short of that drops the newest exit last: it is the one that explains this start.
 
 **What is not here, and will not be: the report's *contents*.** A decision
 snapshot, a snooze summary, an `Intent` rendering — those are each app's own
