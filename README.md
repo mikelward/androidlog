@@ -417,6 +417,21 @@ Two calls rather than one `suspend` function, because this library takes no
 third-party runtime dependency and so cannot hop threads for you — your own
 scope is a better place for that choice anyway.
 
+**A report is at most 60,000 characters** (`DebugReport.MAX_REPORT_CHARS`), so
+it survives the clipboard and the share sheet: a text-only share carries its
+text twice in one Binder transaction, and a report several times this size
+failed on both routes. The earlier runs get up to 20,000 of it
+(`MAX_EARLIER_RUNS_CHARS`), newest lines kept; a run trimmed out entirely stays
+on disk for the next report rather than being consumed by one that never carried
+it. The rest is yours. Keep your section within 40,000 characters and it always
+arrives whole; past that, `collect` cuts it from the middle, at line breaks
+where it can, and says how many characters went.
+
+An app building its own report reads the earlier runs the same way, with
+`DebugFileSink.readPreviousRun(budgetChars)`. Bound the read rather than
+trimming its text afterwards: the handle names the files the text carries, so
+a handle for the whole text deletes runs a later trim cut away.
+
 To send a **screenshot** alongside the text, hand `deliver` a `content://`
 [Uri] as the trailing `screenshot` argument. `ReportScreenshot.capture` does the
 capture — the hardened part every app was hand-rolling the same way — and

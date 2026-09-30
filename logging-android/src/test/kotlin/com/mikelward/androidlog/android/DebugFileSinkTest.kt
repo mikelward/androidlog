@@ -918,6 +918,96 @@ class DebugFileSinkTest {
     }
 
     @Test
+    fun `a budgeted read counts its notice against the budget`() {
+        // The notice is prepended after the trim, so a bound on the lines alone
+        // would let it push the text past what the caller asked for.
+        File(dir, "androidlog-prev-1.log").mkdirs()
+        File(dir, "androidlog-prev-2.log").writeText(
+            (1..500).joinToString("\n") { "line $it of a readable run" } + "\n",
+        )
+
+        val handle = sink().readPreviousRun(1_000)!!
+
+        assertTrue("${handle.text.length}", handle.text.length <= 1_000)
+        assertTrue(handle.text, handle.text.startsWith("[1 earlier run(s) could not be read]"))
+        assertTrue(handle.text, handle.text.endsWith("line 500 of a readable run"))
+    }
+
+    @Test
+    fun `a budgeted read consumes only the runs its text carries`() {
+        // The reason the bound is in the read: a caller that read everything and
+        // trimmed the text itself would clear a handle still naming the older run.
+        val older = File(dir, "androidlog-prev-1.log").apply { writeText("the oldest run\n") }
+        val newer = File(dir, "androidlog-prev-2.log").apply {
+            writeText((1..500).joinToString("\n") { "line $it of a readable run" } + "\n")
+        }
+        assertTrue(older.setLastModified(1_000L))
+        assertTrue(newer.setLastModified(2_000L))
+        val sink = sink()
+
+        val handle = sink.readPreviousRun(1_000)!!
+        assertFalse(handle.text, handle.text.contains("the oldest run"))
+        assertFalse("the budget left a run out", handle.complete)
+        sink.clearPreviousRun(handle)
+        sink.awaitIdle()
+
+        assertTrue("the run nobody was sent survives", older.exists())
+        assertFalse("the run that was sent does not", newer.exists())
+    }
+
+    @Test
+    fun `a run that fits the budget exactly is carried whole`() {
+        // The text is joined with no trailing newline, so it must not be charged
+        // one: that clamped a run that fit, and the share then consumed it.
+        File(dir, "androidlog-prev-1.log").writeText("first line\nsecond line\n")
+        val exact = "first line\nsecond line".length
+
+        assertEquals("first line\nsecond line", sink().readPreviousRun(exact)!!.text)
+        // One character less and the oldest line goes.
+        assertEquals("second line", sink().readPreviousRun(exact - 1)!!.text)
+    }
+
+    @Test
+    fun `one line that fits the budget exactly is carried whole, and one over is clamped to it`() {
+        val line = "x".repeat(100)
+        File(dir, "androidlog-prev-1.log").writeText("$line\n")
+
+        assertEquals(line, sink().readPreviousRun(100)!!.text)
+        val clamped = sink().readPreviousRun(99)!!.text
+        assertEquals(99, clamped.length)
+        assertTrue(clamped, clamped.endsWith("(truncated)"))
+    }
+
+    @Test
+    fun `the largest budget reads every run whole`() {
+        // Int.MAX_VALUE is how a caller says "no limit", and a budget computed
+        // one past it wrapped to a negative one that kept a single clamped line.
+        File(dir, "androidlog-prev-1.log").writeText("first line\nsecond line\n")
+
+        val handle = sink().readPreviousRun(Int.MAX_VALUE)!!
+
+        assertEquals("first line\nsecond line", handle.text)
+        assertTrue(handle.complete)
+    }
+
+    @Test
+    fun `the smallest budget reads nothing and consumes nothing`() {
+        val run = File(dir, "androidlog-prev-1.log").apply { writeText("a line\n") }
+
+        assertNull(sink().readPreviousRun(Int.MIN_VALUE))
+        assertTrue(run.exists())
+    }
+
+    @Test
+    fun `a budget too small for anything reads nothing and consumes nothing`() {
+        File(dir, "androidlog-prev-1.log").mkdirs()
+        val run = File(dir, "androidlog-prev-2.log").apply { writeText("a line longer than the budget\n") }
+
+        assertNull(sink().readPreviousRun(10))
+        assertTrue(run.exists())
+    }
+
+    @Test
     fun `a handle from a listing that failed says it covers nothing`() {
         // The strongest incomplete case: not one run was accounted for, and
         // every one of them is still on disk.

@@ -1409,9 +1409,30 @@ class DebugFileSink internal constructor(
      * report deletes exactly the files it was built from — overlapping flows
      * included, and a caller that got nothing deletes nothing.
      */
-    fun readPreviousRun(): PreviousRun? =
+    fun readPreviousRun(): PreviousRun? = readPreviousRun(PERSIST_BUDGET_CHARS)
+
+    /**
+     * [readPreviousRun], with the text held to [budgetChars], its notices
+     * included, and the handle to the files that text still speaks for.
+     *
+     * For a report that gives the earlier runs a share of itself rather than
+     * the whole persisted budget — [DebugReport.collect] reads with
+     * [DebugReport.MAX_EARLIER_RUNS_CHARS]. **Bound the read here rather than
+     * trimming its text afterwards**: the handle is built from what the text
+     * carries, so one handed back for the full text still consumes every run a
+     * later trim cut away, and clearing it deletes them unsent.
+     *
+     * The newest lines are kept, and a run left without any is left on disk
+     * for the next read; [PreviousRun.complete] is false whenever anything
+     * was. A budget too small for even a notice answers null, which consumes
+     * nothing.
+     */
+    fun readPreviousRun(budgetChars: Int): PreviousRun? =
         runCatching {
-            worker.submit<PreviousRun?> { readPreviousRunOnWorker() }
+            // Floored, so the notice arithmetic below cannot wrap a negative
+            // budget round to a huge one; nothing fits in zero either way.
+            val budget = budgetChars.coerceAtLeast(0)
+            worker.submit<PreviousRun?> { readPreviousRunOnWorker(budget) }
                 .get(previousRunReadTimeoutMs, TimeUnit.MILLISECONDS)
         }
             .onFailure { failure ->
@@ -1440,7 +1461,12 @@ class DebugFileSink internal constructor(
             }
             .getOrNull()
 
-    private fun readPreviousRunOnWorker(): PreviousRun? {
+    private fun readPreviousRunOnWorker(budgetChars: Int): PreviousRun? {
+        // Every answer passes through here, so a text over the budget -- a
+        // notice longer than a tiny budget -- is no answer rather than an
+        // oversized one. Null consumes nothing, which is the safe direction.
+        fun handleFor(text: String?, files: MutableList<File>, complete: Boolean) =
+            this@DebugFileSink.handleFor(text?.takeIf { it.length <= budgetChars }, files, complete)
         // The listing itself, not the best-effort view: a directory that could
         // not be read is a different fact from one with nothing in it, and
         // collapsing them here made an unavailable prior log read as no prior log
@@ -1469,10 +1495,23 @@ class DebugFileSink internal constructor(
         val readable = perFile.map { it.first }.toMutableList()
         val lines = perFile.flatMap { it.second }
         if (unreadable > 0) log.warning("%s earlier run(s) could not be read", unreadable)
-        if (lines.isEmpty()) return handleFor(unreadableNotice(unreadable), readable, unreadable == 0)
+        val notice = unreadableNotice(unreadable)
+        if (lines.isEmpty()) return handleFor(notice, readable, unreadable == 0)
         // After the bound, not before: a notice prepended first would be the
-        // oldest line and so the first one trimmed.
-        val kept = boundedLogTail(lines, PERSIST_BUDGET_CHARS)
+        // oldest line and so the first one trimmed. Charged against it all the
+        // same, with the newline that joins it, so the text is inside the budget.
+        val lineBudget = budgetChars - (notice?.let { it.length + 1 } ?: 0)
+        // [boundedLogTail] charges every line a newline, the last included,
+        // which is right for a caller writing each line with one. This text is
+        // joined, so its last newline is never written, and charging it clamped
+        // or dropped a run that fit exactly -- then consumed it (Codex, PR #51).
+        // The one case the extra character can overrun is a single clamped
+        // line, which takes the ordinary bound instead.
+        // Saturated: Int.MAX_VALUE, the natural "no limit", would wrap to a
+        // budget that keeps one clamped line (Codex, PR #51).
+        val kept = boundedLogTail(lines, if (lineBudget == Int.MAX_VALUE) lineBudget else lineBudget + 1)
+            .takeIf { tail -> tail.sumOf { it.length + 1 } - 1 <= lineBudget }
+            ?: boundedLogTail(lines, lineBudget)
         // The trim is the second way this handle can cover less than it
         // consumes, and the only one that would *destroy* what it left out: a
         // skipped run stays on disk because it never entered the handle, but a
@@ -1487,9 +1526,9 @@ class DebugFileSink internal constructor(
         // surviving line can be truncated in place instead of dropped.
         val complete = unreadable == 0 && kept == lines
         val tail = kept.joinToString("\n")
-        if (tail.isBlank()) return handleFor(unreadableNotice(unreadable), consumable, complete)
+        if (tail.isBlank()) return handleFor(notice, consumable, complete)
         return handleFor(
-            listOfNotNull(unreadableNotice(unreadable), tail).joinToString("\n"),
+            listOfNotNull(notice, tail).joinToString("\n"),
             consumable,
             complete,
         )

@@ -86,6 +86,43 @@ class CollectedReport internal constructor(
 object DebugReport {
 
     /**
+     * The most a report may hold, the earlier runs included.
+     *
+     * A report has to survive two Binder transfers, and it is the second that
+     * sets the bound. The clipboard copy carries the text once, as UTF-16 —
+     * two bytes a character. A text-only share carries it twice: starting the
+     * chooser copies `EXTRA_TEXT` into the intent's `ClipData`
+     * (`Intent.migrateExtraStreamToClipData`), so both copies ride in one
+     * transaction, four bytes a character. At this size that is about 240 KB of
+     * the 1 MB buffer the whole process shares with every other call in flight
+     * — room to spare on a busy device, where a report several times this size
+     * failed on both routes. (A screenshot report sets its own `ClipData`, so
+     * the migration is skipped and its text crosses once.)
+     *
+     * Enforced in [collect], so every [CollectedReport] is already inside it:
+     * a cut at delivery could not know which part of the text is the prior run
+     * the report consumes.
+     */
+    const val MAX_REPORT_CHARS = 60_000
+
+    /**
+     * The part of [MAX_REPORT_CHARS] the earlier runs may use, their heading
+     * and the blank line before it included.
+     *
+     * A fixed share rather than whatever the app's section leaves over, so the
+     * runs are read — and a failure to read them logged — before the app's
+     * section is built, where that section's own log can still carry the line.
+     * The rest is the app's: a section within
+     * `MAX_REPORT_CHARS - MAX_EARLIER_RUNS_CHARS` always arrives whole, and one
+     * with no earlier runs beside it can use all of [MAX_REPORT_CHARS].
+     *
+     * The newest part of the runs is kept, so what goes is the oldest: a crash
+     * leaves its stack trace and the lines leading up to it at the end of its
+     * run.
+     */
+    const val MAX_EARLIER_RUNS_CHARS = 20_000
+
+    /**
      * Reads the prior run, builds the report from it, and remembers whether the
      * text really carries it. **Blocks** — call it off the main thread.
      *
@@ -103,6 +140,12 @@ object DebugReport {
      * recorded through [log] one line earlier, with its message, into the run
      * this report is already carrying. And the prior run is still appended and
      * still consumed, because it is still there to read.
+     *
+     * The report is held to [MAX_REPORT_CHARS]. The earlier runs are read to
+     * fit [MAX_EARLIER_RUNS_CHARS], which keeps the files whose lines were all
+     * trimmed away out of what the report consumes; the app's section gets the
+     * rest, and is cut from the middle only if it outgrows that ([keepingEnds]).
+     * An app that budgets its own section never sees the cut.
      */
     fun collect(
         log: DebugLog,
@@ -110,9 +153,25 @@ object DebugReport {
         heading: String = "--- earlier runs ---",
         buildPayload: () -> String,
     ): CollectedReport {
-        val run = runCatching { sink?.readPreviousRun() }
-            .onFailure { log.failure(it, "Earlier runs could not be read for a report") }
-            .getOrNull()
+        // The run's share less its framing -- the blank line before the
+        // heading and the newline after it -- so the section as a whole stays
+        // inside [MAX_EARLIER_RUNS_CHARS].
+        val runBudget = MAX_EARLIER_RUNS_CHARS - (heading.length + 3)
+        val run = when {
+            sink == null -> null
+            runBudget <= 0 -> {
+                // Reading nothing consumes nothing, so the runs wait for a
+                // report with room for them rather than going out empty.
+                log.warning("An earlier-runs heading of %s characters leaves no room for the runs", heading.length)
+                null
+            }
+            // Bounded in the read, not after it: a trim of the finished text
+            // would leave the handle consuming runs the report no longer
+            // carries, which is how a crash log gets deleted unsent.
+            else -> runCatching { sink.readPreviousRun(runBudget) }
+                .onFailure { log.failure(it, "Earlier runs could not be read for a report") }
+                .getOrNull()
+        }
         val own = runCatching { buildPayload() }
             .getOrElse { failure ->
                 log.failure(failure, "A report could not be built")
@@ -129,8 +188,61 @@ object DebugReport {
         // (Codex, PR #8). Nothing the library can inspect distinguishes that
         // from an honest inclusion, so it does not have to: the library writes
         // the section itself.
-        val text = if (run == null) own else "$own\n\n$heading\n${run.text}"
+        val text = if (run == null) {
+            keepingEnds(own, MAX_REPORT_CHARS)
+        } else {
+            val section = "$heading\n${run.text}"
+            "${keepingEnds(own, MAX_REPORT_CHARS - section.length - 2)}\n\n$section"
+        }
         return CollectedReport(text, run, sink)
+    }
+
+    /**
+     * [text] within [budgetChars], cut from the middle when it has to be.
+     *
+     * The backstop for an app section that outgrew its share of the report —
+     * an app that budgets its own sections never reaches it. The middle goes
+     * because this library cannot know an app's layout, and the ends are what
+     * every app puts somewhere worth keeping: the head names the build and the
+     * state, the tail is the newest of the log. Half the room is the head's
+     * and the rest the tail's, and a line between them says how many
+     * characters went, so a reader knows the report is not the whole account.
+     *
+     * Each cut moves to a nearby line break, so no line is left half-read —
+     * unless the nearest is further away than a log entry can be long, when it
+     * stays mid-line rather than give up the room. Counted in characters, not
+     * lines, for that reason: one line longer than the whole budget still
+     * keeps both its ends (Codex, PR #51).
+     */
+    internal fun keepingEnds(text: String, budgetChars: Int): String {
+        if (text.length <= budgetChars) return text
+        // Sized for the largest count it could name, so the final form fits
+        // whatever the count turns out to be. + a newline either side.
+        val room = budgetChars - (cutNotice(text.length).length + 2)
+        if (room <= 0) return text.substring(0, codePointCut(text, budgetChars))
+        var headEnd = codePointCut(text, room / 2)
+        // Inclusive of headEnd itself: a break there means the head already
+        // ends on a whole line.
+        val lineEnd = text.lastIndexOf('\n', headEnd)
+        if (lineEnd >= 0 && headEnd - lineEnd <= DebugLog.DEFAULT_MAX_ENTRY_CHARS) headEnd = lineEnd
+        // Whatever the head did not use goes to the tail.
+        var tailStart = text.length - (room - headEnd)
+        if (text[tailStart].isLowSurrogate()) tailStart++
+        if (text[tailStart - 1] != '\n') {
+            val lineStart = text.indexOf('\n', tailStart) + 1
+            if (lineStart > 0 && lineStart - tailStart <= DebugLog.DEFAULT_MAX_ENTRY_CHARS) tailStart = lineStart
+        }
+        return listOf(text.substring(0, headEnd), cutNotice(tailStart - headEnd), text.substring(tailStart))
+            .filter { it.isNotEmpty() }
+            .joinToString("\n")
+    }
+
+    private fun cutNotice(chars: Int) = "[$chars characters cut here to keep the report shareable]"
+
+    /** Where to cut [text] near [at] without splitting a surrogate pair. */
+    private fun codePointCut(text: String, at: Int): Int {
+        val cut = at.coerceIn(0, text.length)
+        return if (cut > 0 && text[cut - 1].isHighSurrogate()) cut - 1 else cut
     }
 
     /**
