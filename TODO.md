@@ -1351,4 +1351,6 @@ own `runCatching`, before the snapshot and after the crash marker.
   lifted from. snoozemo is the pilot. The rest delete theirs one at a time, each
   choosing `includeDescription`: typelauncher and clothescast log the description
   today and simmo doesn't. stopdash never had a copy and takes the shared one
-  directly.
+  directly. Each needs a release after 2.3.71 and a report that reads `boundedSnapshot`
+  with `ProcessExits.maxBatchChars()` reserved for pinned lines, or the batch is
+  pinned but still dropped from reports on a busy run (snoozemo #302).
