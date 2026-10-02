@@ -47,6 +47,18 @@ built with `boundedSnapshot` keeps the whole batch when it reserves
 useful first (the package times, then the exits oldest first), so any limit
 short of that drops the newest exit last: it is the one that explains this start.
 
+Just before the newest ANR among them comes where its main thread was stuck,
+read from the trace the platform kept: the top 8 frames, then the first 6 below
+them in the package of the app's `Application` class (or, where a release build
+renamed that, the first 6 outside the platform's own packages), one pinned line
+each, numbered by their place in the stack. Before the exit, so a pinned limit
+drops frames ahead of the exit they explain, never the exit.
+An ANR's reason alone doesn't say which code froze the screen, and the frames
+do. A frame is a code location, never a value, but it is read from a file the
+system wrote, so it stays in the device's own copy like the description. On by
+default; `includeAnrStack = false` turns it off, and `maxBatchChars` takes the
+same flag so a report's reserve matches.
+
 **What is not here, and will not be: the report's *contents*.** A decision
 snapshot, a snooze summary, an `Intent` rendering — those are each app's own
 domain. A call site summarizes its own type and passes the result through

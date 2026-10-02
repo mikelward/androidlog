@@ -35,7 +35,7 @@ class ProcessExitsTest {
         exits: (() -> List<ProcessExits.Exit>)?,
         includeDescription: Boolean = false,
         packageTimes: () -> ProcessExits.PackageTimes = { times },
-    ) = ProcessExits.record(log, includeDescription, exits, packageTimes)
+    ) = ProcessExits.record(log, includeDescription, exits, packageTimes = packageTimes)
 
     /** Lines about this, pinned ones only: the ring may evict the rest before a report. */
     private fun pinned(): List<String> =
@@ -201,7 +201,7 @@ class ProcessExitsTest {
         // Precondition: the ring alone has lost every line of the batch.
         assertFalse(log.snapshot().any { "processExit" in it || "ownPackage" in it })
 
-        val kept = log.boundedSnapshot(pinnedBudgetChars = ProcessExits.maxBatchChars(), recentBudgetChars = 0)
+        val kept = log.boundedSnapshot(pinnedBudgetChars = ProcessExits.maxBatchChars(includeAnrStack = false), recentBudgetChars = 0)
 
         val exits = kept.filter { "processExit " in it }
         assertEquals(kept.toString(), ProcessExits.DEFAULT_MAX_RECORDS, exits.size)
@@ -211,7 +211,142 @@ class ProcessExitsTest {
         // And not so loose that it takes a report's space for nothing: within
         // one line's allowance per line of what the batch really renders to.
         val rendered = kept.sumOf { it.length + 1 }
-        assertTrue("$rendered of ${ProcessExits.maxBatchChars()}", ProcessExits.maxBatchChars() - rendered < 64 * 6)
+        val reserve = ProcessExits.maxBatchChars(includeAnrStack = false)
+        assertTrue("$rendered of $reserve", reserve - rendered < 64 * 6)
+    }
+
+    /** A trace in the platform's shape: a header, the main thread, then another thread. */
+    private fun trace(mainFrames: List<String>) = buildString {
+        appendLine("----- pid 1234 at 2026-10-02 00:00:00.000 -----")
+        appendLine("DALVIK THREADS (2):")
+        appendLine("\"main\" prio=5 tid=1 Runnable")
+        appendLine("  | group=\"main\" sCount=0 ucsCount=0 flags=0 obj=0x0 self=0x0")
+        appendLine("  native: #00 pc 0000 /apex/libc.so (read+8)")
+        mainFrames.forEach { appendLine("  $it") }
+        appendLine()
+        appendLine("\"worker\" prio=5 tid=2 Waiting")
+        appendLine("  at com.example.app.Worker.run(Worker.kt:1)")
+    }
+
+    // A deep main thread: ten library frames, then the app's own, as a decode on the main thread looks.
+    private val deepMain = List(10) { "at lib.Decoder.read$it(Decoder.kt:$it)" } +
+        "- waiting to lock <0x0> (a java.lang.Object) held by thread 2" +
+        List(8) { "at com.example.app.Screen.load$it(Screen.kt:$it)" } +
+        "at android.os.Looper.loop(Looper.java:1)"
+
+    private fun anrWith(trace: String?) = ProcessExits.Exit(
+        ApplicationExitInfo.REASON_ANR, ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND,
+        status = 0, timestamp = dayOne, description = null,
+        trace = { trace?.byteInputStream() },
+    )
+
+    @Test
+    fun `an ANR's main thread keeps its top frames, then the app's own below them, and nothing of other threads`() {
+        val frames = ProcessExits.mainThreadFrames(trace(deepMain).lineSequence(), "com.example.app")
+
+        assertEquals((0 until 8).map { "lib.Decoder.read$it(Decoder.kt:$it)" }, frames.take(8).map { it.second })
+        // Below the top: only the app's, and only so many; the lock line and the looper aren't the app's.
+        assertEquals((0 until 6).map { "com.example.app.Screen.load$it(Screen.kt:$it)" }, frames.drop(8).map { it.second })
+        // Numbered by their place in the stack, the lock line included.
+        assertEquals((0 until 8).toList() + (11 until 17).toList(), frames.map { it.first })
+        assertTrue(frames.none { "Worker" in it.second || "libc" in it.second })
+    }
+
+    @Test
+    fun `a trace with no main thread keeps no frames`() {
+        assertEquals(emptyList<Pair<Int, String>>(), ProcessExits.mainThreadFrames("nothing here".lineSequence(), "com.example.app"))
+    }
+
+    @Test
+    fun `under a build suffix or renamed classes, the app's frames are those outside the platform`() {
+        // Renamed by R8: nothing in the namespace, so the first non-platform frames below the top.
+        val renamed = List(10) { "at kotlinx.Decoder.read$it(Decoder.kt:$it)" } +
+            "at androidx.compose.Recomposer.run(Recomposer.kt:1)" +
+            List(8) { "at a.b.c$it(SourceFile:$it)" }
+        val frames = ProcessExits.mainThreadFrames(trace(renamed).lineSequence(), "com.example.app")
+        assertEquals((0 until 6).map { "a.b.c$it(SourceFile:$it)" }, frames.drop(8).map { it.second })
+        // No namespace at all (the platform's own Application): the same.
+        assertEquals(frames, ProcessExits.mainThreadFrames(trace(renamed).lineSequence(), null))
+    }
+
+    @Test
+    fun `the newest ANR's stack comes just before its exit, on the device's own copy only`() {
+        val offDevice = mutableListOf<String>()
+        log.addSink({ if ("anrMainStack" in it) offDevice += it }, DebugLog.Destination.OFF_DEVICE)
+
+        // Newest first: this start's ANR, then an older one whose trace mustn't be read.
+        ProcessExits.record(log, includeDescription = false, {
+            listOf(anrWith(trace(deepMain)), anrWith(null), exit(ApplicationExitInfo.REASON_CRASH))
+        }, includeAnrStack = true, appNamespace = "com.example.app") { times }
+
+        val lines = log.pinnedSnapshot().filter { "processExit" in it || "anrMainStack" in it }
+        // The crash, the older ANR with no stack, then the newest ANR's 14 frames and its exit.
+        assertEquals(lines.toString(), 3 + 14, lines.size)
+        assertTrue(lines[1], "reason=anr" in lines[1])
+        assertTrue(lines[2], lines[2].endsWith("anrMainStack #0 lib.Decoder.read0(Decoder.kt:0)"))
+        assertTrue(lines[15], lines[15].endsWith("anrMainStack #16 com.example.app.Screen.load5(Screen.kt:5)"))
+        assertTrue(lines.last(), "reason=anr" in lines.last())
+        assertTrue(lines.none { "unavailable" in it })
+        // A frame crosses only as the placeholder.
+        assertEquals(14, offDevice.size)
+        assertTrue(offDevice.toString(), offDevice.all { it.endsWith(OFF_DEVICE_PLACEHOLDER) })
+    }
+
+    @Test
+    fun `a pinned buffer too small for the stack and its exit keeps the exit`() {
+        val one = DebugLog(maxPinnedEntries = 1, readMillis = { 0L })
+
+        ProcessExits.record(one, includeDescription = false, { listOf(anrWith(trace(deepMain))) }, includeAnrStack = true, appNamespace = "com.example.app") { times }
+
+        val kept = one.pinnedSnapshot().filter { "processExit" in it || "anrMainStack" in it }
+        assertTrue(kept.toString(), kept.single().contains("reason=anr"))
+    }
+
+    @Test
+    fun `an ANR with no trace, or one that can't be read, says so`() {
+        ProcessExits.record(log, includeDescription = false, { listOf(anrWith(null)) }, includeAnrStack = true, appNamespace = "com.example.app") { times }
+        assertTrue(pinned().toString(), log.pinnedSnapshot().any { it.endsWith("anrMainStack unavailable reason=noTrace") })
+
+        val broken = ProcessExits.Exit(
+            ApplicationExitInfo.REASON_ANR, 0, 0, dayOne, null,
+            trace = { throw java.io.IOException("gone") },
+        )
+        ProcessExits.record(log, includeDescription = false, { listOf(broken) }, includeAnrStack = true, appNamespace = "com.example.app") { times }
+        assertTrue(log.pinnedSnapshot().any { it.endsWith("anrMainStack unavailable reason=readFailed") })
+    }
+
+    @Test
+    fun `without the stack asked for, a trace is never read`() {
+        var read = false
+        val anr = ProcessExits.Exit(ApplicationExitInfo.REASON_ANR, 0, 0, dayOne, null, trace = { read = true; null })
+
+        ProcessExits.record(log, includeDescription = false, { listOf(anr) }, includeAnrStack = false) { times }
+
+        assertFalse(read)
+        assertFalse(log.pinnedSnapshot().any { "anrMainStack" in it })
+    }
+
+    @Test
+    fun `a batch with the longest ANR stack fits the reserve it declares`() {
+        val log = DebugLog(maxEntries = 10, readMillis = { 0L })
+        val huge = List(30) { "at com.example.app.${"Z".repeat(1_000)}$it(Z.kt:$it)" }
+        val exits = listOf(anrWith(trace(huge))) + List(ProcessExits.DEFAULT_MAX_RECORDS - 1) {
+            exit(Int.MIN_VALUE, Int.MIN_VALUE, description = "y".repeat(10 * ProcessExits.MAX_DESCRIPTION_CHARS))
+        }
+        ProcessExits.record(log, includeDescription = true, { exits }, includeAnrStack = true, appNamespace = "com.example.app") {
+            ProcessExits.PackageTimes(lastUpdate = Long.MIN_VALUE, firstInstall = Long.MIN_VALUE)
+        }
+        repeat(20) { log.event("later %s", it) }
+
+        val kept = log.boundedSnapshot(pinnedBudgetChars = ProcessExits.maxBatchChars(), recentBudgetChars = 0)
+
+        val stack = kept.filter { "anrMainStack #" in it }
+        assertEquals(kept.toString(), ProcessExits.ANR_TOP_FRAMES + ProcessExits.ANR_APP_FRAMES, stack.size)
+        assertEquals(ProcessExits.DEFAULT_MAX_RECORDS, kept.count { "processExit " in it })
+        stack.forEach { assertTrue(it, it.endsWith("…(truncated)")) }
+        // And not so loose it takes a report's space for nothing: within a line's allowance each.
+        val rendered = kept.sumOf { it.length + 1 }
+        assertTrue("$rendered of ${ProcessExits.maxBatchChars()}", ProcessExits.maxBatchChars() - rendered < 64 * 20 + 14 * 12)
     }
 
     @Test
@@ -293,4 +428,21 @@ class ProcessExitsTest {
         assertEquals("2023-Nov-14T22:13:20Z", stamp)
         assertFalse(stamp, Regex("\\d{6,}").containsMatchIn(stamp))
     }
+
+    @Test
+    fun `3_0's signatures still link, and reserve for the stack that is now on by default`() {
+        val exits = ProcessExits::class.java
+        val oneArg = exits.getMethod("maxBatchChars", Int::class.javaPrimitiveType)
+        assertEquals(ProcessExits.maxBatchChars(3), oneArg.invoke(ProcessExits, 3))
+        // The old default-argument bridges too, which a caller relying on a default compiled against.
+        assertTrue(exits.methods.any { it.name == "maxBatchChars\$default" && it.parameterCount == 4 })
+        exits.getMethod(
+            "logRecent",
+            android.content.Context::class.java,
+            com.mikelward.androidlog.DebugLog::class.java,
+            Boolean::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType,
+        )
+    }
+
 }
