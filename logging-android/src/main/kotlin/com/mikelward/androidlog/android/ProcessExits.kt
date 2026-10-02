@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.pm.PackageManager
 import com.mikelward.androidlog.DebugLog
 import com.mikelward.androidlog.safe
+import java.io.IOException
+import java.io.InputStream
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -44,6 +46,19 @@ object ProcessExits {
     const val MAX_DESCRIPTION_CHARS: Int = 300
 
     /**
+     * How many of an ANR's main-thread frames [logRecent] keeps when asked to
+     * ([includeAnrStack]): the top few, which say what the thread was stuck in,
+     * then the first few of the app's own below them, which say whose code put
+     * it there. A frozen screen is usually the app's own work, several frames
+     * below a library's decoder or a framework's dispatch. See
+     * [mainThreadFrames] for what counts as the app's.
+     */
+    const val ANR_TOP_FRAMES: Int = 8
+
+    /** See [ANR_TOP_FRAMES]. */
+    const val ANR_APP_FRAMES: Int = 6
+
+    /**
      * The most characters one [logRecent] batch of up to [maxRecords] exits
      * takes in the log, each line's timestamp, newline and offset anchor
      * included: what to pass as `pinnedBudgetChars` to
@@ -54,7 +69,21 @@ object ProcessExits {
      * the log applies costs the least useful line, not the exit that explains
      * this start. Add to it for any lines of the app's own that it also pins.
      */
-    fun maxBatchChars(maxRecords: Int = DEFAULT_MAX_RECORDS): Int {
+    // 3.0's signatures, kept so code compiled against them (Java, or a library built on 3.0) still
+    // links: a new defaulted parameter changes the JVM signature (Codex, PR #52). Hidden, so Kotlin
+    // source resolves to the current ones and nothing new can call these.
+    @Deprecated("3.0's signature, kept for binary compatibility", level = DeprecationLevel.HIDDEN)
+    fun maxBatchChars(maxRecords: Int = DEFAULT_MAX_RECORDS): Int = maxBatchChars(maxRecords, includeAnrStack = true)
+
+    @Deprecated("3.0's signature, kept for binary compatibility", level = DeprecationLevel.HIDDEN)
+    fun logRecent(
+        context: Context,
+        log: DebugLog,
+        includeDescription: Boolean = false,
+        maxRecords: Int = DEFAULT_MAX_RECORDS,
+    ) = logRecent(context, log, includeDescription, maxRecords, includeAnrStack = true)
+
+    fun maxBatchChars(maxRecords: Int = DEFAULT_MAX_RECORDS, includeAnrStack: Boolean = true): Int {
         requirePositive(maxRecords)
         // A count whose reserve can't be represented is refused rather than
         // wrapped: an overflowed Int is negative, and a negative reserve keeps
@@ -62,7 +91,8 @@ object ProcessExits {
         require(maxRecords <= MAX_RESERVABLE_RECORDS) {
             "maxRecords must be at most $MAX_RESERVABLE_RECORDS to have a reserve, was $maxRecords"
         }
-        return maxRecords * EXIT_LINE_CHARS + PACKAGE_LINE_CHARS
+        val stack = if (includeAnrStack) (ANR_TOP_FRAMES + ANR_APP_FRAMES) * STACK_LINE_CHARS else 0
+        return maxRecords * EXIT_LINE_CHARS + PACKAGE_LINE_CHARS + stack
     }
 
     /**
@@ -90,6 +120,20 @@ object ProcessExits {
      * [DebugLog.failure] and leaves a pinned line saying so, since a missing
      * section would otherwise read like one that was never wired up.
      *
+     * [includeAnrStack] adds, just before the newest ANR among them, where its
+     * main thread was stuck: the frames [ANR_TOP_FRAMES] and [ANR_APP_FRAMES]
+     * say, read from the trace the platform kept, one pinned line each. Before
+     * its exit rather than after, so any limit on pinned lines, which drops
+     * from the front, takes frames before the exit they belong to and never
+     * leaves frames without it (Codex, PR #52). A frame is
+     * a code location (class, method, file and line), never a value; each is
+     * still passed as an ordinary argument, so it stays on the device's own
+     * copy and is withheld from anything leaving it. Reading the trace is a
+     * file read too, so the same off-the-main-thread rule applies. On by
+     * default (maintainer, 2026-10-02): an ANR otherwise leaves only its reason
+     * in the log, and the stack is what says which code froze the screen.
+     * Reserve [maxBatchChars] with the same flag.
+     *
      * [maxRecords] must be positive. The platform reads 0 as "every record",
      * which no [maxBatchChars] reserve can hold.
      */
@@ -98,12 +142,15 @@ object ProcessExits {
         log: DebugLog,
         includeDescription: Boolean = false,
         maxRecords: Int = DEFAULT_MAX_RECORDS,
+        includeAnrStack: Boolean = true,
     ) {
         requirePositive(maxRecords)
         val activityManager = context.getSystemService(ActivityManager::class.java)
         record(
             log = log,
             includeDescription = includeDescription,
+            includeAnrStack = includeAnrStack,
+            appNamespace = appNamespaceOf(context),
             // pid 0 means any process of this package; asking by pid would miss
             // exactly the abrupt deaths this is for.
             exits = activityManager?.let { manager ->
@@ -129,23 +176,29 @@ object ProcessExits {
         val status: Int,
         val timestamp: Long,
         val description: String?,
+        // The platform's trace for an ANR, read only when its stack is asked for; null when it kept none.
+        val trace: () -> InputStream? = { null },
     )
 
     internal class PackageTimes(val lastUpdate: Long, val firstInstall: Long)
 
     private fun toExit(info: ApplicationExitInfo) =
-        Exit(info.reason, info.importance, info.status, info.timestamp, info.description)
+        Exit(info.reason, info.importance, info.status, info.timestamp, info.description, trace = info::getTraceInputStream)
 
     /**
      * The part [logRecent] shares between the apps, reachable without a
      * `Context`: this module's tests run on a plain JVM (see [DebugReport]).
      * [exits] answers newest first, as the platform does, and is null when
-     * there is no `ActivityManager` to ask.
+     * there is no `ActivityManager` to ask. [includeAnrStack] asks for the
+     * newest ANR's main-thread stack, [appNamespace] being where the app's own
+     * classes live, when that can be told (see [mainThreadFrames]).
      */
     internal fun record(
         log: DebugLog,
         includeDescription: Boolean,
         exits: (() -> List<Exit>)?,
+        includeAnrStack: Boolean = false,
+        appNamespace: String? = null,
         packageTimes: () -> PackageTimes,
     ) {
         // Recording off means off: not even the queries, whose answers would
@@ -177,7 +230,11 @@ object ProcessExits {
         } else {
             // Then the exits oldest first, reversing the platform's order. It
             // also reads like the rest of the log.
+            val stackFor = if (includeAnrStack) records.firstOrNull { it.reason == ApplicationExitInfo.REASON_ANR } else null
             records.asReversed().forEach { exit ->
+                // Just before the exit it explains: it matters less than the exit, so any limit
+                // on pinned lines, which drops from the front, takes it first.
+                if (exit === stackFor) logAnrStack(log, exit, appNamespace)
                 val fields = "processExit reason=%s importance=%s status=%s timestamp=%s"
                 val named = arrayOf<Any?>(
                     safe(exitReasonName(exit.reason)),
@@ -192,6 +249,95 @@ object ProcessExits {
                 }
             }
         }
+    }
+
+    private fun logAnrStack(log: DebugLog, exit: Exit, appNamespace: String?) {
+        val frames = try {
+            exit.trace()?.bufferedReader()?.use { mainThreadFrames(it.lineSequence(), appNamespace) }
+        } catch (e: IOException) {
+            log.failure(e, "anr trace read failed")
+            log.pinnedEvent("anrMainStack unavailable reason=%s", safe("readFailed"))
+            return
+        } catch (e: RuntimeException) {
+            // A trace whose file the system has since dropped can fail this way too.
+            log.failure(e, "anr trace read failed")
+            log.pinnedEvent("anrMainStack unavailable reason=%s", safe("readFailed"))
+            return
+        }
+        when {
+            frames == null -> log.pinnedEvent("anrMainStack unavailable reason=%s", safe("noTrace"))
+            frames.isEmpty() -> log.pinnedEvent("anrMainStack unavailable reason=%s", safe("noMainThread"))
+            // Plain arguments: code locations, but read from a file the system wrote, so the
+            // floor keeps them on the device's own copy. One line each: a log entry holds
+            // 2,000 characters, not the 14 frames at their bound.
+            else -> frames.forEach { (index, frame) -> log.pinnedEvent("anrMainStack #%s %s", index, frame) }
+        }
+    }
+
+    /**
+     * The frames of the `"main"` thread in an ANR trace worth keeping, with
+     * each one's position in the stack: the top [ANR_TOP_FRAMES], then the
+     * first [ANR_APP_FRAMES] of the app's own below them. Java frames (`at …`)
+     * and the lock lines between them (`- waiting to lock …`) count; native
+     * frames don't. Empty when the trace has no main thread.
+     *
+     * The app's own are those in [appNamespace], the package its `Application`
+     * class is in (not its application ID, which a build suffix like `.debug`
+     * changes). Where none is, as in a build whose classes R8 has renamed,
+     * they are those outside the platform's own packages ([PLATFORM_PREFIXES]),
+     * which no build renames: the app's code, or a library it bundles, either
+     * way readable with the build's mapping file (Codex, PR #52).
+     *
+     * Reads only as far as the main thread's section, which a trace writes
+     * first, so a trace of every thread costs no more than that one.
+     */
+    internal fun mainThreadFrames(lines: Sequence<String>, appNamespace: String?): List<Pair<Int, String>> {
+        val section = lines
+            .dropWhile { !it.startsWith("\"main\"") }
+            .drop(1)
+            .takeWhile { it.isNotBlank() }
+            .map { it.trim() }
+            .filter { it.startsWith("at ") || it.startsWith("- ") }
+            .map { boundedFrame(it.removePrefix("at ")) }
+            .withIndex()
+            .map { it.index to it.value }
+            .toList()
+        val top = section.take(ANR_TOP_FRAMES)
+        val below = section.drop(ANR_TOP_FRAMES)
+        val inNamespace = appNamespace?.let { namespace -> below.filter { it.second.startsWith("$namespace.") } }.orEmpty()
+        val app = inNamespace.ifEmpty { below.filter { (_, frame) -> !frame.startsWith("- ") && PLATFORM_PREFIXES.none(frame::startsWith) } }
+        return top + app.take(ANR_APP_FRAMES)
+    }
+
+    /**
+     * The package the app's own classes are in: its `Application` subclass's,
+     * which R8 keeps by name since the manifest names it. Null for the
+     * platform's own `Application`, whose package says nothing about the app's.
+     */
+    private fun appNamespaceOf(context: Context): String? =
+        context.applicationContext.javaClass.name.substringBeforeLast('.', "")
+            .takeIf { namespace -> namespace.isNotEmpty() && PLATFORM_PREFIXES.none { "$namespace.".startsWith(it) } }
+
+    /**
+     * The platform's packages: the boot classpath and the libraries an app
+     * build leaves as they are, so a frame in one is never the app's.
+     */
+    internal val PLATFORM_PREFIXES: List<String> = listOf(
+        "java.", "javax.", "jdk.", "sun.", "libcore.", "dalvik.", "android.", "com.android.",
+        "androidx.", "kotlin.", "kotlinx.",
+    )
+
+
+    /**
+     * [frame] cut to [MAX_FRAME_CHARS] and marked, so a line's size is bounded
+     * for [maxBatchChars]: unlike a throwable's message, the log doesn't bound a
+     * plain string argument itself. Stepped back off a high surrogate.
+     */
+    private fun boundedFrame(frame: String): String {
+        if (frame.length <= MAX_FRAME_CHARS) return frame
+        var cut = MAX_FRAME_CHARS
+        if (Character.isHighSurrogate(frame[cut - 1])) cut--
+        return frame.take(cut) + TRUNCATED
     }
 
     private fun logPackageTimes(log: DebugLog, packageTimes: () -> PackageTimes) {
@@ -334,6 +480,14 @@ object ProcessExits {
 
     private const val PACKAGE_LINE_CHARS = MAX_PACKAGE_MESSAGE_CHARS + LINE_ALLOWANCE_CHARS
 
+    /** The longest one frame line keeps of a frame, before the cut's marker. */
+    private const val MAX_FRAME_CHARS = 300
+
+    /** One stack line: its fixed text, the frame's number (at most an `Int`), and the bounded frame. */
+    private const val STACK_LINE_CHARS =
+        "anrMainStack # ".length + 11 + MAX_FRAME_CHARS + TRUNCATED.length + LINE_ALLOWANCE_CHARS
+
     /** The largest count whose [maxBatchChars] fits in an `Int`. */
-    private const val MAX_RESERVABLE_RECORDS = (Int.MAX_VALUE - PACKAGE_LINE_CHARS) / EXIT_LINE_CHARS
+    private const val MAX_RESERVABLE_RECORDS =
+        (Int.MAX_VALUE - PACKAGE_LINE_CHARS - (ANR_TOP_FRAMES + ANR_APP_FRAMES) * STACK_LINE_CHARS) / EXIT_LINE_CHARS
 }
