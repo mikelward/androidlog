@@ -108,6 +108,12 @@ jobs:
       - name: Verify the Maven merge guard
         run: ./scripts/merge-maven-tree-test.sh
 
+      # scripts/unshallow.sh runs from the session-start hook, which no CI job
+      # executes. Pins that a single-branch feature clone comes out complete
+      # with origin/main present, which the version derivation reads.
+      - name: Test the shallow-clone deepener
+        run: python3 scripts/unshallow_test.py
+
       # A guard against a *false pass* cannot be proven by a passing run. The
       # version this check replaced -- ported from snoozemo, where it had been
       # enforcing nothing -- went green with an androidx dependency present,
