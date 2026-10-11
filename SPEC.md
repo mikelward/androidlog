@@ -183,6 +183,13 @@ for.
   2026-10-11): the share is the user acting on the banner, and holding it up
   for a crash no report has room for leaves Dismiss the only way down. That
   crash's log stays on disk, still shareable.
+- **The banner never stays up over something the user cannot fix**
+  (maintainer, 2026-10-11). Once the user dismisses or shares, the banner
+  comes down even when a crash log cannot be renamed, read, or listed: the
+  log stays where it is, and the banner returns only when a later check reads
+  that file as a crash. A file that could not be renamed is remembered only
+  for the running process, so the next start raises it again; nothing more
+  durable is kept, since the cache can drop a record while keeping the file.
 - **A screenshot is an extra, never the report.** `deliver` may attach one,
   and the clipboard still carries the text alone, so everything needed to
   diagnose the bug is in the text.

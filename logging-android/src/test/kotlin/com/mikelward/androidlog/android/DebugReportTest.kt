@@ -502,30 +502,6 @@ class DebugReportTest {
     }
 
     @Test
-    fun `a share that cannot lower the banner is not reported as a failed dismissal`() {
-        // A crash whose rename is blocked keeps the banner up whatever acts on
-        // it. After a dismissal that is the dismissal's failure to report; after
-        // a share it is not, or the app shows a dismissal error for a share
-        // that worked (Codex, PR #58).
-        File(dir, "androidlog-prev-1.crash.log").writeText("the crash\n")
-        File(dir, "androidlog-prev-1.log/held").mkdirs()
-        val sink = sink()
-        sink.requestCrashRecompute()
-        sink.awaitIdle()
-        assertTrue("the premise: the banner is up", sink.unacknowledgedCrash)
-
-        val report = DebugReport.collect(log(), sink) { "the app section" }
-        DebugReport.settle(report, copied = true, launched = true) { sink.acknowledgeCrashesAfterShare() }
-        sink.awaitIdle()
-
-        assertTrue("the premise: the share could not lower it", sink.unacknowledgedCrash)
-        assertFalse(sink.storageOutcomes.crashDismissalFailed)
-        sink.acknowledgeCrashBanner()
-        sink.awaitIdle()
-        assertTrue("while a dismissal that could not is reported", sink.storageOutcomes.crashDismissalFailed)
-    }
-
-    @Test
     fun `a share lowers the banner for a crash the report carried`() {
         val crashed = File(dir, "androidlog-prev-1.crash.log").apply { writeText("the crash\n") }
         val sink = sink()
