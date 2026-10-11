@@ -88,22 +88,27 @@ object DebugReport {
     /**
      * The most a report may hold, the earlier runs included.
      *
-     * A report has to survive two Binder transfers, and it is the second that
-     * sets the bound. The clipboard copy carries the text once, as UTF-16 —
-     * two bytes a character. A text-only share carries it twice: starting the
-     * chooser copies `EXTRA_TEXT` into the intent's `ClipData`
-     * (`Intent.migrateExtraStreamToClipData`), so both copies ride in one
-     * transaction, four bytes a character. At this size that is about 240 KB of
-     * the 1 MB buffer the whole process shares with every other call in flight
-     * — room to spare on a busy device, where a report several times this size
-     * failed on both routes. (A screenshot report sets its own `ClipData`, so
-     * the migration is skipped and its text crosses once.)
+     * Set by where a report ends up, not by what carries it there: a report is
+     * read by pasting it, into a chat, an issue or an email, and a paste is
+     * kept whole only so far. Reports at the old 60,000 arrived cut at about
+     * their first 20,000 characters, so the newest of everything — the lines
+     * that explained the bug — was what went (bug reports, 2026-10-11). This
+     * is that bound less a tenth, for a limit only seen roughly and one that
+     * may count bytes rather than characters; lower it if a channel keeps
+     * less. It is the library's to set, so no app has to know it: a report is
+     * meant to arrive whole wherever it goes.
+     *
+     * It also clears the transfers on the way out with room to spare. A
+     * text-only share carries its text twice in one Binder transaction, four
+     * bytes a character (starting the chooser copies `EXTRA_TEXT` into the
+     * intent's `ClipData`, `Intent.migrateExtraStreamToClipData`), so this is
+     * about 72 KB of the 1 MB buffer the whole process shares.
      *
      * Enforced in [collect], so every [CollectedReport] is already inside it:
      * a cut at delivery could not know which part of the text is the prior run
      * the report consumes.
      */
-    const val MAX_REPORT_CHARS = 60_000
+    const val MAX_REPORT_CHARS = 18_000
 
     /**
      * The part of [MAX_REPORT_CHARS] the earlier runs may use, their heading
@@ -112,15 +117,48 @@ object DebugReport {
      * A fixed share rather than whatever the app's section leaves over, so the
      * runs are read — and a failure to read them logged — before the app's
      * section is built, where that section's own log can still carry the line.
-     * The rest is the app's: a section within
-     * `MAX_REPORT_CHARS - MAX_EARLIER_RUNS_CHARS` always arrives whole, and one
-     * with no earlier runs beside it can use all of [MAX_REPORT_CHARS].
+     * The rest is the app's, [APP_SECTION_CHARS].
      *
      * The newest part of the runs is kept, so what goes is the oldest: a crash
      * leaves its stack trace and the lines leading up to it at the end of its
-     * run.
+     * run. Why each earlier process ended is not in here but in this run's
+     * pinned lines ([logLines]), which is what lets this share stay small.
      */
-    const val MAX_EARLIER_RUNS_CHARS = 20_000
+    const val MAX_EARLIER_RUNS_CHARS = 4_000
+
+    /**
+     * The room an app's section always has whole: [MAX_REPORT_CHARS] less the
+     * earlier runs' share. One with no earlier runs beside it can use all of
+     * [MAX_REPORT_CHARS]; past that, [collect] cuts it from the middle.
+     *
+     * Budget each part of a section against this — a summary, a list capped to
+     * its newest or nearest few, and then the log, which takes whatever room is
+     * left ([logLines]) — so the cut never has to choose for you.
+     */
+    const val APP_SECTION_CHARS = MAX_REPORT_CHARS - MAX_EARLIER_RUNS_CHARS
+
+    /**
+     * This run's log for a report, within [budgetChars], each line counted
+     * with its newline: the ring's newest lines, preceded by any pinned lines
+     * the ring has since evicted, such as why the previous processes ended
+     * ([ProcessExits.logRecent]). [DebugLog.snapshot] reads the ring only, so
+     * a busy run would push those out of the report.
+     *
+     * The pinned lines are kept first, up to a whole process-exit batch
+     * ([ProcessExits.maxBatchChars]), since a smaller reserve would drop the
+     * oldest exits; the recent lines get the rest, newest kept, and whatever
+     * of the reserve the pinned lines did not need ([DebugLog.reportSnapshot]).
+     *
+     * Give it whatever the rest of the section left of [APP_SECTION_CHARS].
+     * An app that logs its exits with other than the defaults passes the
+     * matching [pinnedReserveChars] — `ProcessExits.maxBatchChars(n, ...)`
+     * for the `maxRecords = n` it logs with — or the oldest exits are cut.
+     */
+    fun logLines(
+        log: DebugLog,
+        budgetChars: Int = APP_SECTION_CHARS,
+        pinnedReserveChars: Int = ProcessExits.maxBatchChars(),
+    ): List<String> = log.reportSnapshot(budgetChars, pinnedReserveChars)
 
     /**
      * Reads the prior run, builds the report from it, and remembers whether the

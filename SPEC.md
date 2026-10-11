@@ -142,3 +142,36 @@ of them.
   to take anyway, rather than as a red build. `REDACTED_PLACEHOLDER` is the
   standing example: renamed to `OFF_DEVICE_PLACEHOLDER`, aliased, and removed
   no earlier than the next major.
+
+## Bug reports
+
+**A report is shared as a text body, and must arrive whole that way.** The
+point of the shared report is that a user of any of these apps can send it
+through whatever they already use — a chat, WhatsApp, a message, an email, an
+issue — by pasting it in or picking the app from the share sheet, as plain
+text, with no attachment. A report that only works as a file, or that a
+messaging app or a paste box cuts short, has failed at the one thing it is
+for.
+
+- **The library sets the size, not the app.** Every report `DebugReport.collect`
+  builds is held to `MAX_REPORT_CHARS`, chosen so the whole text survives being
+  pasted or sent as a message. Reports at 60,000 characters were cut at about
+  their first 20,000 when pasted (2026-10-11), taking the newest lines — the
+  ones that explained the bug — so the cap is 18,000, a tenth under where
+  they were cut, and lowered if a channel turns out to keep less. No consumer
+  sets a limit of its own; one that sizes its own report has opted out of
+  this guarantee.
+- **What fits is the most important part, so trimming never loses it.** A
+  report that has to shrink sheds the least useful text first and keeps, in
+  order: what build and state the app was in; why the previous processes
+  ended and any crash; the newest of the log, since the bug is what happened
+  last; then older lines and long lists. Each part has its own cap, so one
+  long part cannot crowd out another: the earlier runs get a fixed share,
+  newest kept, and the app's section the rest. Within that section an app
+  holds each part — a list to its nearest or newest few, with a count of the
+  rest — and the log takes the room left (`DebugReport.logLines`), why the
+  previous processes ended first, then the newest lines. The middle cut in
+  `collect` is a backstop, not the plan: what it takes was never chosen.
+- **A screenshot is an extra, never the report.** `deliver` may attach one,
+  and the clipboard still carries the text alone, so everything needed to
+  diagnose the bug is in the text.

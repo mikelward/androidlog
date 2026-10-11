@@ -118,6 +118,7 @@ open class DebugLog(
          */
         private const val MAX_MESSAGE_CHARS = 300
 
+
         /**
          * Stands in for an entry whose off-device rendering threw.
          *
@@ -850,45 +851,87 @@ open class DebugLog(
      */
     fun boundedSnapshot(pinnedBudgetChars: Int, recentBudgetChars: Int): List<String> =
         synchronized(buffer) {
-            val lines = buffer.toList()
-            val trimmed = anchoredTail(lines, recentBudgetChars)
-            // The originals the trim *stands for*, not the trim itself: its
-            // oldest line may have been clamped, and a clamp is a new [Line]
-            // that an identity set would fail to match against the pinned
-            // buffer's copy (Codex, PR #7). [anchoredTail] returns a suffix and
-            // only ever replaces this one element, so the last `trimmed.size`
-            // originals are exactly what it kept.
-            val originals = lines.takeLast(trimmed.size)
-            // A clamped line that is *also* pinned is handed to the pinned
-            // section rather than kept here cut short. Retaining it both ways
-            // writes it twice; retaining only the clamp leaves the persisted
-            // log holding a truncated start-up line while the reserve that
-            // exists to protect exactly that line sits unspent (Codex, PR #7).
-            // The clamp fires only when nothing else fit, so `trimmed` is a
-            // single element and giving it up empties the tail — the recent
-            // budget had one line to spend it on and that line has a better
-            // home.
-            val clamped = trimmed.isNotEmpty() && trimmed.first() !== originals.first()
-            // And only when the reserve will actually keep it. A pinned budget
-            // too small to hold anything makes the yield a deletion: the tail
-            // empties and the pinned trim then returns nothing, so the freshest
-            // event is in neither section (Codex, PR #7). Asking the trim
-            // itself, rather than comparing budgets here, keeps the two from
-            // disagreeing about what fits.
-            val yielded = clamped &&
-                pinnedBuffer.any { it === originals.first() } &&
-                anchoredTail(listOf(originals.first()), pinnedBudgetChars).isNotEmpty()
-            val tail = if (yielded) emptyList() else trimmed
-            // Identity, not equality: two entries a second apart can render to
-            // the same text, and dropping a pinned line because the tail holds
-            // an equal-looking one would lose a line that is genuinely gone
-            // from it. The same instance is in both buffers by construction.
-            val alreadyKept = Collections.newSetFromMap(IdentityHashMap<Line, Boolean>())
-            if (!yielded) alreadyKept += originals
-            val pinned =
-                anchoredTail(pinnedBuffer.filterNot { it in alreadyKept }, pinnedBudgetChars)
+            val (pinned, tail) = boundedParts(pinnedBudgetChars, recentBudgetChars)
             anchored(pinned + tail)
         }
+
+    /**
+     * [boundedSnapshot] within one budget, [budgetChars], of which up to
+     * [pinnedReserveChars] is held for pinned lines — and only as much of that
+     * as they actually take. The rest goes to the newest lines.
+     *
+     * For a report, where the budget is a share of something fixed and room
+     * nobody fills is lost. [boundedSnapshot] cannot hand an unused reserve on:
+     * which pinned lines it needs room for depends on the tail, and the tail on
+     * the room the reserve leaves. A pinned line the kept tail still carries is
+     * written once, there, so a fresh run whose start-up lines are among its
+     * newest would otherwise leave its whole reserve empty (Codex, PR #57).
+     * So the reserve shrinks to what the pinned section used and the trim runs
+     * again; a smaller reserve only lengthens the tail, so the pinned section
+     * can only need less. Under one monitor, so every pass reads the same
+     * buffers.
+     */
+    fun reportSnapshot(budgetChars: Int, pinnedReserveChars: Int): List<String> =
+        synchronized(buffer) {
+            val budget = budgetChars.coerceAtLeast(0)
+            var reserve = pinnedReserveChars.coerceIn(0, budget)
+            var parts = boundedParts(reserve, budget - reserve)
+            // Run to the fixed point, uncapped: a cap returns an unconverged
+            // split, room unused (Codex, PR #57). It ends without one: a pass
+            // continues only when the pinned section used less than its
+            // reserve, so the reserve strictly shrinks and cannot go below
+            // zero. It settles in a pass or two — the tail takes in the
+            // pinned lines nearest it, and the rest fit their smaller reserve.
+            while (true) {
+                val used = anchored(parts.first).sumOf { it.length + 1 }
+                if (used >= reserve) break
+                reserve = used
+                parts = boundedParts(reserve, budget - reserve)
+            }
+            anchored(parts.first + parts.second)
+        }
+
+    /** [boundedSnapshot]'s two sections, unanchored: the pinned lines the kept tail lacks, then that tail. Hold the monitor. */
+    private fun boundedParts(pinnedBudgetChars: Int, recentBudgetChars: Int): Pair<List<Line>, List<Line>> {
+        val lines = buffer.toList()
+        val trimmed = anchoredTail(lines, recentBudgetChars)
+        // The originals the trim *stands for*, not the trim itself: its
+        // oldest line may have been clamped, and a clamp is a new [Line]
+        // that an identity set would fail to match against the pinned
+        // buffer's copy (Codex, PR #7). [anchoredTail] returns a suffix and
+        // only ever replaces this one element, so the last `trimmed.size`
+        // originals are exactly what it kept.
+        val originals = lines.takeLast(trimmed.size)
+        // A clamped line that is *also* pinned is handed to the pinned
+        // section rather than kept here cut short. Retaining it both ways
+        // writes it twice; retaining only the clamp leaves the persisted
+        // log holding a truncated start-up line while the reserve that
+        // exists to protect exactly that line sits unspent (Codex, PR #7).
+        // The clamp fires only when nothing else fit, so `trimmed` is a
+        // single element and giving it up empties the tail — the recent
+        // budget had one line to spend it on and that line has a better
+        // home.
+        val clamped = trimmed.isNotEmpty() && trimmed.first() !== originals.first()
+        // And only when the reserve will actually keep it. A pinned budget
+        // too small to hold anything makes the yield a deletion: the tail
+        // empties and the pinned trim then returns nothing, so the freshest
+        // event is in neither section (Codex, PR #7). Asking the trim
+        // itself, rather than comparing budgets here, keeps the two from
+        // disagreeing about what fits.
+        val yielded = clamped &&
+            pinnedBuffer.any { it === originals.first() } &&
+            anchoredTail(listOf(originals.first()), pinnedBudgetChars).isNotEmpty()
+        val tail = if (yielded) emptyList() else trimmed
+        // Identity, not equality: two entries a second apart can render to
+        // the same text, and dropping a pinned line because the tail holds
+        // an equal-looking one would lose a line that is genuinely gone
+        // from it. The same instance is in both buffers by construction.
+        val alreadyKept = Collections.newSetFromMap(IdentityHashMap<Line, Boolean>())
+        if (!yielded) alreadyKept += originals
+        val pinned =
+            anchoredTail(pinnedBuffer.filterNot { it in alreadyKept }, pinnedBudgetChars)
+        return pinned to tail
+    }
 
     /**
      * The newest of [lines] whose *rendering* fits [budgetChars] — the lines

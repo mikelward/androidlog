@@ -343,4 +343,109 @@ class DebugReportTest {
         assertEquals("text/plain", content.mimeType)
         assertFalse("a text-only report grants nothing", content.grantRead)
     }
+
+    // -------------------------------------------------------- report size
+
+    @Test
+    fun `a report fits what a paste keeps whole`() {
+        // Pasted reports at 60,000 were kept to about their first 20,000
+        // characters; the cap has to sit below that, with room to spare.
+        assertTrue(DebugReport.MAX_REPORT_CHARS <= 18_000)
+        assertEquals(
+            DebugReport.MAX_REPORT_CHARS,
+            DebugReport.APP_SECTION_CHARS + DebugReport.MAX_EARLIER_RUNS_CHARS,
+        )
+        // Room for a whole process-exit batch and more besides.
+        assertTrue(DebugReport.APP_SECTION_CHARS > ProcessExits.maxBatchChars())
+    }
+
+    // ------------------------------------------------------------ log lines
+
+    @Test
+    fun `the log keeps how the run began when a busy run evicted it`() {
+        val log = log()
+        log.pinnedEvent("processExit %s", "crash")
+        repeat(DebugLog.DEFAULT_MAX_ENTRIES * 2) { log.event("busy %s", it) }
+        // The premise: the ring alone no longer has it.
+        assertFalse(log.snapshot().any { "processExit" in it })
+
+        val lines = DebugReport.logLines(log, budgetChars = 4_000)
+
+        val exit = lines.indexOfFirst { "processExit" in it }
+        assertTrue(lines.toString(), exit >= 0 && exit < lines.indexOfFirst { "busy" in it })
+        assertTrue(lines.last(), lines.last().endsWith("busy ${DebugLog.DEFAULT_MAX_ENTRIES * 2 - 1}"))
+        assertTrue(lines.sumOf { it.length + 1 } <= 4_000)
+    }
+
+    @Test
+    fun `a run with nothing pinned gives the whole budget to its newest lines`() {
+        val log = log()
+        repeat(DebugLog.DEFAULT_MAX_ENTRIES) { log.event("busy %s", it) }
+
+        val lines = DebugReport.logLines(log, budgetChars = 2_000)
+
+        assertEquals(log.boundedSnapshot(pinnedBudgetChars = 0, recentBudgetChars = 2_000), lines)
+        assertTrue(lines.sumOf { it.length + 1 } > 1_900)
+    }
+
+    @Test
+    fun `a budget with no room keeps nothing rather than failing`() {
+        val log = log()
+        log.pinnedEvent("processExit %s", "crash")
+        log.event("busy")
+
+        assertEquals(emptyList<String>(), DebugReport.logLines(log, budgetChars = -1))
+    }
+
+    @Test
+    fun `start-up lines still among the newest leave their reserve to the log`() {
+        // A fresh run: its start-up lines are pinned and still its newest, so
+        // the tail carries them and the reserve held for them goes unneeded.
+        val log = log()
+        repeat(100) { log.event("busy %s %s", it, "x".repeat(100)) }
+        repeat(5) { log.pinnedEvent("started %s %s", it, "y".repeat(1_000)) }
+
+        val lines = DebugReport.logLines(log, budgetChars = 10_000)
+        val used = lines.sumOf { it.length + 1 }
+
+        assertEquals(5, lines.count { "started " in it })
+        // Short of the budget by less than one line, not by the reserve.
+        assertTrue("$used", used in 9_800..10_000)
+    }
+
+    @Test
+    fun `pinned lines spread through the run still leave the log full`() {
+        // Each larger tail takes in one more group of pinned lines, so the
+        // split settles only after a dozen passes; none of the room is lost.
+        val log = log()
+        repeat(8) { group ->
+            repeat(4) { log.pinnedEvent("started %s-%s %s", group, it, "y".repeat(265)) }
+            repeat(8) { log.event("busy %s-%s", group, it) }
+        }
+
+        val lines = DebugReport.logLines(log, budgetChars = 12_000)
+        val used = lines.sumOf { it.length + 1 }
+
+        assertTrue("$used", used in 11_400..12_000)
+        assertTrue(lines.last(), lines.last().endsWith("busy 7-7"))
+    }
+
+    @Test
+    fun `a larger exit batch keeps its oldest exits when its reserve is passed`() {
+        val log = log()
+        val records = ProcessExits.DEFAULT_MAX_RECORDS * 4
+        repeat(records) { log.pinnedEvent("processExit %s %s", it, "z".repeat(400)) }
+        repeat(DebugLog.DEFAULT_MAX_ENTRIES) { log.event("busy %s", it) }
+        // The premise: the default reserve is too small for this many.
+        assertTrue(records * 430 > ProcessExits.maxBatchChars())
+
+        val lines = DebugReport.logLines(
+            log,
+            budgetChars = 14_000,
+            pinnedReserveChars = ProcessExits.maxBatchChars(records),
+        )
+
+        assertTrue(lines.any { "processExit 0 " in it })
+        assertEquals(records, lines.count { "processExit " in it })
+    }
 }

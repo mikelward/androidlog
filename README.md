@@ -429,15 +429,22 @@ Two calls rather than one `suspend` function, because this library takes no
 third-party runtime dependency and so cannot hop threads for you — your own
 scope is a better place for that choice anyway.
 
-**A report is at most 60,000 characters** (`DebugReport.MAX_REPORT_CHARS`), so
-it survives the clipboard and the share sheet: a text-only share carries its
-text twice in one Binder transaction, and a report several times this size
-failed on both routes. The earlier runs get up to 20,000 of it
-(`MAX_EARLIER_RUNS_CHARS`), newest lines kept; a run trimmed out entirely stays
-on disk for the next report rather than being consumed by one that never carried
-it. The rest is yours. Keep your section within 40,000 characters and it always
-arrives whole; past that, `collect` cuts it from the middle, at line breaks
-where it can, and says how many characters went.
+**A report is at most 18,000 characters** (`DebugReport.MAX_REPORT_CHARS`), so
+it arrives whole wherever it is pasted — a chat, an issue, an email — not just
+through the share sheet. Reports at the old 60,000 were cut at about their
+first 20,000 characters when pasted, which took the newest lines. The earlier
+runs get up to 4,000 of it (`MAX_EARLIER_RUNS_CHARS`), newest lines kept; a run
+trimmed out entirely stays on disk for the next report rather than being
+consumed by one that never carried it. The rest is yours,
+`DebugReport.APP_SECTION_CHARS` (14,000): keep your section within it and it
+always arrives whole; past that, `collect` cuts it from the middle, at line
+breaks where it can, and says how many characters went.
+
+So the cut never has to choose for you, cap each part of your section: a
+summary, any list held to its newest or nearest few with a count of the rest,
+and then this run's log, which takes whatever room is left.
+`DebugReport.logLines(log, budgetChars)` gives you that log: why the previous
+processes ended (pinned) first, then the newest lines.
 
 An app building its own report reads the earlier runs the same way, with
 `DebugFileSink.readPreviousRun(budgetChars)`. Bound the read rather than
