@@ -12,7 +12,7 @@ import com.mikelward.androidlog.DebugLog
  *
  * Reported rather than assumed, because the two delivery routes fail
  * independently and the difference decides what the user must be told — and
- * whether the prior run may be consumed. `ACTION_SEND` gives no send or
+ * whether the crash banner comes down. `ACTION_SEND` gives no send or
  * selection callback, so a launched chooser is not proof anything was sent;
  * only the clipboard copy is a delivery the user can still get at afterwards.
  */
@@ -23,8 +23,7 @@ enum class ShareOutcome {
     /**
      * The clipboard has the report but no chooser opened. **Say so.** The user
      * saw no share sheet and no error, so without a word they assume the tap did
-     * nothing and share again — and the second report carries no prior run,
-     * overwriting the clipboard copy that did.
+     * nothing and share again.
      */
     COPIED_ONLY,
 
@@ -38,11 +37,10 @@ enum class ShareOutcome {
 /**
  * A built report, and the prior run it actually carries.
  *
- * The pairing is the point: [DebugReport.deliver] consumes that run only once
- * the report containing it is somewhere the user can still get it. A report
- * built without one — the fallback below — carries `null` and so can never
- * consume anything, which is what stops a failed collection from deleting the
- * crash log the user tapped Share for.
+ * The pairing is the point: [DebugReport.deliver] lowers the crash banner only
+ * for a report that carried the earlier runs, once it is somewhere the user can
+ * still get it. A report built without them carries `null`, so the banner
+ * stays up for the next share.
  */
 class CollectedReport internal constructor(
     val text: String,
@@ -51,17 +49,17 @@ class CollectedReport internal constructor(
      * The sink the run came from, carried rather than asked for again.
      *
      * [DebugReport.deliver] used to take its own sink parameter, which let a
-     * caller collect from one and deliver against another — or against null,
-     * leaving a delivered run unconsumed and appended to the next report too
-     * (Codex, PR #8). Two arguments that must agree are two arguments that can
-     * disagree; one that travels with the run cannot.
+     * caller collect from one and deliver against another (Codex, PR #8). Two
+     * arguments that must agree are two arguments that can disagree; one that
+     * travels with the run cannot.
      */
     internal val sink: DebugFileSink?,
 )
 
 /**
  * Delivering a debug report: the two routes, the failure the user is told
- * about, and the rule for when the prior run may be consumed.
+ * about, and the rule for when the crash banner comes down. Sharing deletes
+ * nothing: the earlier runs are kept under [DebugFileSink]'s own retention.
  *
  * **What the report says is the app's, not this library's** — a decision
  * snapshot, a snooze summary, a rule listing are each app domain, and
@@ -105,8 +103,8 @@ object DebugReport {
      * about 72 KB of the 1 MB buffer the whole process shares.
      *
      * Enforced in [collect], so every [CollectedReport] is already inside it:
-     * a cut at delivery could not know which part of the text is the prior run
-     * the report consumes.
+     * a cut at delivery could not know which part of the text is the prior
+     * run.
      */
     const val MAX_REPORT_CHARS = 18_000
 
@@ -167,21 +165,20 @@ object DebugReport {
      * [buildPayload] writes what the *app* wants to say — its own state, in its
      * own words. The prior run is **appended by this function**, under
      * [heading], rather than passed in for the builder to include: that is what
-     * makes carrying it and consuming it the same fact rather than two facts
-     * that can disagree. An app wanting no prior run in its report passes a
-     * null [sink], which reads nothing and so consumes nothing.
+     * makes carrying it and lowering the crash banner for it the same fact
+     * rather than two facts that can disagree. An app wanting no prior run in
+     * its report passes a null [sink], which reads nothing.
      *
      * A failure inside [buildPayload] is contained: a report is most useful
      * after something has already gone wrong, so a failure while inspecting
      * that state must never become a second one. The app's section then names
      * the failure's *type* only — a stand-in, not a floor: the failure is
      * recorded through [log] one line earlier, with its message, into the run
-     * this report is already carrying. And the prior run is still appended and
-     * still consumed, because it is still there to read.
+     * this report is already carrying. And the prior run is still appended,
+     * because it is still there to read.
      *
      * The report is held to [MAX_REPORT_CHARS]. The earlier runs are read to
-     * fit [MAX_EARLIER_RUNS_CHARS], which keeps the files whose lines were all
-     * trimmed away out of what the report consumes; the app's section gets the
+     * fit [MAX_EARLIER_RUNS_CHARS], newest kept; the app's section gets the
      * rest, and is cut from the middle only if it outgrows that ([keepingEnds]).
      * An app that budgets its own section never sees the cut.
      */
@@ -198,14 +195,13 @@ object DebugReport {
         val run = when {
             sink == null -> null
             runBudget <= 0 -> {
-                // Reading nothing consumes nothing, so the runs wait for a
-                // report with room for them rather than going out empty.
+                // The runs wait for a report with room for them rather than
+                // going out empty.
                 log.warning("An earlier-runs heading of %s characters leaves no room for the runs", heading.length)
                 null
             }
-            // Bounded in the read, not after it: a trim of the finished text
-            // would leave the handle consuming runs the report no longer
-            // carries, which is how a crash log gets deleted unsent.
+            // Bounded in the read, not after it, so the handle names only the
+            // runs the text carries.
             else -> runCatching { sink.readPreviousRun(runBudget) }
                 .onFailure { log.failure(it, "Earlier runs could not be read for a report") }
                 .getOrNull()
@@ -216,16 +212,15 @@ object DebugReport {
                 "[the report could not be built: ${failure.javaClass.name}]"
             }
         // Appended here rather than handed to [buildPayload], so that carrying
-        // the run and consuming it are the same fact.
+        // the run and lowering the crash banner for it are the same fact.
         //
         // Passing it in and trusting the returned text to contain it is the
-        // shape that loses a crash log: a payload builder that ignores its
+        // shape that hides a crash: a payload builder that ignores its
         // argument — an app reporting current state only, or one that simply
-        // forgets — still gets the run marked as delivered, and the first
-        // successful clipboard copy deletes a diagnostic nobody ever saw
-        // (Codex, PR #8). Nothing the library can inspect distinguishes that
-        // from an honest inclusion, so it does not have to: the library writes
-        // the section itself.
+        // forgets — still gets the run marked as delivered, and the banner
+        // comes down for a crash nobody was sent (Codex, PR #8). Nothing the
+        // library can inspect distinguishes that from an honest inclusion, so
+        // it does not have to: the library writes the section itself.
         val text = if (run == null) {
             keepingEnds(own, MAX_REPORT_CHARS)
         } else {
@@ -284,15 +279,16 @@ object DebugReport {
     }
 
     /**
-     * Copies the report to the clipboard, opens the share chooser, and consumes
-     * the prior run only if that landed somewhere retained. **Touches the
-     * clipboard — call it on the main thread.**
+     * Copies the report to the clipboard and opens the share chooser, then
+     * lowers the crash banner if the copy landed ([settle]). It deletes
+     * nothing: the earlier runs stay on disk under [DebugFileSink]'s own
+     * retention. **Touches the clipboard — call it on the main thread.**
      *
-     * The clear is gated on the *clipboard*, not the chooser, for the reason in
-     * [ShareOutcome]: the chooser reports nothing back, so treating its launch
-     * as delivery would consume a crash log on the strength of a sheet the user
-     * may have dismissed. Both routes are attempted regardless of whether the
-     * other worked.
+     * The banner is gated on the *clipboard*, not the chooser, for the reason
+     * in [ShareOutcome]: the chooser reports nothing back, so treating its
+     * launch as delivery would lower the banner on the strength of a sheet the
+     * user may have dismissed. Both routes are attempted regardless of whether
+     * the other worked.
      *
      * An optional [screenshot] rides along in the chooser as an `image/png`
      * attachment, so a report can show what the user was looking at. It is a
@@ -319,12 +315,26 @@ object DebugReport {
         val copied = copyToClipboard(context, log, clipboardLabel, report.text)
         val launched =
             startChooser(context, log, subject, chooserTitle, clipboardLabel, report.text, screenshot)
-        return settle(report, copied, launched) { report.sink?.clearPreviousRun(it) }
+        return settle(report, copied, launched) { report.sink?.acknowledgeCrashesAfterShare() }
     }
 
     /**
      * The rule the two routes feed: what the caller is told, and whether the
-     * prior run is consumed.
+     * crash banner comes down.
+     *
+     * **Sharing deletes nothing.** Whether a report was actually sent is
+     * something this library cannot know: the chooser reports nothing back, and
+     * a clipboard copy is only a copy. So the earlier runs stay on disk under
+     * their own retention rule ([DebugFileSink] keeps the newest few runs), and
+     * a later report may carry some of the same lines again. What a landed copy
+     * does do is lower the crash banner ([DebugFileSink.acknowledgeCrashesAfterShare]),
+     * for every crash, a crash too old for the report included (maintainer,
+     * 2026-10-11): the share is the user acting on the banner, and that crash's
+     * log stays on disk, still shareable. Not when the report carried no earlier
+     * runs at all, which is a read that failed, timed out or could not list the
+     * directory, and so may work on the next share. A run the read reached but could not open is different: the
+     * report says so, and holding the banner up for a file that may never open
+     * leaves the user nothing to do but dismiss it (maintainer, 2026-10-11).
      *
      * Separated from [deliver] so it is reachable without a `Context`. This
      * module's tests run on a plain JVM with no Robolectric, and this — not the
@@ -335,12 +345,12 @@ object DebugReport {
         report: CollectedReport,
         copied: Boolean,
         launched: Boolean,
-        clear: (PreviousRun) -> Unit,
+        acknowledgeCrashes: () -> Unit,
     ): ShareOutcome {
-        // Only once the report is retained where the user can still reach it.
-        // If the copy failed, the log stays for the next attempt rather than
-        // being spent on a report that reached nobody.
-        if (copied) report.run?.let(clear)
+        // Only once the report is retained where the user can still reach it,
+        // and only when its read reached the earlier runs: a directory that
+        // could not be listed may list next time.
+        if (copied && report.run?.listed == true) acknowledgeCrashes()
         return when {
             launched -> ShareOutcome.SHARED
             copied -> ShareOutcome.COPIED_ONLY

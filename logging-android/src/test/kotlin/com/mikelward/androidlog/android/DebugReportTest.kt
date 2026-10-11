@@ -38,86 +38,98 @@ class DebugReportTest {
         }
     }
 
-    // ------------------------------------------------------- consuming a run
+    // ---------------------------------------------- what a share changes
 
     @Test
-    fun `a run is consumed only once the report carrying it is retained`() {
+    fun `a landed copy lowers the crash banner for the runs it carried`() {
         val sink = sinkWithAPriorRun()
         val report = DebugReport.collect(log(), sink) { "report" }
-        val cleared = mutableListOf<PreviousRun>()
+        var acknowledged = 0
 
-        val outcome = DebugReport.settle(report, copied = true, launched = true) { cleared += it }
+        val outcome = DebugReport.settle(report, copied = true, launched = true) { acknowledged++ }
 
         assertEquals(ShareOutcome.SHARED, outcome)
-        assertEquals(1, cleared.size)
+        assertEquals(1, acknowledged)
     }
 
     @Test
-    fun `a run survives a report that reached nobody`() {
-        // The clipboard is the retained route, so a failed copy means the log
-        // stays for the next attempt rather than being spent on a report the
-        // user cannot get at.
+    fun `a report that reached nobody leaves the banner up`() {
+        // The clipboard is the retained route, so a failed copy means the
+        // crash still has not reached anywhere the user can get at it.
         val sink = sinkWithAPriorRun()
         val report = DebugReport.collect(log(), sink) { "report" }
-        val cleared = mutableListOf<PreviousRun>()
+        var acknowledged = 0
 
-        val outcome = DebugReport.settle(report, copied = false, launched = true) { cleared += it }
+        val outcome = DebugReport.settle(report, copied = false, launched = true) { acknowledged++ }
 
         assertEquals(ShareOutcome.SHARED, outcome)
-        assertTrue(cleared.toString(), cleared.isEmpty())
+        assertEquals(0, acknowledged)
     }
 
     @Test
-    fun `a chooser that never opened does not consume the run on its own`() {
+    fun `a chooser that never opened does not lower the banner on its own`() {
         val sink = sinkWithAPriorRun()
         val report = DebugReport.collect(log(), sink) { "report" }
-        val cleared = mutableListOf<PreviousRun>()
+        var acknowledged = 0
 
-        val outcome = DebugReport.settle(report, copied = false, launched = false) { cleared += it }
+        val outcome = DebugReport.settle(report, copied = false, launched = false) { acknowledged++ }
 
         assertEquals(ShareOutcome.FAILED, outcome)
-        assertTrue(cleared.toString(), cleared.isEmpty())
+        assertEquals(0, acknowledged)
     }
 
     @Test
     fun `a clipboard copy with no chooser is reported so the user is not left guessing`() {
         val sink = sinkWithAPriorRun()
         val report = DebugReport.collect(log(), sink) { "report" }
-        val cleared = mutableListOf<PreviousRun>()
+        var acknowledged = 0
 
-        val outcome = DebugReport.settle(report, copied = true, launched = false) { cleared += it }
+        val outcome = DebugReport.settle(report, copied = true, launched = false) { acknowledged++ }
 
-        // Consumed, because the clipboard is a delivery the user can still get
-        // at -- which is exactly why they have to be told it happened.
+        // The banner comes down, because the clipboard is a copy the user can
+        // still get at -- which is exactly why they have to be told it happened.
         assertEquals(ShareOutcome.COPIED_ONLY, outcome)
-        assertEquals(1, cleared.size)
+        assertEquals(1, acknowledged)
+    }
+
+    @Test
+    fun `sharing deletes nothing, so the runs are still there for the next report`() {
+        // Whether a report was sent is unknowable here: the chooser reports
+        // nothing back. So the runs stay on disk under their own retention.
+        val sink = sinkWithAPriorRun()
+        val report = DebugReport.collect(log(), sink) { "report" }
+
+        DebugReport.settle(report, copied = true, launched = true) { sink.acknowledgeCrashesAfterShare() }
+        sink.awaitIdle()
+
+        assertTrue(report.text, "an earlier run" in report.text)
+        assertTrue(DebugReport.collect(log(), sink) { "again" }.text.contains("an earlier run"))
     }
 
     // -------------------------------------------------- a failed collection
 
     @Test
-    fun `a failed app section still carries and consumes the prior run`() {
+    fun `a failed app section still carries the prior run`() {
         // The app's own state is what failed to render; the prior run was read
-        // and is appended regardless, so it really is delivered and consuming
-        // it is honest. The failure must not cost the diagnostic the report
-        // exists to carry.
+        // and is appended regardless, so it really is delivered and lowering
+        // the banner for it is honest. The failure must not cost the
+        // diagnostic the report exists to carry.
         val sink = sinkWithAPriorRun()
         val report = DebugReport.collect(log(), sink) { error("no payload for you") }
-        val cleared = mutableListOf<PreviousRun>()
+        var acknowledged = 0
 
-        val outcome = DebugReport.settle(report, copied = true, launched = true) { cleared += it }
+        val outcome = DebugReport.settle(report, copied = true, launched = true) { acknowledged++ }
 
         assertEquals(ShareOutcome.SHARED, outcome)
         assertTrue(report.text, "an earlier run" in report.text)
-        assertEquals(1, cleared.size)
+        assertEquals(1, acknowledged)
     }
 
     @Test
     fun `a payload builder that ignores the prior run still delivers it`() {
         // The library appends it rather than trusting the builder to, so
-        // carrying it and consuming it cannot come apart: an app reporting only
-        // current state used to have the run consumed for a report that never
-        // contained it (Codex, PR #8).
+        // carrying it and lowering the banner for it cannot come apart (Codex,
+        // PR #8).
         val sink = sinkWithAPriorRun()
 
         val report = DebugReport.collect(log(), sink) { "current state only" }
@@ -146,13 +158,28 @@ class DebugReportTest {
     }
 
     @Test
-    fun `a report built without a prior run has nothing to consume`() {
+    fun `a report built without a prior run leaves the banner alone`() {
         val report = DebugReport.collect(log(), sink()) { "report" }
-        val cleared = mutableListOf<PreviousRun>()
+        var acknowledged = 0
 
-        DebugReport.settle(report, copied = true, launched = true) { cleared += it }
+        DebugReport.settle(report, copied = true, launched = true) { acknowledged++ }
 
-        assertTrue(cleared.toString(), cleared.isEmpty())
+        assertEquals(0, acknowledged)
+    }
+
+    @Test
+    fun `a report that could not list the earlier runs leaves the banner up`() {
+        // A directory that could not be listed may list on the next share, so
+        // a report carrying only that notice is not the user's answer to a
+        // crash it never reached (Codex, PR #58).
+        val unlistable = File(dir, "not-a-directory").apply { writeText("x") }
+        val report = DebugReport.collect(log(), DebugFileSink(log(), unlistable)) { "report" }
+        assertTrue("the premise: it says so", "could not be listed" in report.text)
+        var acknowledged = 0
+
+        DebugReport.settle(report, copied = true, launched = true) { acknowledged++ }
+
+        assertEquals(0, acknowledged)
     }
 
     @Test
@@ -270,7 +297,7 @@ class DebugReportTest {
     }
 
     @Test
-    fun `a run the report's share left out is not consumed by it`() {
+    fun `a share keeps every run on disk, shown or not`() {
         val (sink, older, newer) = sinkWithAShortRunBehindALongOne()
         // The premise: the persisted budget alone would have carried it, so it
         // is the report's share that leaves it out.
@@ -278,11 +305,11 @@ class DebugReportTest {
 
         val report = DebugReport.collect(log(), sink) { "the app section" }
         assertFalse(report.text, "the oldest run" in report.text)
-        DebugReport.settle(report, copied = true, launched = true) { sink.clearPreviousRun(it) }
+        DebugReport.settle(report, copied = true, launched = true) { sink.acknowledgeCrashesAfterShare() }
         sink.awaitIdle()
 
         assertTrue("the run nobody was sent survives", older.exists())
-        assertFalse("the run that was sent does not", newer.exists())
+        assertTrue("so does the run that was sent", newer.exists())
     }
 
     @Test
@@ -293,11 +320,11 @@ class DebugReportTest {
         val report = DebugReport.collect(log, sink, heading = "=".repeat(DebugReport.MAX_EARLIER_RUNS_CHARS)) {
             "the app section"
         }
-        val cleared = mutableListOf<PreviousRun>()
-        DebugReport.settle(report, copied = true, launched = true) { cleared += it }
+        var acknowledged = 0
+        DebugReport.settle(report, copied = true, launched = true) { acknowledged++ }
 
         assertEquals("the app section", report.text)
-        assertTrue(cleared.toString(), cleared.isEmpty())
+        assertEquals(0, acknowledged)
         assertTrue(log.snapshot().toString(), log.snapshot().any { "leaves no room for the runs" in it })
         // And an ordinary heading still carries them.
         assertTrue(DebugReport.collect(log(), sink) { "again" }.text.contains("an earlier run"))
@@ -447,5 +474,68 @@ class DebugReportTest {
 
         assertTrue(lines.any { "processExit 0 " in it })
         assertEquals(records, lines.count { "processExit " in it })
+    }
+
+    @Test
+    fun `a share lowers the banner for a crash too old for the report, and keeps its log`() {
+        // The share is the user acting on the banner; holding it up for a
+        // crash no report has room for leaves Dismiss the only way down
+        // (maintainer, 2026-10-11).
+        val older = File(dir, "androidlog-prev-1.crash.log").apply { writeText("the old crash\n") }
+        val newer = File(dir, "androidlog-prev-2.log").apply {
+            writeText(lines(30_000, "talkative") + "\nthe newest line\n")
+        }
+        assertTrue(older.setLastModified(1_000L))
+        assertTrue(newer.setLastModified(2_000L))
+        val sink = sink()
+
+        val report = DebugReport.collect(log(), sink) { "the app section" }
+        assertFalse("the premise: the report has no room for it", "the old crash" in report.text)
+        DebugReport.settle(report, copied = true, launched = true) { sink.acknowledgeCrashesAfterShare() }
+        sink.awaitIdle()
+
+        assertFalse("its banner is down", sink.unacknowledgedCrash)
+        assertTrue(
+            "and its log is kept, still shareable",
+            File(dir, "androidlog-prev-1.log").readText().contains("the old crash"),
+        )
+    }
+
+    @Test
+    fun `a share that cannot lower the banner is not reported as a failed dismissal`() {
+        // A crash whose rename is blocked keeps the banner up whatever acts on
+        // it. After a dismissal that is the dismissal's failure to report; after
+        // a share it is not, or the app shows a dismissal error for a share
+        // that worked (Codex, PR #58).
+        File(dir, "androidlog-prev-1.crash.log").writeText("the crash\n")
+        File(dir, "androidlog-prev-1.log/held").mkdirs()
+        val sink = sink()
+        sink.requestCrashRecompute()
+        sink.awaitIdle()
+        assertTrue("the premise: the banner is up", sink.unacknowledgedCrash)
+
+        val report = DebugReport.collect(log(), sink) { "the app section" }
+        DebugReport.settle(report, copied = true, launched = true) { sink.acknowledgeCrashesAfterShare() }
+        sink.awaitIdle()
+
+        assertTrue("the premise: the share could not lower it", sink.unacknowledgedCrash)
+        assertFalse(sink.storageOutcomes.crashDismissalFailed)
+        sink.acknowledgeCrashBanner()
+        sink.awaitIdle()
+        assertTrue("while a dismissal that could not is reported", sink.storageOutcomes.crashDismissalFailed)
+    }
+
+    @Test
+    fun `a share lowers the banner for a crash the report carried`() {
+        val crashed = File(dir, "androidlog-prev-1.crash.log").apply { writeText("the crash\n") }
+        val sink = sink()
+
+        val report = DebugReport.collect(log(), sink) { "the app section" }
+        assertTrue(report.text, "the crash" in report.text)
+        DebugReport.settle(report, copied = true, launched = true) { sink.acknowledgeCrashesAfterShare() }
+        sink.awaitIdle()
+
+        assertFalse("its banner is down", crashed.exists())
+        assertTrue("and its log is kept", File(dir, "androidlog-prev-1.log").exists())
     }
 }

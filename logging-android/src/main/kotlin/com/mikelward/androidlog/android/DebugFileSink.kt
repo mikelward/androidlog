@@ -198,6 +198,12 @@ class PreviousRun internal constructor(
      * without matching on a sentence.
      */
     val complete: Boolean,
+    /**
+     * Whether the read reached the runs at all. False when the directory could
+     * not be listed, which a later read may well manage: a report that carried
+     * nothing but that notice does not lower the crash banner (Codex, PR #58).
+     */
+    internal val listed: Boolean = true,
 )
 
 class DebugFileSink internal constructor(
@@ -1465,8 +1471,8 @@ class DebugFileSink internal constructor(
         // Every answer passes through here, so a text over the budget -- a
         // notice longer than a tiny budget -- is no answer rather than an
         // oversized one. Null consumes nothing, which is the safe direction.
-        fun handleFor(text: String?, files: MutableList<File>, complete: Boolean) =
-            this@DebugFileSink.handleFor(text?.takeIf { it.length <= budgetChars }, files, complete)
+        fun handleFor(text: String?, files: MutableList<File>, complete: Boolean, listed: Boolean = true) =
+            this@DebugFileSink.handleFor(text?.takeIf { it.length <= budgetChars }, files, complete, listed)
         // The listing itself, not the best-effort view: a directory that could
         // not be read is a different fact from one with nothing in it, and
         // collapsing them here made an unavailable prior log read as no prior log
@@ -1478,7 +1484,7 @@ class DebugFileSink internal constructor(
             log.warning("Earlier runs could not be listed")
             // Incomplete in the strongest sense: not one run was accounted for,
             // and every one of them is still on disk.
-            return handleFor("[earlier runs could not be listed]", mutableListOf(), complete = false)
+            return handleFor("[earlier runs could not be listed]", mutableListOf(), complete = false, listed = false)
         }
         // Kept per file rather than flattened, so the bound below can be
         // attributed back to the file whose lines it dropped.
@@ -1579,9 +1585,14 @@ class DebugFileSink internal constructor(
      * nothing*, not *the read failed*, which is what [readPreviousRun] answers
      * null for when its own wait does not complete.
      */
-    private fun handleFor(text: String?, files: MutableList<File>, complete: Boolean): PreviousRun? =
+    private fun handleFor(
+        text: String?,
+        files: MutableList<File>,
+        complete: Boolean,
+        listed: Boolean = true,
+    ): PreviousRun? =
         text?.let {
-            PreviousRun(it, files, complete).also { handle ->
+            PreviousRun(it, files, complete, listed).also { handle ->
                 liveHandles()
                 outstanding += WeakReference(handle)
             }
@@ -2041,12 +2052,55 @@ class DebugFileSink internal constructor(
      * attempt per debounced write, and it stops the moment it succeeds.
      */
     private fun standDownStillNeeded(): Boolean {
-        // A run the rotation left in `debug.log` is still there to protect, and
-        // only a share ends that — [clearPreviousRun] owns the resume for it.
-        if (retainedPreviousRun() != null) return true
+        // A run the rotation left in `debug.log` is still there to protect, so
+        // retry moving it aside. Waiting for [clearPreviousRun] or the next
+        // start used to be the only ways out, and once a share stopped deleting
+        // runs a failed rotation cost every line of this run (Codex, PR #58).
+        if (retainedPreviousRun() != null) {
+            if (!retryRotation()) return true
+            // The stand-down was reported as a failed rotation, which is no
+            // longer the obstruction if the marker now refuses. Say so once;
+            // later writes retry quietly, as below (Codex, PR #58).
+            if (!discardContents(crashMarker)) {
+                log.warning("An earlier crash marker could not be cleared, so this run is not being saved")
+                return true
+            }
+            return false
+        }
         // So the rotation moved it, and all that can be left is the marker,
         // which would hand this run the crash suffix at the next start.
         return !discardContents(crashMarker)
+    }
+
+    /**
+     * Worker-only: the startup rotation again, for a run it left in `debug.log`.
+     *
+     * Same rules as the start: an unreadable presence or marker defers, the
+     * suffix follows the marker, and the marker goes only once the run has
+     * moved. No prune: the bound may be over by one until the next start,
+     * which is cheaper than deleting a run from inside a write. Silent on
+     * failure, since the stand-down already said why this run is not saved.
+     */
+    private fun retryRotation(): Boolean {
+        val present = currentRunPresent() ?: return false
+        if (present) {
+            val crashed = markerSaysCrashed() ?: return false
+            val suffix = if (crashed) PREVIOUS_CRASH_SUFFIX else PREVIOUS_PLAIN_SUFFIX
+            val rotated = File(dir, "$PREVIOUS_PREFIX${rotationName()}$suffix")
+            if (!moveAside(current, rotated)) return false
+            // A report already read the run as `debug.log`, which is about to
+            // hold this run instead. Follow the move, as a dismissal does, or
+            // that report's acknowledgement misses the crash it carried and its
+            // clear deletes this run in place of the one it sent (Codex, PR #58).
+            liveHandles().forEach { handle ->
+                val at = handle.files.indexOf(current)
+                if (at >= 0) handle.files[at] = rotated
+            }
+            // The run is now a prior run under its own name, so the banner and
+            // the report see it there.
+            recomputeUnacknowledgedCrash()
+        }
+        return true
     }
 
     /**
@@ -2058,7 +2112,22 @@ class DebugFileSink internal constructor(
      * prompt by dropping the marker while keeping the crash file. A later crash
      * writes a fresh crash-suffixed file and raises the banner again.
      */
-    fun acknowledgeCrashBanner() {
+    fun acknowledgeCrashBanner() = acknowledgeCrashesIn(dismissal = true)
+
+    /**
+     * [acknowledgeCrashBanner], for a landed report share ([DebugReport.deliver]).
+     *
+     * Every crash, including one too old for the report's share of earlier runs
+     * (maintainer, 2026-10-11): a share is the user acting on the banner, and
+     * holding it up for a crash no report has room for leaves Dismiss the only
+     * way down. That crash's log stays on disk, still shareable, under the sink's
+     * retention. It never sets [StorageOutcomes.crashDismissalFailed], which is a
+     * dismissal's outcome: a share that worked must not read as a failed
+     * dismissal (Codex, PR #58).
+     */
+    internal fun acknowledgeCrashesAfterShare() = acknowledgeCrashesIn(dismissal = false)
+
+    private fun acknowledgeCrashesIn(dismissal: Boolean) {
         // Nothing is waited on. This is called straight from a tap, and the
         // rename would otherwise queue behind an in-flight write — so waiting for
         // it would block the main thread on storage and can ANR. Only the enqueue
@@ -2106,10 +2175,8 @@ class DebugFileSink internal constructor(
                         //
                         // Refusing leaves the banner up, which is this path's
                         // safe direction and is already what it does for a
-                        // refused rename. It does not strand the user: sharing
-                        // the report still consumes the run and lowers the
-                        // banner, so the dismissal is the blocked route, not the
-                        // only one.
+                        // refused rename. It strands nothing: the log stays on
+                        // disk and in every report, and only the banner stays.
                         val free = presenceOf(plain) == false
                         if (!free || !runCatching { file.renameTo(plain) }.getOrDefault(false)) {
                             // The tap did nothing and the banner stays up, which
@@ -2144,12 +2211,18 @@ class DebugFileSink internal constructor(
                 // a recompute that could not list the directory at all, both of
                 // which leave the value exactly where it was while every rename
                 // reported success (Codex, PR #20).
-                publishStorageOutcomes(crashDismissalFailed = unacknowledgedCrashValue)
+                //
+                // A dismissal's outcome only. A report's acknowledgement can
+                // rightly leave the banner up for a crash it did not carry, and
+                // reading that as a failed dismissal would show the user an
+                // error for a share that worked (Codex, PR #58).
+                if (dismissal) publishStorageOutcomes(crashDismissalFailed = unacknowledgedCrashValue)
             }
         }.onFailure {
             // The task never ran, so the crash file and the banner both stay
-            // and nothing on the worker will say so (Codex, PR #20).
-            recordStorageFailureOffWorker(crashDismissalFailed = true)
+            // and nothing on the worker will say so (Codex, PR #20). A report's
+            // acknowledgement says it in the log alone, for the reason above.
+            if (dismissal) recordStorageFailureOffWorker(crashDismissalFailed = true)
             log.failure(it, "A crash-banner dismissal could not be scheduled")
         }
     }

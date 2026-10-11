@@ -172,6 +172,17 @@ for.
   rest — and the log takes the room left (`DebugReport.logLines`), why the
   previous processes ended first, then the newest lines. The middle cut in
   `collect` is a backstop, not the plan: what it takes was never chosen.
+- **What is kept on disk and what is shared are separate rules.** On disk,
+  `DebugFileSink` keeps the newest five runs, each saved at up to 150,000
+  characters, and an older run goes only when a newer one pushes it out. In a report, the size
+  rule above. **Sharing deletes nothing**, because whether a report was sent
+  is unknowable: the share sheet reports nothing back, and a clipboard copy is
+  only a copy. A later report may therefore repeat some of the same earlier
+  lines. A landed copy does lower the crash banner, for every crash, one too
+  old for the report's share of earlier runs included (maintainer,
+  2026-10-11): the share is the user acting on the banner, and holding it up
+  for a crash no report has room for leaves Dismiss the only way down. That
+  crash's log stays on disk, still shareable.
 - **A screenshot is an extra, never the report.** `deliver` may attach one,
   and the clipboard still carries the text alone, so everything needed to
   diagnose the bug is in the text.
