@@ -370,12 +370,13 @@ at all is the app's decision, tied to a settings toggle and a Play Data Safety
 declaration; that belongs in the sink, which can simply do nothing when the
 answer is no. The destination only decides what the text says if it goes.
 
-The previous run is then `files.readPreviousRun()`, which hands back a handle —
-its `text` is the report, and `files.clearPreviousRun(handle)` consumes exactly
-the runs that report was built from once it has been sent. The pairing is the
-point: a report deletes what it contained and nothing else, so two overlapping
-report flows cannot have the first one destroy a run only the second had read.
-A caller that got no handle deletes nothing. `files.unacknowledgedCrash` says whether a prior run
+The previous run is then `files.readPreviousRun()`, which hands back a handle
+whose `text` is the report. **Sharing deletes nothing**: whether a report was
+actually sent is unknowable (the share sheet reports nothing back), so the
+earlier runs stay on disk under their own retention rule, the newest five runs
+of up to 150,000 characters each, and `DebugReport.deliver` only lowers the crash
+banner once the copy lands. `files.clearPreviousRun(handle)` still deletes
+exactly the runs a handle names, for an app that means to. `files.unacknowledgedCrash` says whether a prior run
 ended in an uncaught exception and the user has neither shared nor dismissed it —
 the state a post-crash banner shows on. It is *derived* on the worker rather than
 maintained by screens, so two screens cannot write stale answers over each other;
@@ -433,9 +434,8 @@ scope is a better place for that choice anyway.
 it arrives whole wherever it is pasted — a chat, an issue, an email — not just
 through the share sheet. Reports at the old 60,000 were cut at about their
 first 20,000 characters when pasted, which took the newest lines. The earlier
-runs get up to 4,000 of it (`MAX_EARLIER_RUNS_CHARS`), newest lines kept; a run
-trimmed out entirely stays on disk for the next report rather than being
-consumed by one that never carried it. The rest is yours,
+runs get up to 4,000 of it (`MAX_EARLIER_RUNS_CHARS`), newest lines kept. The
+rest is yours,
 `DebugReport.APP_SECTION_CHARS` (14,000): keep your section within it and it
 always arrives whole; past that, `collect` cuts it from the middle, at line
 breaks where it can, and says how many characters went.
@@ -481,24 +481,23 @@ default) shares text only. The clipboard still carries the text alone: it is the
 retained fallback the outcome is gated on, and a paste cannot recover an image.
 Omit the argument and nothing changes for an app that shares text.
 
-The prior run is consumed only when the **clipboard copy** landed. A chooser
-reports nothing back, so its launch is not evidence anything was sent, and
-treating it as delivery would spend a crash log on a sheet the user may have
-dismissed. `COPIED_ONLY` is the case worth telling them about: no sheet and no
-error reads as "the tap did nothing", and the retry carries no prior run and
-overwrites the clipboard copy that did.
+Sharing deletes nothing. A landed **clipboard copy** lowers the crash banner for
+every crash, one too old to fit the report included, and nothing else changes: the runs stay on disk
+under the sink's own retention, and a later report may carry some of the same
+lines. A chooser reports nothing back, so its launch is not evidence anything
+was sent and does not lower the banner. `COPIED_ONLY` is the case worth telling
+the user about: no sheet and no error reads as "the tap did nothing".
 
 You write what your app has to say; **the prior run is appended for you**. That
 is deliberate rather than a convenience: passing it in and trusting the returned
 text to contain it means a builder that ignores it still gets it marked as
-delivered, and the first clipboard copy then deletes a crash log nobody saw. An
-app that wants no prior run passes a null sink, which reads nothing and consumes
-nothing.
+delivered, and the banner then comes down for a crash nobody saw. An app that
+wants no prior run passes a null sink, which reads nothing.
 
 A payload builder that throws is contained — its section names the exception
 type, and the failure itself is recorded in the log the report already carries
-— and the prior run is still appended and still consumed, because it was read
-and delivered regardless of what the app's own section managed to say.
+— and the prior run is still appended, because it was read regardless of what
+the app's own section managed to say.
 
 The rule that matters: **a log call is a hard-coded format string plus
 arguments.** The literal is safe by construction; each argument is carried or

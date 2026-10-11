@@ -667,6 +667,114 @@ class DebugFileSinkTest {
     }
 
     @Test
+    fun `a stand-down retries the rotation and resumes once it can`() {
+        // A share no longer deletes the retained run, so ending the stand-down
+        // cannot wait for one: every line of this run would be lost (Codex, PR
+        // #58). The next write retries the move itself.
+        val log = log()
+        val sink = sinkWithFailedRotation(log)
+        log.addSink(sink)
+        log.event("logged while nothing could be written")
+        sink.awaitIdle()
+        assertTrue(
+            "the premise: still stood down while the obstruction holds",
+            current().readText().contains("the crash nobody has read yet"),
+        )
+
+        File(dir, "androidlog-prev-pinned.crash.log").deleteRecursively()
+        log.event("this run, now that there is room for it")
+        sink.awaitIdle()
+
+        assertTrue(
+            "the previous run moved aside, still a crash",
+            File(dir, "androidlog-prev-pinned.crash.log").readText().contains("the crash nobody has read yet"),
+        )
+        val text = current().readText()
+        assertTrue(text, text.contains("logged while nothing could be written"))
+        assertTrue(text, text.contains("this run, now that there is room for it"))
+        assertFalse(text, text.contains("the crash nobody has read yet"))
+        assertFalse("the marker went with the run", File(dir, "androidlog.log.crash").exists())
+        assertTrue("and its banner is still up", sink.unacknowledgedCrash)
+    }
+
+    @Test
+    fun `a shared preserved run is kept and this run is saved once the rotation lands`() {
+        // What a landed share does now: lower the banner for the run it
+        // carried, and delete nothing.
+        val log = log()
+        val sink = sinkWithFailedRotation(log)
+        log.addSink(sink)
+
+        sink.acknowledgeCrashesAfterShare()
+        sink.awaitIdle()
+        assertFalse(sink.unacknowledgedCrash)
+        assertTrue(current().readText().contains("the crash nobody has read yet"))
+
+        File(dir, "androidlog-prev-pinned.crash.log").deleteRecursively()
+        log.event("this run, saved after the share")
+        sink.awaitIdle()
+
+        assertTrue(
+            "the shared run is still on disk, under a plain name",
+            File(dir, "androidlog-prev-pinned.log").readText().contains("the crash nobody has read yet"),
+        )
+        assertTrue(current().readText().contains("this run, saved after the share"))
+        assertFalse("and the banner stays down", sink.unacknowledgedCrash)
+    }
+
+    @Test
+    fun `a handle read before the retried rotation follows the run it carried`() {
+        val log = log()
+        val sink = sinkWithFailedRotation(log)
+        log.addSink(sink)
+        val handle = sink.readPreviousRun()!!
+
+        File(dir, "androidlog-prev-pinned.crash.log").deleteRecursively()
+        log.event("this run, written after the handle was read")
+        sink.awaitIdle()
+        assertTrue(
+            "the premise: the retry moved the run aside",
+            File(dir, "androidlog-prev-pinned.crash.log").exists(),
+        )
+
+        sink.acknowledgeCrashesAfterShare()
+        sink.awaitIdle()
+        assertFalse("the carried crash's banner comes down", sink.unacknowledgedCrash)
+
+        sink.clearPreviousRun(handle)
+        sink.awaitIdle()
+        assertTrue(
+            "the clear takes the run it was given, not this one",
+            current().readText().contains("this run, written after the handle was read"),
+        )
+        assertTrue(previous().none { it.readText().contains("the crash nobody has read yet") })
+    }
+
+    @Test
+    fun `a marker that will not clear after the retried move is named once`() {
+        val log = log()
+        val sink = sinkWithFailedRotation(log)
+        log.addSink(sink)
+        // Wedge the marker: a non-empty directory reads, but will not go.
+        File(dir, "androidlog.log.crash").delete()
+        File(dir, "androidlog.log.crash/wedged").mkdirs()
+
+        File(dir, "androidlog-prev-pinned.crash.log").deleteRecursively()
+        log.event("first write after the obstruction cleared")
+        sink.awaitIdle()
+        log.event("second write")
+        sink.awaitIdle()
+
+        assertTrue("the premise: the run moved aside", previous().any { it.readText().contains("the crash nobody has read yet") })
+        assertFalse("nothing is written beside the marker", current().exists())
+        assertEquals(
+            log.snapshot().toString(),
+            1,
+            log.snapshot().count { it.contains("crash marker could not be cleared") },
+        )
+    }
+
+    @Test
     fun `the opt-out deletes a preserved run too`() {
         // Prior runs used to survive an opt-out, and a preserved run is a prior
         // run, so this file was deliberately left alone. Reversed by the
@@ -1311,9 +1419,13 @@ class DebugFileSinkTest {
         log.event("this run, which must not land on top of it")
         sink.awaitIdle()
 
+        // The write that follows retries the rotation the worker refused
+        // (PR #58), so the run is kept under a prior-run name rather than in
+        // place. Either way it must not be overwritten.
+        val kept = listOf(current(), File(dir, "androidlog-prev-1.log")).filter { it.exists() }
         assertTrue(
-            current().readText(),
-            current().readText().contains("the run nobody rotated aside"),
+            kept.joinToString { it.readText() },
+            kept.any { it.readText().contains("the run nobody rotated aside") },
         )
         assertTrue(
             log.snapshot().toString(),
