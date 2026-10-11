@@ -1007,6 +1007,19 @@ own `runCatching`, before the snapshot and after the crash marker.
 
 ## Not built yet
 
+- **Move the consumers' own reports onto `DebugReport.collect`.** 4.0 makes
+  the library's default safe to paste (18,000 characters), but simmo,
+  snoozemo and typelauncher still build and size their reports themselves, at
+  up to 60,000, so they are still cut when pasted. typelauncher derives its
+  totals from `MAX_REPORT_CHARS` and `MAX_EARLIER_RUNS_CHARS` and clothescast
+  its structured share from both, so each needs its budgets re-derived on the
+  bump (clothescast's goes negative). One app at a time, piloted first.
+- **Cap each earlier run, not just the runs together.** The earlier runs keep
+  their newest 4,000 characters across all runs, so one noisy run can crowd a
+  crashed run out entirely. A per-run share, crashed runs first, would keep a
+  crash however busy the run after it was. Needs `DebugFileSink`'s read to
+  hand back what it left out per run.
+
 - **Publish the staged repository from CI, and serve it over HTTP.** *(Built;
   this entry is kept for the reasoning until the first release has actually
   run.)* The Gradle side is done: `./gradlew publishAllPublicationsToStagingRepository` writes a
