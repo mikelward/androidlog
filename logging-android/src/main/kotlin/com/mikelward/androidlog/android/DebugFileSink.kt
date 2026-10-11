@@ -50,6 +50,9 @@ private const val PREVIOUS_PLAIN_SUFFIX = ".log"
  */
 private const val PREVIOUS_CRASH_SUFFIX = ".crash.log"
 
+/** How many names past the plain one a dismissal tries before acknowledging in place. */
+private const val ACKNOWLEDGE_NAME_ATTEMPTS = 9
+
 /**
  * Companion to [CURRENT_FILE], written by the uncaught-exception handler and
  * consumed at the next start. Its presence there is the one reliable in-process
@@ -877,8 +880,21 @@ class DebugFileSink internal constructor(
         // The difference shows only where a stat is refused over a name that is
         // really taken, which no fixture here can construct.
         val existed = presenceOf(to) ?: true
+        // The run's age, kept across the copy: `copyTo` stamps the destination
+        // now, and the prune orders runs by that stamp, so an old run copied
+        // aside would read as the newest and outlive a newer one (Codex, PR #58).
+        // An age that cannot be read cannot be kept, so there is no copy to make.
+        val modified = modifiedAt(from) ?: return false
         return runCatching {
             from.copyTo(to)
+            // A copy that cannot keep its age is not the run's, so it is not a
+            // move: take it back out and leave the source for the next attempt
+            // (Codex, PR #58).
+            if (!to.setLastModified(modified)) {
+                log.warning("A previous run could not keep its age when copied aside")
+                if (!existed) discardContents(to)
+                return@runCatching false
+            }
             // See above: the destination is authoritative now, so the source must
             // stop being a second copy of the same run. A discard that *fails* is
             // not a move that succeeded, and answering true here left exactly the
@@ -929,6 +945,14 @@ class DebugFileSink internal constructor(
      */
     @Volatile
     private var mirroringStoodDown = false
+
+    /**
+     * Worker-only: crashed runs the user dismissed or shared whose name could not
+     * be changed off the crash suffix. They hold the banner up no longer in this
+     * process; nothing records them across a restart, since the cache this log
+     * lives in can drop a record while keeping the file it describes.
+     */
+    private val acknowledgedInPlace = mutableSetOf<File>()
 
     /**
      * Gives up persisting *this* run, because writing would destroy the previous
@@ -1972,7 +1996,7 @@ class DebugFileSink internal constructor(
      * One line is also the right amount of signal: a reader needs to know the
      * check stopped working, not how many times it retried.
      */
-    private fun recomputeUnacknowledgedCrash() {
+    private fun recomputeUnacknowledgedCrash(userActed: Boolean = false) {
         // The read itself can throw, not just answer null: resolving the cache
         // directory is lazy and happens here. Letting that escape would leave the
         // value at its initial false with nothing recorded — the silent "no crash"
@@ -1988,11 +2012,22 @@ class DebugFileSink internal constructor(
             crashCheckFailing = beginSpell(crashCheckFailing) {
                 log.warning("Crash-banner check could not list the log directory")
             }
+            // Right after a dismissal or a share the banner comes down anyway:
+            // the user has answered it, and holding it up over a check that may
+            // never work leaves them nothing to do (maintainer, 2026-10-11).
+            if (userActed) publishUnacknowledgedCrash(false)
             return
         }
+        // Right after a dismissal or a share, every crash this check can see is
+        // one the user just answered — including any the action's own scan could
+        // not list or classify a moment earlier. Holding those in place, rather
+        // than reading them as new, is what makes the action always lower the
+        // banner (Codex, PR #58); a later check still raises a file that only
+        // then reads as a crash.
+        if (userActed) acknowledgedInPlace += scan.crashed
         // A crash it *could* read outranks one it could not: the banner goes up
         // either way, and going up is never the unsafe direction.
-        if (scan.crashed.isNotEmpty()) {
+        if (scan.crashed.any { it !in acknowledgedInPlace }) {
             crashCheckFailing = false
             publishUnacknowledgedCrash(true)
             return
@@ -2001,7 +2036,7 @@ class DebugFileSink internal constructor(
         // is. Publishing false here lowers a banner that is already up, and the
         // next recompute may not come before the user's chance to report is gone
         // (Codex, PR #4).
-        if (scan.unknown) {
+        if (scan.unknown && !userActed) {
             crashCheckFailing = beginSpell(crashCheckFailing) {
                 log.warning("Crash-banner check could not read a prior run, so the banner is unchanged")
             }
@@ -2096,6 +2131,10 @@ class DebugFileSink internal constructor(
                 val at = handle.files.indexOf(current)
                 if (at >= 0) handle.files[at] = rotated
             }
+            // And a dismissal or share the run already had stays with it, or
+            // the recompute below raises the banner the user just lowered
+            // (Codex, PR #58).
+            if (acknowledgedInPlace.remove(current)) acknowledgedInPlace += rotated
             // The run is now a prior run under its own name, so the banner and
             // the report see it there.
             recomputeUnacknowledgedCrash()
@@ -2106,6 +2145,12 @@ class DebugFileSink internal constructor(
     /**
      * Dismiss: rename every crashed prior-run file off the crash suffix so it no
      * longer raises the banner, keeping its log still shareable in a report.
+     *
+     * The banner comes down whatever stands in the way (maintainer, 2026-10-11):
+     * a plain name already taken moves the run to the next free one, and a file
+     * that cannot be renamed, read, or even listed stops holding the banner up
+     * for this process. Such a file raises it again only when a later check
+     * reads it as a crash — a later start, for one that could not be renamed.
      *
      * Renaming in place — rather than recording a separate acknowledgement marker
      * in this evictable cache directory — so cache eviction cannot resurrect the
@@ -2144,9 +2189,7 @@ class DebugFileSink internal constructor(
         // delay, so it runs ahead of any debounced write already scheduled.
         //
         // Losing the eager lowering also deletes the restore-on-failure branch it
-        // needed, because a dismissal that reached nothing now simply leaves the
-        // recompute below to publish the truth — an unknown check leaves the
-        // banner up by construction rather than by a second code path.
+        // needed: the recompute below publishes the truth, on the worker.
         runCatching {
             worker.submit {
                 runCatching {
@@ -2155,35 +2198,33 @@ class DebugFileSink internal constructor(
                             // The retained run carries no crash suffix to rename
                             // off; what marks it is the marker, so consuming that
                             // is the dismissal. Its log stays, still shareable.
-                            // It says so itself when it cannot.
-                            consumeCrashMarker()
+                            // It says so itself when it cannot, and the banner
+                            // still comes down for this process, as below.
+                            if (!consumeCrashMarker()) acknowledgedInPlace += file
                             return@forEach
                         }
-                        val plain = File(
-                            dir,
-                            file.name.removeSuffix(PREVIOUS_CRASH_SUFFIX) + PREVIOUS_PLAIN_SUFFIX,
-                        )
+                        val base = file.name.removeSuffix(PREVIOUS_CRASH_SUFFIX)
                         // The plain name can already be taken. Two rotations
                         // sharing a `System.nanoTime()` base do not collide with
                         // each other when their suffixes differ, so a crashed run
-                        // and an ordinary one can sit under one base — and
-                        // `renameTo` then *replaces* rather than refusing, which
-                        // is the same answer-for-two-cases the rotation fixed,
-                        // one call site over (Codex, PR #4). What a wrong "free"
-                        // destroys is an unshared run, permanently, so unknown
-                        // counts as taken here too.
-                        //
-                        // Refusing leaves the banner up, which is this path's
-                        // safe direction and is already what it does for a
-                        // refused rename. It strands nothing: the log stays on
-                        // disk and in every report, and only the banner stays.
-                        val free = presenceOf(plain) == false
-                        if (!free || !runCatching { file.renameTo(plain) }.getOrDefault(false)) {
-                            // The tap did nothing and the banner stays up, which
-                            // is the right direction to fail in — but with no
-                            // line here the user is left tapping a control that
-                            // has no visible effect and no reason (Codex, PR #4).
-                            log.warning("A crash could not be dismissed, so its banner stays")
+                        // and an ordinary one can sit under one base (Codex, PR
+                        // #4). So the next free name after it is tried, never one
+                        // that is taken: `moveAside` refuses a destination it
+                        // cannot prove free, since a wrong "free" overwrites an
+                        // unshared run.
+                        val plain = (0..ACKNOWLEDGE_NAME_ATTEMPTS)
+                            .asSequence()
+                            .map { n -> File(dir, base + (if (n == 0) "" else "-$n") + PREVIOUS_PLAIN_SUFFIX) }
+                            .firstOrNull { moveAside(file, it) }
+                        if (plain == null) {
+                            // Still the user's answer: the banner comes down for
+                            // this process, and the log stays where it is, still
+                            // shareable. Only the name could not be changed, so a
+                            // later start, which cannot tell it was seen, raises
+                            // it again (maintainer, 2026-10-11: no banner up for
+                            // good over a condition the user cannot fix).
+                            acknowledgedInPlace += file
+                            log.warning("A crash could not be marked as seen, so its banner is down until the next start")
                             return@forEach
                         }
                         // A share already in flight has read this file and is
@@ -2199,10 +2240,10 @@ class DebugFileSink internal constructor(
                         }
                     }
                 }.onFailure { log.failure(it, "A crash-banner dismissal failed") }
-                // The third of the three points the record changes. A rename that
-                // did not happen leaves the banner up, which is the direction an
-                // unknown check has to fail in.
-                recomputeUnacknowledgedCrash()
+                // The third of the three points the record changes. The user has
+                // acted on the banner, so what could not be read no longer holds
+                // it up; a file that later reads as a crash raises it again.
+                recomputeUnacknowledgedCrash(userActed = true)
                 // Derived from what that published, and only after it. The
                 // outcome is the question the user is actually asking -- I
                 // tapped Dismiss, is the banner still there? -- so reading it
@@ -2262,10 +2303,12 @@ class DebugFileSink internal constructor(
         /**
          * Whether the last [acknowledgeCrashBanner] left the banner up.
          *
-         * True when a rename was refused, when the directory could not be
-         * listed, and when an entry would not say whether it had crashed —
-         * all three end with the banner where it was and the tap with nothing
-         * to show for it.
+         * In practice, whether it could not be scheduled at all. A dismissal
+         * that runs lowers the banner whatever stands in its way — a refused
+         * rename, a directory that could not be listed, an entry that would not
+         * say whether it crashed (maintainer, 2026-10-11) — so those no longer
+         * read as failed. A share never sets it; see
+         * [acknowledgeCrashesAfterShare].
          */
         val crashDismissalFailed: Boolean,
     ) {

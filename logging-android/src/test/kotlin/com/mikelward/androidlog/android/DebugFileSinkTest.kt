@@ -344,9 +344,8 @@ class DebugFileSinkTest {
     fun `a dismissal onto a name already taken keeps the run that is there`() {
         // Two rotations sharing a `System.nanoTime()` base do not collide when
         // their suffixes differ, so a crashed run and an ordinary one can sit
-        // under one base — and the dismissal renames the crash suffix off,
-        // straight onto the other one. `renameTo` replaces rather than refusing
-        // (Codex, PR #4).
+        // under one base — and `renameTo` replaces rather than refusing (Codex,
+        // PR #4). So the dismissal takes the next free name instead.
         File(dir, "androidlog-prev-1.crash.log").writeText("the run that crashed\n")
         File(dir, "androidlog-prev-1.log").writeText("an earlier run, never shared\n")
         val sink = sink()
@@ -363,11 +362,12 @@ class DebugFileSinkTest {
             File(dir, "androidlog-prev-1.log").readText(),
         )
         assertEquals(
-            "and the crashed one is still there to share",
+            "and the crashed one is kept under the next free name",
             "the run that crashed\n",
-            File(dir, "androidlog-prev-1.crash.log").readText(),
+            File(dir, "androidlog-prev-1-1.log").readText(),
         )
-        assertTrue("so the banner stays up, which is the safe direction", sink.unacknowledgedCrash)
+        assertFalse("so the banner comes down", sink.unacknowledgedCrash)
+        assertFalse(sink.storageOutcomes.crashDismissalFailed)
     }
 
     @Test
@@ -456,9 +456,9 @@ class DebugFileSinkTest {
         // this same sink, so a report per attempt is a self-sustaining loop.
         assertEquals(complaints.toString(), 1, complaints.size)
         // Left where it started rather than set from an answer that never came.
-        // That an unknown answer cannot *lower* a raised banner is the stronger
-        // claim, and `a dismissal that reaches nothing leaves the banner up` is
-        // where it is actually made, from a real `true`.
+        // That an unknown answer cannot *lower* a raised banner on its own is
+        // the stronger claim, and `a prior run whose crash record cannot be read
+        // leaves the banner up` is where it is actually made, from a real `true`.
         assertFalse(sink.unacknowledgedCrash)
     }
 
@@ -851,31 +851,39 @@ class DebugFileSinkTest {
     }
 
     @Test
-    fun `a dismissal that reaches nothing leaves the banner up`() {
-        // Starting from a real `true`, because starting from `false` would assert
-        // the state the sink begins in and pass however the dismissal behaved.
-        // The rename is what a dismissal does, so blocking it with a directory at
-        // the destination is a dismissal that reaches nothing.
+    fun `a dismissal that cannot rename the crash still lowers the banner, until the next start`() {
+        // The banner must not stay up for good over a condition the user cannot
+        // fix (maintainer, 2026-10-11). Every name the run could move to is
+        // occupied, so it keeps its crash suffix: the banner comes down for this
+        // process, the log stays, and a later start raises it again.
         current().writeText("crashed\n")
         File(dir, "androidlog.log.crash").writeText("1")
-        val sink = sink()
+        val log = log()
+        val sink = sink(log)
         sink.start(installCrashHandler = false)
         sink.awaitIdle()
         assertTrue("the banner is up to begin with", sink.unacknowledgedCrash)
-
         val crashFile = previous().single()
-        File(dir, crashFile.name.removeSuffix(".crash.log") + ".log").mkdirs()
+        val base = crashFile.name.removeSuffix(".crash.log")
+        File(dir, "$base.log/held").mkdirs()
+        (1..9).forEach { File(dir, "$base-$it.log/held").mkdirs() }
 
         sink.acknowledgeCrashBanner()
         sink.awaitIdle()
-        assertTrue(
-            "an unknown check must never be what leaves the banner down",
-            sink.unacknowledgedCrash,
-        )
-        assertTrue("and the crash log is untouched", crashFile.exists())
-    }
 
-    // ------------------------------------- results that used to be discarded
+        assertFalse("the banner comes down", sink.unacknowledgedCrash)
+        assertFalse(sink.storageOutcomes.crashDismissalFailed)
+        assertEquals("and the crash log is untouched", "crashed\n", crashFile.readText())
+        assertTrue(log.snapshot().toString(), log.snapshot().any { it.contains("could not be marked as seen") })
+        sink.requestCrashRecompute()
+        sink.awaitIdle()
+        assertFalse("a later check in this process keeps it down", sink.unacknowledgedCrash)
+
+        val next = sink()
+        next.start(installCrashHandler = false)
+        next.awaitIdle()
+        assertTrue("the next start cannot tell it was seen, and raises it", next.unacknowledgedCrash)
+    }
 
     @Test
     fun `an opt-out that cannot purge says so once the log works again`() {
@@ -1468,6 +1476,17 @@ class DebugFileSinkTest {
     }
 
     @Test
+    fun `a share the worker refuses is not reported as a failed dismissal`() {
+        // A dismissal's outcome is the dismissal's: a share that worked must not
+        // light a dismissal error (Codex, PR #58).
+        val sink = DebugFileSink(log(), { dir }, 0L, {}, { "1" }, { refusingWorker() })
+
+        sink.acknowledgeCrashesAfterShare()
+
+        assertFalse(sink.storageOutcomes.crashDismissalFailed)
+    }
+
+    @Test
     fun `a dismissal the worker refuses says so to the caller too`() {
         // The task never runs, so the crash file and the banner both stay and
         // no worker publication will ever say so.
@@ -1593,25 +1612,19 @@ class DebugFileSinkTest {
     }
 
     @Test
-    fun `a dismissal the filesystem refuses is reported`() {
-        // The banner staying up is right, but a control that has no visible
-        // effect and no reason is not something to leave unsaid.
-        current().writeText("crashed\n")
-        File(dir, "androidlog.log.crash").writeText("1")
+    fun `a dismissal of the retained run whose marker will not clear still lowers the banner`() {
         val log = log()
-        val sink = sink(log)
-        sink.start(installCrashHandler = false)
-        sink.awaitIdle()
-        val crashFile = previous().single()
-        File(dir, crashFile.name.removeSuffix(".crash.log") + ".log").mkdirs()
+        val sink = sinkWithFailedRotation(log)
+        log.addSink(sink)
+        assertTrue("the premise: the banner is up", sink.unacknowledgedCrash)
+        File(dir, "androidlog.log.crash").delete()
+        File(dir, "androidlog.log.crash/wedged").mkdirs()
 
         sink.acknowledgeCrashBanner()
         sink.awaitIdle()
-        assertTrue(sink.unacknowledgedCrash)
-        assertTrue(
-            log.snapshot().toString(),
-            log.snapshot().any { it.contains("could not be dismissed") },
-        )
+
+        assertFalse(sink.unacknowledgedCrash)
+        assertTrue("and the run is kept", current().readText().contains("the crash nobody has read yet"))
     }
 
     @Test
@@ -2945,57 +2958,47 @@ class DebugFileSinkTest {
     }
 
     @Test
-    fun `a dismissal tells the caller whether the banner actually came down`() {
-        // The refusal shape from `a dismissal onto a name already taken`: the
-        // plain name is occupied, so the rename is refused and the banner stays.
-        // Without this the user taps a control that does nothing, and the one
-        // line saying why is in a log they would have to go and read.
+    fun `a dismissal the worker refuses is the one that reports a failure`() {
+        // A dismissal that runs always lowers the banner now, so what is left to
+        // report is one that never ran.
         File(dir, "androidlog-prev-1.crash.log").writeText("the run that crashed\n")
-        File(dir, "androidlog-prev-1.log").writeText("an earlier run, never shared\n")
         val sink = sink()
         sink.start(installCrashHandler = false)
         sink.awaitIdle()
 
         sink.acknowledgeCrashBanner()
         sink.awaitIdle()
-        assertTrue("the premise: it really was refused", sink.unacknowledgedCrash)
-        assertTrue(sink.storageOutcomes.crashDismissalFailed)
-        assertFalse("one operation does not answer for the other", sink.storageOutcomes.optOutPurgeFailed)
-
-        // And the retry that works clears it.
-        File(dir, "androidlog-prev-1.log").delete()
-        sink.acknowledgeCrashBanner()
-        sink.awaitIdle()
-        assertFalse("the premise: it worked this time", sink.unacknowledgedCrash)
+        assertFalse(sink.unacknowledgedCrash)
         assertFalse(sink.storageOutcomes.crashDismissalFailed)
+        assertFalse("one operation does not answer for the other", sink.storageOutcomes.optOutPurgeFailed)
     }
 
     @Test
-    fun `a dismissal that could not look says so rather than reading as done`() {
-        // Nothing was renamed and the recompute leaves the banner where it is,
-        // so the tap had no visible effect -- which is why the outcome is
-        // derived from the banner after the recompute rather than from the
-        // renames: every rename here "succeeded" by not being attempted
-        // (Codex, PR #20).
+    fun `a dismissal lowers the banner over a crash log nobody can read`() {
+        // An entry that will not say whether it crashed no longer holds the
+        // banner up once the user has acted on it: it may never be readable,
+        // and the user can do nothing about it (maintainer, 2026-10-11).
         current().writeText("the crash nobody has read yet\n")
         File(dir, "androidlog.log.crash").writeText("1")
         val sink = sink()
         sink.start(installCrashHandler = false)
         sink.awaitIdle()
         assertTrue("the premise: the banner is up", sink.unacknowledgedCrash)
-
-        // The rotated crash log becomes unclassifiable: a self-referencing
-        // symlink fails with a real filesystem error rather than "not found",
-        // so the scan will not say whether it crashed and the recompute leaves
-        // the banner exactly where it is.
         val rotated = previous().single { it.name.endsWith(".crash.log") }
         assertTrue(rotated.delete())
         Files.createSymbolicLink(rotated.toPath(), rotated.toPath())
+        sink.requestCrashRecompute()
+        sink.awaitIdle()
+        assertTrue("the premise: a check alone leaves it up", sink.unacknowledgedCrash)
 
         sink.acknowledgeCrashBanner()
         sink.awaitIdle()
-        assertTrue("the premise: the banner really did stay up", sink.unacknowledgedCrash)
-        assertTrue(sink.storageOutcomes.crashDismissalFailed)
+
+        assertFalse(sink.unacknowledgedCrash)
+        assertFalse(sink.storageOutcomes.crashDismissalFailed)
+        sink.requestCrashRecompute()
+        sink.awaitIdle()
+        assertFalse("and an unreadable entry does not raise it again", sink.unacknowledgedCrash)
     }
 
     @Test
@@ -3041,17 +3044,21 @@ class DebugFileSinkTest {
 
     @Test
     fun `a storage listener is handed the current value on the worker`() {
-        File(dir, "androidlog-prev-1.crash.log").writeText("crashed\n")
-        File(dir, "androidlog-prev-1.log").writeText("taken\n")
-        val sink = sink()
-        sink.start(installCrashHandler = false)
-        sink.acknowledgeCrashBanner()
+        val log = log()
+        val sink = sink(log)
+        log.addSink(sink)
+        log.event("collected before the opt-out")
+        sink.awaitIdle()
+        // Neither deletable (not empty) nor truncatable, so the purge fails.
+        current().delete()
+        File(dir, "androidlog.log/wedged").mkdirs()
+        log.setRecording(false)
         sink.awaitIdle()
 
         val seen = mutableListOf<Boolean>()
         val threads = mutableListOf<String>()
         val listener = DebugFileSink.StorageListener {
-            seen += it.crashDismissalFailed
+            seen += it.optOutPurgeFailed
             threads += Thread.currentThread().name
         }
         sink.addStorageListener(listener)
@@ -3062,32 +3069,24 @@ class DebugFileSinkTest {
         assertTrue(threads.toString(), threads.single().contains("androidlog"))
 
         // Change-only from there, and silent once removed.
-        File(dir, "androidlog-prev-1.log").delete()
-        sink.acknowledgeCrashBanner()
+        File(dir, "androidlog.log").deleteRecursively()
+        log.setRecording(true)
+        log.event("after")
+        sink.awaitIdle()
+        log.setRecording(false)
         sink.awaitIdle()
         assertEquals(listOf(true, false), seen)
         sink.removeStorageListener(listener)
-        File(dir, "androidlog-prev-2.crash.log").writeText("crashed again\n")
-        File(dir, "androidlog-prev-2.log").writeText("taken\n")
-        sink.acknowledgeCrashBanner()
+        log.setRecording(true)
+        log.event("again")
+        sink.awaitIdle()
+        File(dir, "androidlog.log").delete()
+        File(dir, "androidlog.log/wedged").mkdirs()
+        log.setRecording(false)
         sink.awaitIdle()
         assertEquals("nothing after the removal", listOf(true, false), seen)
     }
 
-    /**
-     * A worker that never comes back must not park the caller for the life of
-     * the process.
-     *
-     * The wait used to be an unbounded `get()`, and the caller is typically an
-     * app's own single-threaded worker — so one stalled read stopped everything
-     * that app had queued behind it, for good (snoozemo#168). Answering null is
-     * the same thing every other unreadable state answers; what matters is that
-     * it answers at all, and says which failure it was.
-     *
-     * Staged rather than waited for: the worker's single thread is occupied by
-     * a task the test releases, so the timeout is reached deterministically and
-     * the injected bound keeps it to a fraction of a second.
-     */
     @Test
     fun `a read gives up when the worker never gets to it`() {
         val occupied = CountDownLatch(1)

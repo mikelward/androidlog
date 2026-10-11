@@ -381,7 +381,9 @@ ended in an uncaught exception and the user has neither shared nor dismissed it 
 the state a post-crash banner shows on. It is *derived* on the worker rather than
 maintained by screens, so two screens cannot write stale answers over each other;
 observe it with `addCrashListener`, ask for a refresh with `requestCrashRecompute()`
-when a screen opens, and lower it with `acknowledgeCrashBanner()`.
+when a screen opens, and lower it with `acknowledgeCrashBanner()`. A dismissal
+always lowers it, even when a crash log cannot be renamed or read: the log stays
+on disk, and the banner returns only when a later check reads that file as a crash.
 
 It is not a `StateFlow`, because this library takes no third-party runtime
 dependency and coroutines would reach every consumer's APK to deliver one
