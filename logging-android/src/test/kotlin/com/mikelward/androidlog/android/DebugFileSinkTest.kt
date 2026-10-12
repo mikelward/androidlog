@@ -170,6 +170,128 @@ class DebugFileSinkTest {
     }
 
     @Test
+    fun `the persist transform applies to what is written and nothing else`() {
+        // An app that scrubs every export needs the persisted run scrubbed too,
+        // since a later report carries it as written. Both directions: the file
+        // holds the transformed line, and the in-memory log the original.
+        val log = log()
+        val sink = DebugFileSink.scrubbing(log, dir, persistLine = { it.replace("5550100", "*******") })
+        log.addSink(sink)
+        log.event("dialed %s", "5550100")
+        sink.awaitIdle()
+
+        val written = current().readText()
+        assertTrue(written, written.contains("dialed *******"))
+        assertFalse(written, written.contains("5550100"))
+        assertTrue("the log itself is untouched", log.snapshot().any { it.contains("dialed 5550100") })
+    }
+
+    @Test
+    fun `the 5_0 constructors are exactly as they were`() {
+        // Source compatibility, checked where it broke twice: the scrub is a
+        // named factory, so the constructor set is the 5.0 one and no call
+        // written against 5.0 -- trailing lambda or parenthesized -- can bind a
+        // lambda to the scrub. The non-synthetic public constructors, by type.
+        val ctors = DebugFileSink::class.java.constructors
+            .map { ctor -> ctor.parameterTypes.joinToString { it.simpleName } }
+            .filter { "DefaultConstructorMarker" !in it }
+            // The internal primary is public on the JVM too; only these two
+            // shapes are what a consumer's source can call.
+            .filter { it.startsWith("DebugLog, Context") || it.startsWith("DebugLog, File") }
+            .toSet()
+        assertEquals(
+            setOf(
+                "DebugLog, Context",
+                "DebugLog, Context, Function0",
+                "DebugLog, File",
+            ),
+            ctors,
+        )
+    }
+
+    @Test
+    fun `a scrub that lengthens a line a little keeps what it added`() {
+        // A scrub may note what it masked. Within the bound, that note is kept.
+        val log = log()
+        val sink = DebugFileSink.scrubbing(log, dir, persistLine = { it.replace("5550100", "••••100 (len=7)") })
+        log.addSink(sink)
+        log.event("dialed %s done", "5550100")
+        sink.awaitIdle()
+
+        assertTrue(current().readText(), current().readText().contains("dialed ••••100 (len=7) done"))
+    }
+
+    @Test
+    fun `a scrub that would overrun the bound is held to each line's length`() {
+        // The bound is taken before the scrub, so one that grew lines would
+        // overshoot it. Then each written line is cut to the length of the line
+        // it came from, which keeps the bound and every line in its place.
+        val log = log()
+        val sink = DebugFileSink.scrubbing(
+            log,
+            dir,
+            persistLine = { it.replace("5550100", "[a number]") + "!".repeat(20_000) },
+        )
+        log.addSink(sink)
+        repeat(12) { log.pinnedEvent("pinned %s", it) }
+        repeat(DebugLog.DEFAULT_MAX_ENTRIES) { log.event("line %s %s", it, "y".repeat(400)) }
+        log.event("dialed %s", "5550100")
+        sink.awaitIdle()
+
+        val written = current().readText()
+        assertTrue("${written.length} chars", written.length <= 150_000)
+        assertFalse("nothing past a line's own length", written.contains("!"))
+        val last = written.lines().last()
+        assertTrue(last, last.contains("dialed [a numb"))
+        assertFalse(last, last.contains("5550100"))
+        assertEquals(
+            "every line where the snapshot put it",
+            log.boundedSnapshot(20_000, 130_000).size,
+            written.lines().size,
+        )
+    }
+
+    @Test
+    fun `a run saved before the scrub was adopted is scrubbed as it is read`() {
+        // Written by a sink without the scrub -- an earlier version of the app.
+        File(dir, "androidlog-prev-1.log").writeText("02-01 10:00:00.000 D dialed 5550100\n")
+        val sink = DebugFileSink.scrubbing(log(), dir, persistLine = { it.replace("5550100", "*******") })
+
+        val run = sink.readPreviousRun()!!.text
+        assertTrue(run, run.contains("dialed *******"))
+        assertFalse(run, run.contains("5550100"))
+    }
+
+    @Test
+    fun `a scrub that throws on read reports the run unreadable, never raw`() {
+        File(dir, "androidlog-prev-1.log").writeText("02-01 10:00:00.000 D dialed 5550100\n")
+        val log = log()
+        val sink = DebugFileSink.scrubbing(log, dir, persistLine = { error("scrub broke") })
+
+        val run = sink.readPreviousRun()?.text.orEmpty()
+        assertFalse(run, run.contains("5550100"))
+        assertTrue("the file is left for a later read", File(dir, "androidlog-prev-1.log").exists())
+        assertTrue(
+            "the scrub's failure is said, apart from an unreadable file",
+            log.snapshot().any { it.contains("scrub failed on a saved run") },
+        )
+    }
+
+    @Test
+    fun `a throwing persist transform writes nothing and says so`() {
+        // Fails closed: a scrub that breaks must not be the reason an
+        // unscrubbed line reaches disk.
+        val log = log()
+        val sink = DebugFileSink.scrubbing(log, dir, persistLine = { error("scrub broke") })
+        log.addSink(sink)
+        log.event("dialed %s", "5550100")
+        sink.awaitIdle()
+
+        assertFalse("nothing unscrubbed on disk", current().exists() && current().readText().contains("5550100"))
+        assertTrue(log.snapshot().any { it.contains("could not be saved") })
+    }
+
+    @Test
     fun `each write replaces the file rather than appending`() {
         val log = log()
         val sink = sink(log)

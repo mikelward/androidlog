@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-04
+last_modified: 2026-10-12
 ---
 
 # AGENTS.md
@@ -58,6 +58,8 @@ has stopped biting.
   in it cannot weaken the type rule. What needs scrubbing differs per app (a
   phone number is simmo's problem, an SSID is snoozemo's, a package name is
   Type Launcher's), and a shared regex would be wrong for three of the four.
+  The persisted run is the one export an app cannot wrap, so `DebugFileSink`
+  takes the app's own scrub as `persistLine` (maintainer, 2026-10-12).
 - **The floor is a boundary, not an ingestion filter** (maintainer,
   2026-08-31). What this log records for the device carries every argument in
   full, throwable messages included; `•••` and the missing message appear only
