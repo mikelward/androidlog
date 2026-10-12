@@ -258,6 +258,30 @@ class DebugFileSink internal constructor(
      * production always gets the constant.
      */
     private val previousRunReadTimeoutMs: Long = PREVIOUS_RUN_READ_TIMEOUT_MS,
+    /**
+     * Applied to each line as it is written to disk and as it is read back,
+     * and to nothing else: the in-memory log, and every other sink, see the
+     * line as recorded.
+     *
+     * For an app that scrubs what leaves it. The persisted run is what a later
+     * report carries ([DebugReport.collect] appends it as written), so an app
+     * that runs its own last-pass scrub over every other export has to be able
+     * to run it here too, or the earlier runs are the one section of its
+     * report that skipped it. This library stays without a scrubber of its
+     * own, since what needs masking differs per app; the app supplies one.
+     *
+     * Also applied to the earlier runs as they are read back for a report, so
+     * a run saved before the app adopted it is scrubbed too. That makes it run
+     * twice over what this sink wrote, so it must be idempotent, as a mask is.
+     *
+     * Fails closed: a transform that throws fails the whole write, which is
+     * reported like any other failed write, and on a read the run counts as
+     * unreadable — nothing unscrubbed reaches disk or a report. It may
+     * lengthen a line a little; when that would push a write past its bound,
+     * each line is cut back to its own length, and what the transform added
+     * past that is lost.
+     */
+    private val persistLine: (String) -> String = { it },
 ) : DebugLog.Sink {
 
     /**
@@ -281,6 +305,39 @@ class DebugFileSink internal constructor(
     /** Tests and direct use: an already-resolved directory, writes un-debounced. */
     constructor(log: DebugLog, dir: File) :
         this(log, { dir }, 0L, {}, { System.nanoTime().toString() })
+
+    companion object {
+        /**
+         * Production, with the app's own scrub over what is written ([persistLine]).
+         *
+         * A factory with its own name rather than a constructor overload, so no
+         * call written against 5.0 can reach it. Two overloads were tried and
+         * each broke a 5.0 call shape: a defaulted trailing `persistLine` took
+         * over `DebugFileSink(log, context) { ... }`, and a second constructor
+         * with it required made `DebugFileSink(log, context, { ... })` ambiguous,
+         * since a lambda fits both function types (Codex, PR #59).
+         */
+        @JvmStatic
+        @JvmOverloads
+        fun scrubbing(
+            log: DebugLog,
+            context: Context,
+            persistLine: (String) -> String,
+            onCrash: () -> Unit = {},
+        ): DebugFileSink = DebugFileSink(
+            log,
+            { context.applicationContext.cacheDir },
+            WRITE_DEBOUNCE_MS,
+            onCrash,
+            { System.nanoTime().toString() },
+            persistLine = persistLine,
+        )
+
+        /** [scrubbing] for tests and direct use: an already-resolved directory, writes un-debounced. */
+        @JvmStatic
+        fun scrubbing(log: DebugLog, dir: File, persistLine: (String) -> String): DebugFileSink =
+            DebugFileSink(log, { dir }, 0L, {}, { System.nanoTime().toString() }, persistLine = persistLine)
+    }
 
     // Resolved on first access, which is always inside a worker task (every file
     // operation runs there), so cacheDir resolution never touches the caller's
@@ -1333,6 +1390,39 @@ class DebugFileSink internal constructor(
     /** Worker-only: whether the last mirror write failed, so a repeat stays quiet. */
     private var writeFailing = false
 
+    /**
+     * The snapshot as written: bounded, then each line passed through
+     * [persistLine].
+     *
+     * The bound is applied before the transform, so a transform that lengthens
+     * lines — a scrub that notes what it masked, say — could push the file past
+     * [PERSIST_BUDGET_CHARS]. Only then is each line held to the length it had
+     * before the transform, which keeps the bound by construction while every
+     * line stays where the snapshot put it: a time-zone anchor stays ahead of
+     * the lines it dates. An earlier version re-took the snapshot with a
+     * smaller budget instead, and each fix to that grew a new case — anchors
+     * dropped by a final trim, then a loop that could spin on the worker
+     * (Codex, PR #59). A cut can only shorten text the transform produced, so
+     * it never brings back what the scrub removed.
+     */
+    private fun persistedText(): String {
+        val lines = log.boundedSnapshot(
+            pinnedBudgetChars = PINNED_PERSIST_BUDGET_CHARS,
+            recentBudgetChars = PERSIST_BUDGET_CHARS - PINNED_PERSIST_BUDGET_CHARS,
+        )
+        val transformed = lines.map(persistLine)
+        val text = transformed.joinToString("\n")
+        if (text.length <= PERSIST_BUDGET_CHARS) return text
+        return transformed.indices.joinToString("\n") { heldToLength(transformed[it], lines[it].length) }
+    }
+
+    /** [text] cut to at most [length] characters, never between a surrogate pair. */
+    private fun heldToLength(text: String, length: Int): String {
+        if (text.length <= length) return text
+        val cut = if (length > 0 && text[length - 1].isHighSurrogate()) length - 1 else length
+        return text.substring(0, cut)
+    }
+
     private fun writeSnapshot() {
         // Writing here would replace a previous run the rotation could not move
         // out of the way. Reported once, at the point it was decided — and
@@ -1342,10 +1432,7 @@ class DebugFileSink internal constructor(
         runCatching {
             // Trimmed, composed and anchored in one call, because those three
             // steps do not commute — see [DebugLog.boundedSnapshot].
-            val text = log.boundedSnapshot(
-                pinnedBudgetChars = PINNED_PERSIST_BUDGET_CHARS,
-                recentBudgetChars = PERSIST_BUDGET_CHARS - PINNED_PERSIST_BUDGET_CHARS,
-            ).joinToString("\n")
+            val text = persistedText()
             // Atomic replace: write a temp file, then rename it over the current
             // one. A kill mid-write then leaves the prior *complete* snapshot
             // intact rather than a truncated or empty file — surviving exactly
@@ -1515,12 +1602,28 @@ class DebugFileSink internal constructor(
         val perFile = mutableListOf<Pair<File, List<String>>>()
         var unreadable = 0
         for (file in files) {
-            val text = runCatching { file.readText() }.getOrNull()
-            if (text == null) {
+            // Through the scrub on the way out as well as on the way in: a run
+            // saved before the app adopted [scrubbing] was written without it,
+            // and it is still a run this report carries (Codex, PR #59). A scrub
+            // that throws makes the file unreadable here, never raw.
+            val raw = runCatching { file.readText() }.getOrNull()
+            if (raw == null) {
                 unreadable++
                 continue
             }
-            perFile += file to text.split("\n").filter { it.isNotEmpty() }
+            val fileLines = runCatching { raw.split("\n").filter { it.isNotEmpty() }.map(persistLine) }
+                .onFailure {
+                    // Said apart from a file that would not read, since what
+                    // needs fixing is the app's scrub, not storage. The
+                    // throwable crosses the device boundary as its type only.
+                    log.failure(it, "The app's scrub failed on a saved run, so it was left out of the report")
+                }
+                .getOrNull()
+            if (fileLines == null) {
+                unreadable++
+                continue
+            }
+            perFile += file to fileLines
         }
         val readable = perFile.map { it.first }.toMutableList()
         val lines = perFile.flatMap { it.second }
