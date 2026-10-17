@@ -8,8 +8,8 @@ last_modified: 2026-10-17
 
 Conventions for AI agents working in this repository.
 
-`CLAUDE.md` is a symlink to this file, so every agent reads the same
-conventions. Edit `AGENTS.md`.
+`CLAUDE.md` and `GEMINI.md` are symlinks to this file, so every agent reads
+the same conventions. Edit `AGENTS.md`.
 
 **At the start of every session, print the full absolute path of the
 `AGENTS.md` you loaded and its `last_modified` date** (front matter), so a
@@ -159,6 +159,13 @@ has stopped biting.
   unresolvable repository. It runs in CI after `check`, needs `fetch-depth: 0`,
   and grades HEAD rather than the working tree -- it says so when the tree is
   dirty.
+- **`.claude/hooks/session-start.sh` runs automatically only in Claude Code.**
+  It deepens a shallow clone (`scripts/unshallow.sh`) — the patch level is
+  `git rev-list --count`, which a shallow clone answers wrongly — and in a
+  remote container provisions the Android SDK. Other agents run
+  `scripts/unshallow.sh` themselves, and
+  `CLAUDE_CODE_REMOTE=true .claude/hooks/session-start.sh` when a remote
+  container has no SDK.
 - **CI carries the fleet's standard checks: `lanes`, `codex`, and `zizmor`.**
   The lane engine is `mikelward/lanes`, tracked `@main` — this repository
   carries only its policy (`.github/lanes.conf`) and the thin `classify` /
@@ -197,7 +204,8 @@ has stopped biting.
 ## Git and pull requests
 
 - **Branch naming.** `<agent>/<short-topic>` — `claude/...` for Claude Code,
-  `codex/...` for Codex. One topic per branch; never commit to `main` (the
+  `gemini/...` for Gemini / Antigravity, `codex/...` for Codex. One topic per
+  branch; never commit to `main` (the
   exception is the initial scaffolding commit that created this repository,
   made directly to an empty `main` at the repo owner's request).
 - **Branches under your own `<agent>/` prefix are yours** — create, push,
@@ -279,6 +287,11 @@ has stopped biting.
   consumer could notice the difference in its next build. There is no `feat:`
   or `fix:`, on purpose — they would prefix nearly everything and leave the log
   as flat as it started.
+- **No model identifier** — never name the coding agent's model or version
+  (`Opus 4.8`, `Sonnet`, `Gemini …`, `claude-*`, `gemini-*`) in a commit, PR,
+  comment, or pushed artifact; keep it to chat. Generic attribution
+  (`Co-Authored-By: Claude` / `Gemini`, `Claude-Session:`, "Generated with
+  Claude Code") is fine.
 - **Only `docs:` rides the docs lane.** `.github/lanes.conf` sends everything
   that is not markdown-outside-the-modules down the code lane, so a commit
   that really was `test:`, `build:`, or `refactor:` work carries a file the
