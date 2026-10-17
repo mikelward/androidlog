@@ -1367,3 +1367,8 @@ own `runCatching`, before the snapshot and after the crash marker.
   directly. Each needs a release after 2.3.71 and a report that reads `boundedSnapshot`
   with `ProcessExits.maxBatchChars()` reserved for pinned lines, or the batch is
   pinned but still dropped from reports on a busy run (snoozemo #302).
+
+- **Check `AGENTS.md` < 24,000 bytes in CI** (mikelward/stopdash#932): add
+  `test "$(wc -c < AGENTS.md)" -lt 24000` to `.github/workflows/ci.yml`, so
+  `AGENTS.md` cannot silently grow past Antigravity's 24,000-byte per-file rule
+  cap, which truncates the tail.

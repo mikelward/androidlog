@@ -16,315 +16,277 @@ the same conventions. Edit `AGENTS.md`.
 stale or wrong copy is caught before it steers the work. Bump `last_modified`
 whenever you edit this file.
 
-This repository is the shared on-device debug log for the Android apps in this
-account: the recording core, the privacy floor that decides what a log line may
-carry, and the transport that persists it and hands it to the user as a bug
-report. It was extracted from four hand-maintained copies — `simmo`,
-`snoozemo`, `typelauncher`, `clothescast` — which had already drifted apart
-(the two `DebugFileSink.kt` copies differed by 525 lines, and each had had its
-own bug found in review that the others never got).
+The shared on-device debug log for this account's Android apps: the recording
+core, the privacy floor deciding what a log line may carry, and the transport
+that persists it and hands it to the user as a bug report. It was extracted
+from four hand-maintained copies (`simmo`, `snoozemo`, `typelauncher`,
+`clothescast`) that had drifted apart, each with a review-found bug the others
+never got.
 
-**Consumers pin a version.** The build publishes a complete Maven repository
-into this repository's own `maven` branch, which raw.githubusercontent.com
-serves, and every consumer resolves a coordinate from it — see `README.md` for
-the wiring and `SPEC.md` for what the number promises.
+**Consumers pin a version**, resolved from the complete Maven repository the
+build publishes to this repository's `maven` branch (served by
+raw.githubusercontent.com; wiring in `README.md`, what the number promises in
+`SPEC.md`). So a merge reaches nobody until someone takes it — the point.
+Consumers used to track `@main` through a Gradle composite build, until two AGP
+versions in one invocation broke every clothescast build at once (2026-08-30;
+see *AGP and Kotlin* below); a resolved AAR carries no `AgpVersionAttr`. The
+composite is still supported, and still the right tool for working on the
+library and an app together — opt-in per consumer, behind `-PandroidlogLocal`
+— but no consumer's CI resolves this that way.
 
-So a merge here reaches nobody until someone takes it, which is the point. It
-used to be the opposite: consumers tracked `@main` through a Gradle composite
-build, nothing to bump and nothing to forget — and also two AGP versions in one
-Gradle invocation, which `AgpVersionCompatibilityRule` refuses to compare at
-all, so a patch bump here broke every clothescast build at once on 2026-08-30.
-A resolved AAR carries no `AgpVersionAttr`.
-
-The composite is still supported and is still the right tool for working on the
-library and an app together — it is opt-in per consumer, behind
-`-PandroidlogLocal`. What it is no longer is how anyone's CI resolves this.
-
-Keep this file as short as it can be and still work. Every session loads it
-whole, so each rule costs context on every turn: add one the first time
+Keep this file as short as it can be and still work, **under 24,000 bytes**
+(`wc -c AGENTS.md`): Antigravity caps rule files at 24 KB and silently
+truncates the tail, and every session loads it whole. Add a rule the first time
 something bites, say it once in the fewest words that carry the *why*, rewrite
-or trim an existing rule rather than appending beside it, and delete one that
-has stopped biting.
+or trim rather than append, and delete one that has stopped biting.
 
 ## What this repository must not grow
 
-- **No third-party runtime dependencies.** Not Timber, not a logging facade,
-  not a serialization library. This code ships inside four APKs, and the whole
-  reason a consumer can track an unpinned `@main` is that reading the source
-  *is* reading what ships.
-- **No scrubber in the core** (maintainer, 2026-08-29). The privacy floor is a
-  type rule over log arguments, not a regex over rendered text — an app that
-  wants a scrubber on top wraps its own sink around the core, where a mistake
-  in it cannot weaken the type rule. What needs scrubbing differs per app (a
-  phone number is simmo's problem, an SSID is snoozemo's, a package name is
-  Type Launcher's), and a shared regex would be wrong for three of the four.
-  The persisted run is the one export an app cannot wrap, so `DebugFileSink`
-  takes the app's own scrub as `persistLine` (maintainer, 2026-10-12).
+- **No third-party runtime dependencies** — not Timber, not a logging facade,
+  not a serialization library. This code ships inside four APKs, and reading
+  the source has to *be* reading what ships.
+- **No scrubber in the core** (maintainer, 2026-08-29). The floor is a type
+  rule over log arguments, not a regex over rendered text; an app wanting a
+  scrubber wraps its own sink around the core, where a mistake can't weaken the
+  type rule. What needs scrubbing differs per app (simmo's phone numbers,
+  snoozemo's SSIDs, Type Launcher's package names), so a shared regex would be
+  wrong for three of four. The persisted run is the one export an app can't
+  wrap, so `DebugFileSink` takes the app's scrub as `persistLine` (maintainer,
+  2026-10-12).
 - **The floor is a boundary, not an ingestion filter** (maintainer,
-  2026-08-31). What this log records for the device carries every argument in
-  full, throwable messages included; `•••` and the missing message appear only
-  in a rendering that is *leaving* — `formatLogMessage(..., leavingDevice =
-  true)` and `DebugLog.offDeviceTrace`. This reverses *the floor is applied at
-  ingestion, and there is one rendering* (2026-08-30), which reduced the
-  device's own copy too and so blanked the log the user opens to explain their
-  own bug — a launcher's failing package, a saved place, the network that was
-  joined all arrive as `String`. Whole or nothing, chosen by destination, is
-  what lets this avoid classifying content it cannot classify.
-  **The real floor did not move, and it is not here**: a full phone number, an
-  ICCID, a coordinate, a whole SSID is reduced by the app *before* this code
-  sees it, so what is rendered in full is already the app's reduced form. This
-  rule governs the tier below that. And the split is by destination alone — a
-  rendering is never chosen per sink. **A sink declares which destination class
-  it is** — `Destination.DEVICE` or `OFF_DEVICE`, PR #26 — and is handed that
-  side's rendering, and its throwable in that side's form (PR #27). That *is*
-  the split, applied; what it forbids is a sink choosing **how** a value is
-  written, or reaching a form its destination may not have — which it cannot,
-  since an off-device throwable has already lost every message and an
-  on-device one carries nothing its line did not. There are two classes and a
-  sink cannot invent a third. An app may still build what leaves itself, from
-  `formatLogMessage(..., leavingDevice = true)`, `offDeviceTrace` and
-  `offDeviceThrowable`.
+  2026-08-31). The device's own record keeps every argument in full, throwable
+  messages included; `•••` and the dropped message appear only in a *leaving*
+  rendering (`formatLogMessage(..., leavingDevice = true)`,
+  `DebugLog.offDeviceTrace`). This reverses *the floor is applied at ingestion,
+  and there is one rendering* (2026-08-30), which blanked the log the user
+  opens to explain their own bug (a failing package, a saved place, a joined
+  network all arrive as `String`); whole or nothing by destination avoids
+  classifying what this code can't classify. **The real floor did not move,
+  and it is not here**: the app reduces a full phone number, ICCID, coordinate
+  or whole SSID *before* this code sees it, so what renders in full is already
+  reduced; this rule governs the tier below. The split is by destination alone,
+  never per sink: **a sink declares its destination class**
+  (`Destination.DEVICE` or `OFF_DEVICE`, PR #26) and gets that side's rendering
+  and throwable (PR #27), so it can't choose **how** a value is written or
+  reach a form its destination may not have — an off-device throwable has
+  already lost every message, an on-device one carries nothing its line did
+  not. Two classes; a sink can't invent a third. An app may still build what
+  leaves itself from `formatLogMessage(..., leavingDevice = true)`,
+  `offDeviceTrace` and `offDeviceThrowable`.
 - **No `getMessage()` from a throwable in anything leaving the device.** A
-  platform exception quotes what it was given, and on the paths this log exists
-  for that is exactly what may not leave: the number that was dialed, the
-  network that was joined. There is no scrubber to catch it and there cannot
-  usefully be one, since the message's content and its sensitivity are both
-  unknown here. On the device's own copy it is read in full, because dropping
-  it costs `ActivityNotFoundException`'s intent and `NameNotFoundException`'s
-  package, which is the whole of what those are diagnosed from. A throwable
-  bound into a `%s` placeholder is type-only in **both** directions — that
-  rendering rests on never calling an unknown `toString()`, not on where the
-  line is going.
-- **`minSdk` is 31**, the floor across the consumer fleet (`clothescast`;
-  simmo and typelauncher are 34, snoozemo 35). Raising it silently drops a
-  consumer, so it is a migration note in that app, not a tidy-up here.
-- **AGP and Kotlin stay in step with the consumers, on the composite path.**
-  `-PandroidlogLocal` puts this build's toolchain alongside an app's in one
-  Gradle invocation, and AGP's `AgpVersionCompatibilityRule` refuses to compare
-  two versions at all — 9.3.1 against 9.3.2 fails to configure, with no pin to
-  hide behind. `gradle-update.yml` keeps them level: this repository rides the
-  same weekly batch as the four apps, so an AGP release reaches all five in one
-  window. Being off that batch is what let this repository fall a patch behind
-  and break every clothescast build at once (2026-08-30) — back when every
-  consumer resolved this way and none of them had a choice. A published AAR
-  carries no `AgpVersionAttr`, so the ordinary path is now immune; this rule
-  protects the opt-in one, which is the loop anyone working on both uses.
+  platform exception quotes its input — here, the number dialed or the network
+  joined — and no scrubber could usefully catch it, its content and
+  sensitivity being unknown. The device's copy reads it in full:
+  `ActivityNotFoundException`'s intent and `NameNotFoundException`'s package
+  are all those are diagnosed from. A throwable bound into a `%s` placeholder
+  is type-only in **both** directions — that rests on never calling an unknown
+  `toString()`, not on the destination.
+- **`minSdk` is 31**, the fleet's floor (`clothescast`; simmo and typelauncher
+  are 34, snoozemo 35). Raising it silently drops a consumer, so it is a
+  migration note in that app, not a tidy-up here.
+- **AGP and Kotlin stay in step with the consumers, for the composite path.**
+  `-PandroidlogLocal` puts this build's toolchain beside an app's in one Gradle
+  invocation, where `AgpVersionCompatibilityRule` refuses to compare two
+  versions at all (9.3.1 against 9.3.2 fails to configure; no pin helps).
+  `gradle-update.yml` keeps them level by riding the four apps' weekly batch,
+  so an AGP release reaches all five in one window; being off it broke every
+  clothescast build (2026-08-30), when every consumer still resolved this way.
+  The published-AAR path is immune; this protects the opt-in loop anyone
+  working on both uses.
 - **App-specific report *content* does not belong here.** `DecisionSnapshot`,
-  `ActiveSnooze`, an `Intent` summary — those are each app's domain. A call site
+  `ActiveSnooze`, an `Intent` summary are each app's domain: a call site
   summarizes its own type and passes the result through `safe(...)`, deciding
   for itself what the summary may say.
 
 ## Versioning
 
-- **Every pull request decides its release level, and says so in the PR body.**
-  `SPEC.md` holds the contract; the mechanism is `gradle/version-series.txt`,
-  which holds `MAJOR.MINOR` and is the only part anyone edits by hand. Patch
-  stays the commit count on the release line and does not reset — deliberate,
-  so no two releases ever share a number.
+- **Every pull request decides its release level, and says so in the PR
+  body.** `SPEC.md` holds the contract; `gradle/version-series.txt` holds
+  `MAJOR.MINOR`, the only part edited by hand. Patch is the release line's
+  commit count and deliberately never resets, so no two releases share a
+  number.
 - **Ask the additive question first: is this purely something added, with
   nothing existing changing meaning?** Then it is MINOR.
 - **Otherwise PATCH needs both halves — *consistent with the intended design*
   and *no client change* — and MAJOR is either one failing** (maintainer,
   2026-09-01). A consumer must edit code for a **source** break or a change to
   **any documented behavior it builds on**; the **intended design** moves when
-  what leaves the device changes, which forces no edit and so gets its own half
-  — the failure this library is likeliest not to notice. Visibility on its own
-  is excluded. The privacy boundary runs both ways: moving the intended line is
-  MAJOR, moving the implementation back onto a line that has not moved is a fix
-  and PATCH, whichever way the output moves. `SPEC.md` carries the reasoning
-  and the worked example.
-- **Prefer a deprecated alias to a bare rename.** It turns a consumer's red
-  build into a warning on a bump they were taking anyway, and it is what lets a
-  rename be MINOR instead of MAJOR. Remove the alias in a later major, not in
-  the release that adds it.
-- **Nothing was SemVer before `2.0.x`**, and `1.0.x` claimed otherwise -- the
-  series was hard-coded and the third component was the total commit count, so
-  a breaking change and a typo fix produced the same bump. Don't cite a `1.0.x`
-  release as precedent for what a version number here means.
+  what leaves the device changes — no edit forced, so it gets its own half, as
+  the failure this library is likeliest to miss. Visibility alone is excluded.
+  The privacy boundary runs both ways: moving the intended line is MAJOR;
+  moving the implementation back onto an unmoved line is a fix, PATCH,
+  whichever way the output moves. `SPEC.md` has the reasoning and a worked
+  example.
+- **Prefer a deprecated alias to a bare rename**: it turns a consumer's red
+  build into a warning on a bump they were taking anyway, and lets a rename be
+  MINOR instead of MAJOR. Remove the alias in a later major, not the release
+  that adds it.
+- **Nothing was SemVer before `2.0.x`**, whatever `1.0.x` claimed (a
+  hard-coded series whose third component was the total commit count, so a
+  breaking change and a typo fix bumped alike). Don't cite a `1.0.x` release as
+  precedent for what a version number means here.
 
 ## Testing
 
-- `./gradlew test` and `./gradlew check` (which runs `verifyNoAndroid`), plus
+- `./gradlew test`, `./gradlew check` (runs `verifyNoAndroid`), and
   `scripts/verify-version-derivation.sh`, which no unit test can replace: its
   cases ARE git checkouts on disk (a shallow clone; a tree with no `.git` inside
-  another repository; a dirty tree; a branch off the release line), and what
-  they prove is that the published version identifies THIS checkout on the
-  release line, or is refused. Each fixture is given a synthesized
-  `refs/remotes/origin/main` -- the code under test never exists on the real one
-  until it merges, and without one per fixture every refusal would be the
-  release-line guard rather than the defect being tested. The success case runs
-  the AGGREGATE publish and asserts what it produced, cross-module POM
-  dependency included: `check` builds the AAR but publishes nothing, so a broken
-  Android publication would otherwise leave CI green and a consumer with an
-  unresolvable repository. It runs in CI after `check`, needs `fetch-depth: 0`,
-  and grades HEAD rather than the working tree -- it says so when the tree is
-  dirty.
-- **`.claude/hooks/session-start.sh` runs automatically only in Claude Code.**
-  It deepens a shallow clone (`scripts/unshallow.sh`) — the patch level is
-  `git rev-list --count`, which a shallow clone answers wrongly — and in a
-  remote container provisions the Android SDK. Other agents run
-  `scripts/unshallow.sh` themselves, and
-  `CLAUDE_CODE_REMOTE=true .claude/hooks/session-start.sh` when a remote
-  container has no SDK.
-- **CI carries the fleet's standard checks: `lanes`, `codex`, and `zizmor`.**
-  The lane engine is `mikelward/lanes`, tracked `@main` — this repository
-  carries only its policy (`.github/lanes.conf`) and the thin `classify` /
-  `lanes` jobs in `ci.yml`, so an engine fix goes there, not here. Codex's
-  verdict machinery is `mikelward/codex-review`, also `@main`: the three
-  workflows it installs are pinned **byte for byte** against that
-  repository's `templates/`, so editing one of them here fails
-  `codex-review-check` until it is re-approved centrally. `zizmor.yml` scans
-  the workflows themselves, with the policy exceptions in
-  `.github/zizmor.yml`. `TODO.md` tracks the remaining ruleset step for all
-  three.
-- **Add or update tests with any change, and assert both directions** — that a
-  value is withheld off device *and* that the diagnostic ones are kept. A floor
-  that quietly widened to withhold everything passes a one-sided test while
-  leaving the consumers unable to explain their own failures, which is its own
-  privacy-shaped failure.
-- The suite's failure mode is a *false pass*, so assert behavior rather than
-  structure, and where a check is derived from parsing something, assert first
-  that the parse found anything at all.
-- **Fix any preexisting test failure as the first commit of the series.** Don't
+  another repository; a dirty tree; a branch off the release line), proving the
+  published version identifies THIS checkout on the release line or is
+  refused. Each fixture gets a synthesized `refs/remotes/origin/main` (the code
+  under test isn't on the real one before it merges; without it every refusal
+  would be the release-line guard, not the defect). The success case runs the
+  AGGREGATE publish and asserts its output, cross-module POM dependency
+  included, since `check` publishes nothing and a broken Android publication
+  would otherwise pass CI. CI runs it after `check` with `fetch-depth: 0`; it
+  grades HEAD, not the working tree, and says so when the tree is dirty.
+- **`.claude/hooks/session-start.sh` runs automatically only in Claude Code**:
+  it deepens a shallow clone (`scripts/unshallow.sh` — a shallow clone
+  miscounts the patch level, `git rev-list --count`) and provisions the Android
+  SDK in a remote container. Other agents run `scripts/unshallow.sh`
+  themselves, and `CLAUDE_CODE_REMOTE=true .claude/hooks/session-start.sh` in a
+  remote container without the SDK.
+- **CI carries the fleet's standard checks: `lanes`, `codex`, `zizmor`.**
+  `mikelward/lanes` (`@main`) is the lane engine — only its policy
+  (`.github/lanes.conf`) and the thin `classify` / `lanes` jobs live here, so
+  engine fixes go there. `mikelward/codex-review` (`@main`) pins its three
+  workflows **byte for byte** to its `templates/`: editing one here fails
+  `codex-review-check` until re-approved centrally. `zizmor.yml` scans the
+  workflows (exceptions in `.github/zizmor.yml`). `TODO.md` tracks the
+  remaining ruleset step for all three.
+- **Add or update tests with any change, and assert both directions** — a
+  value withheld off device *and* the diagnostic ones kept. A one-sided test
+  passes a floor quietly widened to withhold everything, leaving consumers
+  unable to explain their failures: a privacy-shaped failure of its own.
+- The suite fails by *false pass*: assert behavior, not structure, and where a
+  check parses something, assert first that the parse found anything.
+- **Fix any preexisting test failure as the first commit of the series**; don't
   stack new work on a red baseline.
-- **Don't disable a failing check** to make it pass, and don't paper over a
-  flaky one with sleeps or retries — fix the underlying issue.
+- **Don't disable a failing check** to make it pass, or paper over a flaky one
+  with sleeps or retries — fix the underlying issue.
 
 ## Error handling
 
 - **Don't silently swallow errors.** Recording is the exception that proves the
-  rule: it is contained whole and never throws, because it runs on paths where
-  a lost log line is the accepted cost and a dropped call is not. Everywhere
-  else, report what failed with enough context to identify it, clean up what
-  the `try` acquired, and decide explicitly what the caller sees. To ignore a
-  specific failure, say why in a one-line comment.
-- **Sanitized context only in the failure itself** — the *Privacy* rule applies
-  to a message about a logging failure as much as to a log line.
+  rule: contained whole, it never throws, since a lost log line is the accepted
+  cost where a dropped call is not. Elsewhere, report what failed with enough
+  context to identify it, clean up what the `try` acquired, and decide
+  explicitly what the caller sees; to ignore a specific failure, say why in a
+  one-line comment.
+- **Sanitized context only in the failure itself** — *Privacy* applies to a
+  message about a logging failure as much as to a log line.
 
 ## Git and pull requests
 
 - **Branch naming.** `<agent>/<short-topic>` — `claude/...` for Claude Code,
   `gemini/...` for Gemini / Antigravity, `codex/...` for Codex. One topic per
-  branch; never commit to `main` (the
-  exception is the initial scaffolding commit that created this repository,
-  made directly to an empty `main` at the repo owner's request).
+  branch; never commit to `main` (the one exception was the initial
+  scaffolding commit, made to an empty `main` at the repo owner's request).
 - **Branches under your own `<agent>/` prefix are yours** — create, push,
-  `--force-with-lease` and delete them freely. This file is the standing
-  grant, so a client rule demanding per-branch permission is already
-  answered. The prefix names a tool, not a session, so that covers the
-  branches this session created or was assigned — ask about the rest.
-- **One commit per logical change.** Rewrite unmerged commits freely — amend,
-  `--fixup` + autosquash, squash, reorder, split — so each commit that lands is
-  coherent, with review responses folded into the commit they belong to.
-  `--force-with-lease` after a rebase, never a bare `--force`.
+  `--force-with-lease` and delete freely (this file is the standing grant, so a
+  client rule demanding per-branch permission is answered). The prefix names a
+  tool, not a session: this covers branches this session created or was
+  assigned — ask about the rest.
+- **One commit per logical change.** Rewrite unmerged commits freely (amend,
+  `--fixup` + autosquash, squash, reorder, split) so each landing commit is
+  coherent, review responses folded in. `--force-with-lease` after a rebase,
+  never a bare `--force`.
 - **Open the pull request without being asked**, ready for review, not a draft.
-- **Refresh the title and body with the push — body first, then push** — so
-  they describe the branch's latest state, not the scope it had when opened.
-- **Pilot a consumer before merging, not after.** Merging no longer reaches
-  anyone's build on its own — that is what the version pin bought — but it does
-  publish a coordinate, and a published coordinate cannot be withdrawn or
-  corrected. So the cost of merging something wrong did not go away; it moved
-  from four red builds to a permanent bad release. Take one app's PR green
-  against the change first (`-PandroidlogLocal` against a local checkout, or the
-  branch's own published version once it has one), then bump the others after
-  the merge, one at a time. They share one automated reviewer, so the same
-  change opened four times is the same finding four times.
-- **Codex is the automated reviewer**, and its reviews are triggered
-  automatically. Address its comments without being asked, folding each fix
-  into the commit it belongs to — the one exception being a real finding out of
-  scope for this pull request, which you defer instead (see *Deferring a
-  finding* below). Judge every comment on merit: verify the claim before
-  acting, and if it doesn't hold up, reply saying why and decline. A comment
-  citing a rule is a *reading* of that rule, not the rule — check what the rule
-  actually says, since an over-strict reading (the privacy rules especially,
-  where stricter always feels safer) costs the consumers the ability to
-  diagnose their own bugs. A genuine conflict between the rule and what the
-  code needs is the maintainer's call, not one to resolve by quietly narrowing
-  the code. Declining doesn't clear the required `codex` status: post the
-  rebuttal, then `@codex review` once — or let the next push do it, if the
-  rebuttal is up first. Escalate if it re-raises, or stays silent.
-- **Once Codex has +1'd a PR's head, never make an unnecessary change to it
-  without asking first** (maintainer, 2026-10-13): a to-do, tidy-up or extra
-  fix re-runs CI and Codex for nothing, so it waits for a yes or goes in a
-  follow-up PR. A necessary change goes ahead unasked — a rebase for a `dirty`
-  branch, or a `behind` one where the ruleset requires it up to date, a fix for
-  red CI.
+- **Refresh the title and body with the push — body first, then push** — to
+  the branch's latest state, not its opening scope; with no PR yet, push, then
+  update as soon as one is opened.
+- **Pilot a consumer before merging, not after.** A merge reaches no build on
+  its own, but it publishes a coordinate that can't be withdrawn or corrected —
+  a wrong merge now costs a permanent bad release instead of four red builds.
+  Take one app's PR green against the change first (`-PandroidlogLocal` against
+  a local checkout, or the branch's published version once it has one), then
+  bump the others after the merge, one at a time: they share one automated
+  reviewer, so one change opened four times is one finding four times.
+- **Codex is the automated reviewer**, triggered automatically. Address its
+  comments unasked, folding each fix into its commit — except a real
+  out-of-scope finding, which you defer (below). Judge every comment on merit:
+  verify it; if it doesn't hold up, reply why and decline. A comment citing a
+  rule is a *reading* — check what the rule says; an over-strict one (privacy
+  especially, where stricter feels safer) costs consumers the ability to
+  diagnose their own bugs. A genuine rule-vs-code conflict is the maintainer's
+  call, not one to settle by quietly narrowing the code. Declining doesn't
+  clear the required `codex` status: post the rebuttal, then `@codex review`
+  once (or let the next push do it, if the rebuttal is up first); escalate if
+  it re-raises, or stays silent.
+- **Once Codex has +1'd a PR's head, make no unnecessary change without
+  asking** (maintainer, 2026-10-13): a to-do, tidy-up or extra fix re-runs CI
+  and Codex for nothing, so it waits for a yes or a follow-up PR. A necessary
+  one goes ahead unasked — a rebase for `dirty`, or `behind` where the ruleset
+  requires up to date, a red-CI fix.
 - **A second verified finding in the same mechanism is evidence about the
-  design, not another bug.** Look for the same shape elsewhere before fixing
-  it, and ask whether a different design would delete the class rather than the
-  instance; a design change is the maintainer's call, not one to make solo.
-- **Restate every review finding in the next message you send, not just the
-  count.** One bullet each: review comment, top-level comment or review body
-  alike, most blocking first — what it claims, where, and what you did about
-  it, or the options where it's the maintainer's call. Summarize them all in
-  that one reply; ask only the most blocking question.
+  design, not another bug**: look for the shape elsewhere before fixing it, and
+  ask whether a different design would delete the class rather than the
+  instance — the maintainer's call, not one to make solo.
+- **Restate every review finding in your next message, not just the count**:
+  one bullet each (review comment, top-level comment or review body), most
+  blocking first — what it claims, where, and what you did, or the options
+  where it's the maintainer's call, all in that one reply; ask only the most
+  blocking question.
 - **Never leave a review thread silently dismissed** — every thread ends in a
   reply or a resolve.
-- **Deferring a real-but-out-of-scope finding.** Don't ask the maintainer to
-  merge past it: note the follow-up in `TODO.md`, commit and push that first,
-  reply on the thread citing the sha, and resolve. A finding with no thread
-  (top-level comment or review body) still gets the `TODO.md` record, the push,
-  and the reply — only the resolve is skipped. The push re-triggers Codex, so
-  don't also poke it unless five minutes pass with nothing back; escalate if
-  the re-review re-raises it, or stays silent.
+- **Defer a real-but-out-of-scope finding** rather than ask to merge past it:
+  note it in `TODO.md`, commit and push that first, reply on the thread citing
+  the sha, and resolve. A threadless finding (top-level comment or review body)
+  gets the record, push and reply; only the resolve is skipped. The push
+  re-triggers Codex, so poke only if five minutes pass with nothing back;
+  escalate if the re-review re-raises it, or stays silent.
 
 ## Language and spelling
 
-- Use **US English** everywhere people read English: prose, commit subjects and
-  bodies, pull request titles and descriptions, comments, KDoc, and identifiers
-  — `behavior` not `behaviour`, `canceled` not `cancelled`, `gray` not `grey`.
-  Platform and third-party API spellings stay as those APIs spell them
+- **US English** everywhere people read English — prose, commit subjects and
+  bodies, PR titles and descriptions, comments, KDoc, identifiers: `behavior`,
+  `canceled`, `gray`. Platform and third-party API spellings stay as spelled
   (`CancellationException` keeps its double `l`).
 
 ## Commit messages
 
 - A clear, plain-English subject in sentence case, short (≤ ~70 chars) and free
-  of internal jargon. Mechanism and file:line detail go in the body, after a
-  blank line.
-- **Prefix a subject that does not change what a consumer runs**: `docs:` for
-  prose, `test:` for tests alone, `build:` for this repository's own CI, and
-  `refactor:` for deliberately behavior-preserving code. A bare subject means a
-  consumer could notice the difference in its next build. There is no `feat:`
-  or `fix:`, on purpose — they would prefix nearly everything and leave the log
-  as flat as it started.
+  of jargon; mechanism and file:line detail go in the body, after a blank line.
+- **Prefix a subject that does not change what a consumer runs**: `docs:`
+  prose, `test:` tests alone, `build:` this repository's own CI, `refactor:`
+  deliberately behavior-preserving code. Bare means a consumer could notice the
+  difference in its next build. No `feat:` or `fix:`, on purpose — they would
+  prefix nearly everything and leave the log flat.
+- **Only `docs:` rides the docs lane**: `.github/lanes.conf` sends everything
+  but markdown outside the modules down the code lane, so `test:`, `build:` or
+  `refactor:` work runs the full suite anyway. Prefix by the table regardless —
+  the prefix says what the commit is; the lane decides its CI.
 - **No model identifier** — never name the coding agent's model or version
   (`Opus 4.8`, `Sonnet`, `Gemini …`, `claude-*`, `gemini-*`) in a commit, PR,
   comment, or pushed artifact; keep it to chat. Generic attribution
   (`Co-Authored-By: Claude` / `Gemini`, `Claude-Session:`, "Generated with
   Claude Code") is fine.
-- **Only `docs:` rides the docs lane.** `.github/lanes.conf` sends everything
-  that is not markdown-outside-the-modules down the code lane, so a commit
-  that really was `test:`, `build:`, or `refactor:` work carries a file the
-  docs lane never accepts and runs the full suite anyway. Prefix it by the
-  table above regardless — the prefix says what the commit is, and the lane
-  decides separately what CI it needs.
 
 ## Talking to the user
 
 - **One question at a time** — in plain chat or the client's question tool
   (`AskUserQuestion` in Claude Code, `ask_question` in Antigravity); stop and
   wait for the answer before proceeding on an assumed one.
-- **Answer a mid-turn message first.** A user message that arrives while
-  you're working — the "sent while you were working" interjection — is
-  addressed in your very next output, before any further tool call, even if
-  it's one sentence.
-- **Message only when the user needs to see it** (maintainer, 2026-10-15): each one
-  notifies their phone. Work and listen in silence; speak up for a question or blocker,
-  something to merge or act on, a merge, or a change from the plan, `SPEC.md` or their
-  instructions, a review-prompted one included. Never for progress (a client's nudge
-  doesn't count), a review or a push alone (its report rides the next message), routine
-  machinery, or a mistake caught and fixed before it reached the repo. The session-start
-  `AGENTS.md` line still opens every session.
+- **Answer a mid-turn message first** — the "sent while you were working"
+  interjection gets your very next output, before any further tool call, even
+  if it's one sentence.
+- **Message only when the user needs to see it** (maintainer, 2026-10-15):
+  each notifies their phone. Work in silence; speak up for a question or
+  blocker, something to merge or act on, a merge, or a change from the plan,
+  `SPEC.md` or their instructions (review-prompted included). Never for
+  progress (a client's nudge doesn't count), a review or push alone (its report
+  rides the next message), routine machinery, or a mistake caught and fixed
+  before it reached the repo. The session-start `AGENTS.md` line still opens
+  every session.
 
 ## Privacy
 
 - **Never put user data in any artifact that leaves this machine** — commit
-  subjects and bodies, pull request text, review replies, branch names,
-  comments, or test fixtures. This repository is the one that handles four
-  apps' worth of it by definition: phone numbers, contacts, SIM identifiers,
-  coordinates, SSIDs and BSSIDs, place names, installed-app lists. None of it
-  goes into a commit, a PR, a bug reproduction, or a fixture.
+  subjects and bodies, PR text, review replies, branch names, comments, test
+  fixtures, bug reproductions. This repository handles four apps' worth by
+  definition: phone numbers, contacts, SIM identifiers, coordinates, SSIDs and
+  BSSIDs, place names, installed-app lists.
 - **The test is whether a value is somebody's, not whether the name is real.**
-  Stock stand-ins are fine and they stay — `ExampleWifi`, `Home`, `+15550100`,
+  Stock stand-ins are fine and stay — `ExampleWifi`, `Home`, `+15550100`,
   `com.example.app`, `(0.0, 0.0)`. What is banned is a *particular person's*
   data lifted from a device or a bug report.
