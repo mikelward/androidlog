@@ -100,6 +100,11 @@ jobs:
       # with no `.git` inside another repository). Runs after `check` so the
       # Gradle caches are warm; about ten seconds locally.
       - name: Verify the version derivation
+        # Its refusal builds fail on purpose, and setup-gradle skips its cache
+        # cleanup after any failed build in the job: kept out of the build
+        # results it judges by, so main runs still save a pruned cache.
+        env:
+          GRADLE_ACTIONS_SKIP_BUILD_RESULT_CAPTURE: "true"
         run: ./scripts/verify-version-derivation.sh
 
       # The merge guard the release workflow's committing job runs. Pure shell
@@ -119,6 +124,10 @@ jobs:
       # name what it found. A failure for any other reason would be its own
       # false pass.
       - name: Prove that guard actually fails
+        # This build fails on purpose; kept out of setup-gradle's build results
+        # for the same reason as the version derivation above.
+        env:
+          GRADLE_ACTIONS_SKIP_BUILD_RESULT_CAPTURE: "true"
         run: |
           set +e
           output=$(./gradlew :logging-core:verifyNoAndroid -PverifyNoAndroidSelfTest 2>&1)
