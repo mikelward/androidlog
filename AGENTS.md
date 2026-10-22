@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-17
+last_modified: 2026-10-22
 ---
 
 # AGENTS.md
@@ -211,8 +211,11 @@ or trim rather than append, and delete one that has stopped biting.
   diagnose their own bugs. A genuine rule-vs-code conflict is the maintainer's
   call, not one to settle by quietly narrowing the code. Declining doesn't
   clear the required `codex` status: post the rebuttal, then `@codex review`
-  once (or let the next push do it, if the rebuttal is up first); escalate if
-  it re-raises, or stays silent.
+  (or let the next push do it, if the rebuttal is up first); escalate if it
+  re-raises. A hung review — nothing back five minutes after a push or poke,
+  or stuck at running (👀) ten minutes on — gets `@codex review`; a poke that
+  hangs the same way gets a second an hour later, and only a second that hangs
+  too is escalated, never the first (maintainer, 2026-10-22).
 - **Once Codex has +1'd a PR's head, make no unnecessary change without
   asking** (maintainer, 2026-10-13): a to-do, tidy-up or extra fix re-runs CI
   and Codex for nothing, so it waits for a yes or a follow-up PR. A necessary
@@ -233,8 +236,8 @@ or trim rather than append, and delete one that has stopped biting.
   note it in `TODO.md`, commit and push that first, reply on the thread citing
   the sha, and resolve. A threadless finding (top-level comment or review body)
   gets the record, push and reply; only the resolve is skipped. The push
-  re-triggers Codex, so poke only if five minutes pass with nothing back;
-  escalate if the re-review re-raises it, or stays silent.
+  re-triggers Codex, so poke only once it hangs, as above; escalate if the
+  re-review re-raises it.
 
 ## Language and spelling
 
