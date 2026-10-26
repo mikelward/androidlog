@@ -34,7 +34,7 @@ composite is still supported, and still the right tool for working on the
 library and an app together — opt-in per consumer, behind `-PandroidlogLocal`
 — but no consumer's CI resolves this that way.
 
-Keep this file as short as it can be and still work, **under 24,000 bytes**
+Keep this file as short as it can be and still work, **under 22,000 bytes**
 (`wc -c AGENTS.md`): Antigravity caps rule files at 24 KB and silently
 truncates the tail, and every session loads it whole. Add a rule the first time
 something bites, say it once in the fewest words that carry the *why*, rewrite
