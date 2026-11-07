@@ -5,7 +5,6 @@ import android.graphics.Bitmap
 import android.graphics.Rect
 import android.os.Handler
 import android.os.HandlerThread
-import android.os.Looper
 import android.view.PixelCopy
 import android.view.Window
 import com.mikelward.androidlog.DebugLog
@@ -195,7 +194,7 @@ object ReportScreenshot {
      */
     private fun captureWindow(activity: Activity, log: DebugLog): Bitmap? {
         // Window token and view geometry are main-thread state; read them there.
-        val geometry = onMainThread {
+        val geometry = onMainThread(activity) {
             if (activity.isFinishing || activity.isDestroyed) return@onMainThread null
             val window = activity.window ?: return@onMainThread null
             val view = window.decorView
@@ -227,16 +226,21 @@ object ReportScreenshot {
     )
 
     /**
-     * Runs [block] on the main thread and returns its result, blocking the
-     * caller until it completes. Runs inline when already on the main thread, so
-     * a caller that ignored the off-thread contract doesn't deadlock on a post
-     * to a looper it is itself blocking.
+     * Runs [block] on [activity]'s UI thread and returns its result, blocking
+     * the caller until it completes. `runOnUiThread` runs it inline when already
+     * on the UI thread, so a caller that ignored the off-thread contract doesn't
+     * deadlock on a post to a looper it is itself blocking.
+     *
+     * The hop goes through `runOnUiThread` rather than a hand-rolled main-looper
+     * `Handler` post, which it matches step for step: through that post, lint's
+     * thread inference (`ThreadConstraint`, AGP 9.5) took the window read as
+     * running on [capture]'s own thread, in conflict with the `@WorkerThread`
+     * PNG encode after it; through `runOnUiThread` it doesn't.
      */
-    private fun <T> onMainThread(block: () -> T): T {
-        if (Looper.myLooper() == Looper.getMainLooper()) return block()
+    private fun <T> onMainThread(activity: Activity, block: () -> T): T {
         val latch = CountDownLatch(1)
         val result = AtomicReference<Result<T>>()
-        Handler(Looper.getMainLooper()).post {
+        activity.runOnUiThread {
             result.set(runCatching { block() })
             latch.countDown()
         }
